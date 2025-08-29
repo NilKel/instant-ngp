@@ -88,6 +88,20 @@ public:
 			m_radiance_head_mode = rgb_network["radiance_head_mode"].get<std::string>();
 		}
 
+		// Determine feature width based on radiance head mode
+		m_feature_width = 0;
+		if (m_radiance_head_mode == "baseline") {
+			m_feature_width = 16; // default density features
+		} else if (m_radiance_head_mode == "surface") {
+			m_feature_width = 15; // D = 15 from Phi dot n_hat
+		} else if (m_radiance_head_mode == "volume") {
+			m_feature_width = 15; // D = 15 divergence
+		} else if (m_radiance_head_mode == "hybrid" || m_radiance_head_mode == "dual_merge" || m_radiance_head_mode == "dual_separate") {
+			m_feature_width = 30; // 15 surface + 15 volume
+		} else {
+			m_feature_width = 16;
+		}
+
 		json local_density_network_config = density_network;
 		local_density_network_config["n_input_dims"] = m_pos_encoding->padded_output_width();
 		if (!density_network.contains("n_output_dims")) {
@@ -97,7 +111,8 @@ public:
 		}
 		m_density_network.reset(create_network<T>(local_density_network_config));
 
-		m_rgb_network_input_width = next_multiple(m_dir_encoding->padded_output_width() + m_density_network->padded_output_width(), rgb_alignment);
+		// RGB input width is [features (mode-dependent)] + [dir encoding]
+		m_rgb_network_input_width = next_multiple(m_feature_width + m_dir_encoding->padded_output_width(), rgb_alignment);
 
 		json local_rgb_network_config = rgb_network;
 		local_rgb_network_config["n_input_dims"] = m_rgb_network_input_width;
@@ -175,8 +190,19 @@ public:
 			prepare_input_gradients
 		);
 
-		forward->density_network_output = forward->rgb_network_input.slice_rows(0, m_density_network->padded_output_width());
-		forward->density_network_ctx = m_density_network->forward(stream, forward->density_network_input, &forward->density_network_output, use_inference_params, prepare_input_gradients);
+		if (m_radiance_head_mode == "baseline") {
+			// For baseline, write density MLP output directly into the feature slice to avoid extra copies
+			auto feat_out = forward->rgb_network_input.slice_rows(0, m_feature_width);
+			forward->density_network_output = GPUMatrixDynamic<T>{feat_out.data(), feat_out.m(), feat_out.n(), feat_out.layout()};
+			forward->density_network_ctx = m_density_network->forward(stream, forward->density_network_input, &forward->density_network_output, use_inference_params, prepare_input_gradients);
+		} else {
+			// Non-baseline: run density MLP into a temporary buffer, then compute features later
+			forward->density_network_output = GPUMatrixDynamic<T>{m_density_network->padded_output_width(), batch_size, stream, m_dir_encoding->preferred_output_layout()};
+			forward->density_network_ctx = m_density_network->forward(stream, forward->density_network_input, &forward->density_network_output, use_inference_params, prepare_input_gradients);
+			// Placeholder: zero-initialize features (to be replaced by surface/volume computation)
+			auto feat_out = forward->rgb_network_input.slice_rows(0, m_feature_width);
+			CUDA_CHECK_THROW(cudaMemsetAsync(feat_out.data(), 0, feat_out.n_bytes(), stream));
+		}
 
 		// Placeholder: feature head routing (no-op for now)
 		// Modes: baseline | surface | volume | hybrid | dual_separate | dual_merge
@@ -189,7 +215,7 @@ public:
 		// NOTE: This block is intentionally non-intrusive; current behavior remains baseline.
 		// Actual computation will be added with proper buffers and autograd gradients.
 
-		auto dir_out = forward->rgb_network_input.slice_rows(m_density_network->padded_output_width(), m_dir_encoding->padded_output_width());
+		auto dir_out = forward->rgb_network_input.slice_rows(m_feature_width, m_dir_encoding->padded_output_width());
 		forward->dir_encoding_ctx = m_dir_encoding->forward(
 			stream,
 			input.slice_rows(m_dir_offset, m_dir_encoding->input_width()),
@@ -685,6 +711,7 @@ private:
 	uint32_t m_n_extra_dims; // extra dimensions are assumed to be part of a compound encoding with dir_dims
 	uint32_t m_dir_offset;
 
+	uint32_t m_feature_width = 16;
 	std::string m_radiance_head_mode = std::string("baseline");
 
 	// // Storage of forward pass data
