@@ -63,6 +63,7 @@ def parse_args():
 	parser.add_argument("--height", "--screenshot_h", type=int, default=0, help="Resolution height of GUI and screenshots.")
 
 	parser.add_argument("--configuration", choices=["baseline","surface","volume","hybrid","dual_separate","dual_merge"], default=None, help="High-level model configuration. If provided and --network is empty, selects configs/nerf/<configuration>.json")
+	parser.add_argument("--loss_mode", choices=["baseline","surface","hybrid"], default="baseline", help="Select loss: baseline (composited color), surface (per-sample radiance), hybrid (future use)")
 
 	parser.add_argument("--gui", action="store_true", help="Run the testbed GUI interactively.")
 	parser.add_argument("--train", action="store_true", help="If the GUI is enabled, controls whether training starts immediately.")
@@ -88,6 +89,12 @@ if __name__ == "__main__":
 
 	if args.mode:
 		print("Warning: the '--mode' argument is no longer in use. It has no effect. The mode is automatically chosen based on the scene.")
+
+	# Configure loss routing via environment for kernel guard
+	if args.loss_mode == "surface":
+		os.environ["NGP_SURFACE_SAMPLE_LOSS"] = "1"
+	else:
+		os.environ.pop("NGP_SURFACE_SAMPLE_LOSS", None)
 
 	testbed = ngp.Testbed()
 	testbed.root_dir = ROOT_DIR
