@@ -91,7 +91,9 @@ public:
 		json local_density_network_config = density_network;
 		local_density_network_config["n_input_dims"] = m_pos_encoding->padded_output_width();
 		if (!density_network.contains("n_output_dims")) {
-			local_density_network_config["n_output_dims"] = 16;
+			// Expand density output to carry vector potential Phi (15x3) in non-baseline modes.
+			// Channel 0 remains the raw density channel as before; channels 1..45 reserved for Phi.
+			local_density_network_config["n_output_dims"] = (m_radiance_head_mode == "baseline") ? 16 : 46;
 		}
 		m_density_network.reset(create_network<T>(local_density_network_config));
 
