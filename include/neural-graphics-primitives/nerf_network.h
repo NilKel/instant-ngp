@@ -41,6 +41,16 @@ __global__ void compute_surface_features_kernel(
 	T* __restrict__ out, uint32_t out_stride
 );
 
+template <typename T>
+__global__ void set_phi_component_single_kernel(
+	uint32_t n, uint32_t component_idx, T* dL_dout, uint32_t stride
+);
+
+template <typename T>
+__global__ void accumulate_divergence_single_kernel(
+	uint32_t n, uint32_t feature_idx, uint32_t component_idx, const float* __restrict__ dL_dpos, uint32_t dpos_stride, T* __restrict__ out, uint32_t out_stride
+);
+
 
 template <typename T>
 __global__ void extract_density(
@@ -267,8 +277,75 @@ public:
 					feat_out.data(),
 					feat_out.layout() == AoS ? feat_out.stride() : 1
 				);
+			} else if (m_radiance_head_mode == "volume" || m_radiance_head_mode == "hybrid" || m_radiance_head_mode == "dual_merge" || m_radiance_head_mode == "dual_separate") {
+				const uint32_t D = 15;
+				auto phi_out = forward->density_network_output.slice_rows(1, 1 + 3 * D);
+				// zero features
+				CUDA_CHECK_THROW(cudaMemsetAsync(feat_out.data(), 0, feat_out.n_bytes(), stream));
+
+				// If hybrid/dual, first fill surface features into first D
+				if (m_radiance_head_mode == "hybrid" || m_radiance_head_mode == "dual_merge" || m_radiance_head_mode == "dual_separate") {
+					// Compute normals as in surface
+					GPUMatrixDynamic<T> dL_ddensity_out{forward->density_network_output.m(), batch_size, stream, forward->density_network_output.layout()};
+					CUDA_CHECK_THROW(cudaMemsetAsync(dL_ddensity_out.data(), 0, dL_ddensity_out.n_bytes(), stream));
+					set_first_channel_one_kernel<T><<<n_blocks_linear(batch_size), N_THREADS_LINEAR, 0, stream>>>(
+						batch_size,
+						dL_ddensity_out.data(),
+						dL_ddensity_out.layout() == AoS ? dL_ddensity_out.stride() : 1
+					);
+					GPUMatrixDynamic<T> dL_ddensity_in{forward->density_network_input.m(), batch_size, stream, forward->density_network_input.layout()};
+					m_density_network->backward(stream, *forward->density_network_ctx, forward->density_network_input, forward->density_network_output, dL_ddensity_out, &dL_ddensity_in, use_inference_params, GradientMode::Overwrite);
+					GPUMatrixDynamic<float> dL_dpos_input;
+					m_pos_encoding->backward(stream, *forward->pos_encoding_ctx, input.slice_rows(0, m_pos_encoding->input_width()), forward->density_network_input, dL_ddensity_in, &dL_dpos_input, use_inference_params, GradientMode::Overwrite);
+					auto surf_slice = feat_out.slice_rows(0, D);
+					compute_surface_features_kernel<T><<<n_blocks_linear(batch_size), N_THREADS_LINEAR, 0, stream>>>(
+						batch_size,
+						D,
+						phi_out.data(),
+						phi_out.layout() == AoS ? phi_out.stride() : 1,
+						dL_dpos_input.data(),
+						dL_dpos_input.layout() == AoS ? dL_dpos_input.stride() : 1,
+						surf_slice.data(),
+						surf_slice.layout() == AoS ? surf_slice.stride() : 1
+					);
+				}
+
+				// Volume divergence features into target slice
+				GPUMatrixDynamic<T> volm_slice = (m_radiance_head_mode == "volume") ? GPUMatrixDynamic<T>{feat_out.data(), feat_out.m(), feat_out.n(), feat_out.layout()} : feat_out.slice_rows(D, D);
+				// Temporary grads buffers
+				GPUMatrixDynamic<T> dL_ddensity_out{forward->density_network_output.m(), batch_size, stream, forward->density_network_output.layout()};
+				GPUMatrixDynamic<T> dL_ddensity_in{forward->density_network_input.m(), batch_size, stream, forward->density_network_input.layout()};
+				GPUMatrixDynamic<float> dL_dpos_input;
+
+				for (uint32_t i = 0; i < D; ++i) {
+					for (uint32_t c = 0; c < 3; ++c) {
+						// zero grads
+						CUDA_CHECK_THROW(cudaMemsetAsync(dL_ddensity_out.data(), 0, dL_ddensity_out.n_bytes(), stream));
+						// set unit grad on row corresponding to Phi component (1 + 3*i + c)
+						set_phi_component_single_kernel<T><<<n_blocks_linear(batch_size), N_THREADS_LINEAR, 0, stream>>>(
+							batch_size,
+							1 + 3 * i + c,
+							dL_ddensity_out.data(),
+							dL_ddensity_out.layout() == AoS ? dL_ddensity_out.stride() : 1
+						);
+						// Backprop to encoded pos
+						m_density_network->backward(stream, *forward->density_network_ctx, forward->density_network_input, forward->density_network_output, dL_ddensity_out, &dL_ddensity_in, use_inference_params, GradientMode::Overwrite);
+						// Backprop to raw pos
+						m_pos_encoding->backward(stream, *forward->pos_encoding_ctx, input.slice_rows(0, m_pos_encoding->input_width()), forward->density_network_input, dL_ddensity_in, &dL_dpos_input, use_inference_params, GradientMode::Overwrite);
+						// Accumulate partial derivative for component c into feature i
+						accumulate_divergence_single_kernel<T><<<n_blocks_linear(batch_size), N_THREADS_LINEAR, 0, stream>>>(
+							batch_size,
+							i,
+							c,
+							dL_dpos_input.data(),
+							dL_dpos_input.layout() == AoS ? dL_dpos_input.stride() : 1,
+							volm_slice.data(),
+							volm_slice.layout() == AoS ? volm_slice.stride() : 1
+						);
+					}
+				}
 			} else {
-				// TODO: implement volume (divergence) and hybrid/dual modes
+				// Unknown mode
 				CUDA_CHECK_THROW(cudaMemsetAsync(feat_out.data(), 0, feat_out.n_bytes(), stream));
 			}
 		}
@@ -833,6 +910,24 @@ __global__ void compute_surface_features_kernel(
 		float s = -(float(px)*nx + float(py)*ny + float(pz)*nz);
 		out[i * out_stride + b] = (T)(s > 0.f ? s : 0.f);
 	}
+}
+
+template <typename T>
+__global__ void set_phi_component_single_kernel(
+	uint32_t n, uint32_t component_idx, T* dL_dout, uint32_t stride
+) {
+	uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
+	if (i >= n) return;
+	dL_dout[i * stride + component_idx] = (T)1;
+}
+
+template <typename T>
+__global__ void accumulate_divergence_single_kernel(
+	uint32_t n, uint32_t feature_idx, uint32_t component_idx, const float* __restrict__ dL_dpos, uint32_t dpos_stride, T* __restrict__ out, uint32_t out_stride
+) {
+	uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
+	if (i >= n) return;
+	out[i * out_stride + feature_idx] += dL_dpos[i * dpos_stride + component_idx];
 }
 
 }
