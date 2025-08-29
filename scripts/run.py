@@ -52,8 +52,9 @@ def parse_args():
 	parser.add_argument("--video_n_seconds", type=int, default=1, help="Number of seconds the rendered video should be long.")
 	parser.add_argument("--video_render_range", type=int, nargs=2, default=(-1, -1), metavar=("START_FRAME", "END_FRAME"), help="Limit output to frames between START_FRAME and END_FRAME (inclusive)")
 	parser.add_argument("--video_spp", type=int, default=8, help="Number of samples per pixel. A larger number means less noise, but slower rendering.")
-	parser.add_argument("--video_output", type=str, default="video.mp4", help="Filename of the output video (video.mp4) or video frames (video_%%04d.png).")
+	parser.add_argument("--video_output", type=str, default="video.mp4", help="Filename of the output video (video.mp4) or video frames (video_%04d.png).")
 
+	parser.add_argument("--name", type=str, default="", help="Experiment name. Outputs will be organized as dataset/scene/name under the repo root.")
 	parser.add_argument("--save_mesh", default="", help="Output a marching-cubes based mesh from the NeRF or SDF model. Supports OBJ and PLY format.")
 	parser.add_argument("--marching_cubes_res", default=256, type=int, help="Sets the resolution for the marching cubes grid.")
 	parser.add_argument("--marching_cubes_density_thresh", default=2.5, type=float, help="Sets the density threshold for marching cubes.")
@@ -103,6 +104,24 @@ if __name__ == "__main__":
 				args.network = scene_info["network"]
 
 		testbed.load_training_data(args.scene)
+
+		# Create output directory structure: dataset/scene/name if args.scene ends with dataset/scene/transforms_train.json
+		# Example: /home/.../data/nerf_synthetic/lego/transforms_train.json -> nerf_synthetic/lego/<name>
+		if args.name:
+			try:
+				parts = args.scene.split("/")
+				if len(parts) >= 2 and parts[-1] == "transforms_train.json":
+					dataset = parts[-2]  # scene
+					data_root = parts[-3]  # dataset folder name
+					out_rel = os.path.join(data_root, dataset, args.name)
+					out_abs = os.path.join(ROOT_DIR, out_rel)
+					os.makedirs(out_abs, exist_ok=True)
+					# Prepare subfolders commonly used
+					for sub in ["checkpoints", "logs", "images", "evaluation", "mesh", "recording"]:
+						os.makedirs(os.path.join(out_abs, sub), exist_ok=True)
+					print(f"Outputs will be stored under: {out_abs}")
+			except Exception as e:
+				print(f"Warning: failed to create structured output folders: {e}")
 
 	if args.gui:
 		# Pick a sensible GUI resolution depending on arguments.
