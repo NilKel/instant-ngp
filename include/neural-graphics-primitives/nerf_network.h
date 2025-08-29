@@ -28,6 +28,20 @@
 
 namespace ngp {
 
+// Forward declarations for CUDA kernels used in this header
+template <typename T>
+__global__ void set_first_channel_one_kernel(uint32_t n, T* dL_dout, uint32_t stride);
+
+template <typename T>
+__global__ void compute_surface_features_kernel(
+	uint32_t batch_size,
+	uint32_t D,
+	const T* __restrict__ phi, uint32_t phi_stride,
+	const float* __restrict__ dpos, uint32_t dpos_stride,
+	T* __restrict__ out, uint32_t out_stride
+);
+
+
 template <typename T>
 __global__ void extract_density(
 	const uint32_t n_elements,
@@ -201,8 +215,62 @@ public:
 			forward->density_network_ctx = m_density_network->forward(stream, forward->density_network_input, &forward->density_network_output, use_inference_params, prepare_input_gradients);
 			// Compute features depending on mode
 			auto feat_out = forward->rgb_network_input.slice_rows(0, m_feature_width);
-			// TODO: implement surface (ReLU(-dot(Phi, n_hat))), volume (divergence), and hybrid/dual modes
-			CUDA_CHECK_THROW(cudaMemsetAsync(feat_out.data(), 0, feat_out.n_bytes(), stream));
+			if (m_radiance_head_mode == "surface") {
+				// density output layout: [sigma | Phi_flattened (3*D)]
+				const uint32_t D = 15;
+				auto phi_out = forward->density_network_output.slice_rows(1, 1 + 3 * D);
+
+				// Backprop to get d sigma / d x,y,z per sample
+				GPUMatrixDynamic<T> dL_ddensity_out{forward->density_network_output.m(), batch_size, stream, forward->density_network_output.layout()};
+				CUDA_CHECK_THROW(cudaMemsetAsync(dL_ddensity_out.data(), 0, dL_ddensity_out.n_bytes(), stream));
+				// set grad on sigma channel to 1
+				set_first_channel_one_kernel<T><<<n_blocks_linear(batch_size), N_THREADS_LINEAR, 0, stream>>>(
+					batch_size,
+					dL_ddensity_out.data(),
+					dL_ddensity_out.layout() == AoS ? dL_ddensity_out.stride() : 1
+				);
+
+				// dL/d encoded pos
+				GPUMatrixDynamic<T> dL_ddensity_in{forward->density_network_input.m(), batch_size, stream, forward->density_network_input.layout()};
+				m_density_network->backward(
+					stream,
+					*forward->density_network_ctx,
+					forward->density_network_input,
+					forward->density_network_output,
+					dL_ddensity_out,
+					&dL_ddensity_in,
+					use_inference_params,
+					GradientMode::Overwrite
+				);
+
+				// dL/d raw pos (xyz)
+				GPUMatrixDynamic<float> dL_dpos_input;
+				m_pos_encoding->backward(
+					stream,
+					*forward->pos_encoding_ctx,
+					input.slice_rows(0, m_pos_encoding->input_width()),
+					forward->density_network_input,
+					dL_ddensity_in,
+					&dL_dpos_input,
+					use_inference_params,
+					GradientMode::Overwrite
+				);
+
+				// Compute features = ReLU(-dot(Phi_i, n_hat))
+				compute_surface_features_kernel<T><<<n_blocks_linear(batch_size), N_THREADS_LINEAR, 0, stream>>>(
+					batch_size,
+					D,
+					phi_out.data(),
+					phi_out.layout() == AoS ? phi_out.stride() : 1,
+					dL_dpos_input.data(),
+					dL_dpos_input.layout() == AoS ? dL_dpos_input.stride() : 1,
+					feat_out.data(),
+					feat_out.layout() == AoS ? feat_out.stride() : 1
+				);
+			} else {
+				// TODO: implement volume (divergence) and hybrid/dual modes
+				CUDA_CHECK_THROW(cudaMemsetAsync(feat_out.data(), 0, feat_out.n_bytes(), stream));
+			}
 		}
 
 		// Placeholder: feature head routing (no-op for now)
@@ -729,5 +797,42 @@ private:
 		std::unique_ptr<Context> rgb_network_ctx;
 	};
 };
+
+// Kernel implementations
+
+template <typename T>
+__global__ void set_first_channel_one_kernel(
+	uint32_t n, T* dL_dout, uint32_t stride
+) {
+	uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
+	if (i >= n) return;
+	dL_dout[i * stride + 0] = (T)1;
+}
+
+template <typename T>
+__global__ void compute_surface_features_kernel(
+	uint32_t batch_size,
+	uint32_t D,
+	const T* __restrict__ phi, uint32_t phi_stride,
+	const float* __restrict__ dpos, uint32_t dpos_stride,
+	T* __restrict__ out, uint32_t out_stride
+) {
+	uint32_t b = threadIdx.x + blockIdx.x * blockDim.x;
+	if (b >= batch_size) return;
+
+	float nx = dpos[b * dpos_stride + 0];
+	float ny = dpos[b * dpos_stride + 1];
+	float nz = dpos[b * dpos_stride + 2];
+	float norm = sqrtf(nx*nx + ny*ny + nz*nz) + 1e-8f;
+	nx /= norm; ny /= norm; nz /= norm;
+
+	for (uint32_t i = 0; i < D; ++i) {
+		T px = phi[(i*3+0) * phi_stride + b];
+		T py = phi[(i*3+1) * phi_stride + b];
+		T pz = phi[(i*3+2) * phi_stride + b];
+		float s = -(float(px)*nx + float(py)*ny + float(pz)*nz);
+		out[i * out_stride + b] = (T)(s > 0.f ? s : 0.f);
+	}
+}
 
 }
