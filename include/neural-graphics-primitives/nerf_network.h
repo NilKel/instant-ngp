@@ -83,6 +83,11 @@ public:
 		uint32_t rgb_alignment = minimum_alignment(rgb_network);
 		m_dir_encoding.reset(create_encoding<T>(m_n_dir_dims + m_n_extra_dims, dir_encoding, rgb_alignment));
 
+		// Parse radiance head mode if provided in network config (defaults to baseline)
+		if (rgb_network.contains("radiance_head_mode") && rgb_network["radiance_head_mode"].is_string()) {
+			m_radiance_head_mode = rgb_network["radiance_head_mode"].get<std::string>();
+		}
+
 		json local_density_network_config = density_network;
 		local_density_network_config["n_input_dims"] = m_pos_encoding->padded_output_width();
 		if (!density_network.contains("n_output_dims")) {
@@ -161,6 +166,17 @@ public:
 
 		forward->density_network_output = forward->rgb_network_input.slice_rows(0, m_density_network->padded_output_width());
 		forward->density_network_ctx = m_density_network->forward(stream, forward->density_network_input, &forward->density_network_output, use_inference_params, prepare_input_gradients);
+
+		// Placeholder: feature head routing (no-op for now)
+		// Modes: baseline | surface | volume | hybrid | dual_separate | dual_merge
+		// - surface: compute normals n = \nabla sigma(x) from density via autograd, normalize n_hat, then
+		//   surface_feature[i] = ReLU(dot(Phi_i (3D), n_hat)) for D feature vectors.
+		// - volume: divergence_feature[i] = d Phi_ix / dx + d Phi_iy / dy + d Phi_iz / dz.
+		// - hybrid: concat(surface, volume) and pad RGB MLP input via tcnn::next_multiple.
+		// - dual_separate: construct two RGB inputs (surface/volume) for two identical RGB heads.
+		// - dual_merge: feed both feature streams to the same head as separate inputs.
+		// NOTE: This block is intentionally non-intrusive; current behavior remains baseline.
+		// Actual computation will be added with proper buffers and autograd gradients.
 
 		auto dir_out = forward->rgb_network_input.slice_rows(m_density_network->padded_output_width(), m_dir_encoding->padded_output_width());
 		forward->dir_encoding_ctx = m_dir_encoding->forward(
@@ -655,6 +671,8 @@ private:
 	uint32_t m_n_dir_dims;
 	uint32_t m_n_extra_dims; // extra dimensions are assumed to be part of a compound encoding with dir_dims
 	uint32_t m_dir_offset;
+
+	std::string m_radiance_head_mode = std::string("baseline");
 
 	// // Storage of forward pass data
 	struct ForwardContext : public Context {
