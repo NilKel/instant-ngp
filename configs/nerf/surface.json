@@ -1,4 +1,5 @@
 {
 	"radiance_head_mode": "surface",
+	"loss_mode": "surface",
 	"parent": "base.json"
 } 

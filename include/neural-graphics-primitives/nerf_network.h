@@ -143,6 +143,11 @@ public:
 		local_rgb_network_config["n_output_dims"] = 3;
 		m_rgb_network.reset(create_network<T>(local_rgb_network_config));
 
+		// Enable per-sample loss via json flag loss_mode=="surface"
+		if (rgb_network.contains("loss_mode") && rgb_network["loss_mode"].is_string()) {
+			m_loss_mode = rgb_network["loss_mode"].get<std::string>();
+		}
+
 		// Optional second RGB head for dual_separate mode (constructed now, used later)
 		if (m_radiance_head_mode == "dual_separate") {
 			json local_rgb_network_config2 = rgb_network;
@@ -859,6 +864,7 @@ private:
 
 	uint32_t m_feature_width = 16;
 	std::string m_radiance_head_mode = std::string("baseline");
+	std::string m_loss_mode = std::string("");
 
 	// // Storage of forward pass data
 	struct ForwardContext : public Context {

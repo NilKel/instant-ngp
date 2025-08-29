@@ -62,6 +62,8 @@ def parse_args():
 	parser.add_argument("--width", "--screenshot_w", type=int, default=0, help="Resolution width of GUI and screenshots.")
 	parser.add_argument("--height", "--screenshot_h", type=int, default=0, help="Resolution height of GUI and screenshots.")
 
+	parser.add_argument("--configuration", choices=["baseline","surface","volume","hybrid","dual_separate","dual_merge"], default=None, help="High-level model configuration. If provided and --network is empty, selects configs/nerf/<configuration>.json")
+
 	parser.add_argument("--gui", action="store_true", help="Run the testbed GUI interactively.")
 	parser.add_argument("--train", action="store_true", help="If the GUI is enabled, controls whether training starts immediately.")
 	parser.add_argument("--n_steps", type=int, default=-1, help="Number of steps to train for before quitting.")
@@ -142,6 +144,14 @@ if __name__ == "__main__":
 		testbed.load_snapshot(args.load_snapshot)
 	elif args.network:
 		testbed.reload_network_from_file(args.network)
+	elif args.configuration:
+		# Map configuration to default nerf config JSON
+		cfg_path = os.path.join(ROOT_DIR, "configs", "nerf", f"{args.configuration}.json")
+		if os.path.exists(cfg_path):
+			args.network = cfg_path
+			testbed.reload_network_from_file(args.network)
+		else:
+			print(f"Warning: configuration '{args.configuration}' not found at {cfg_path}")
 
 	ref_transforms = {}
 	if args.screenshot_transforms: # try to load the given file straight away
