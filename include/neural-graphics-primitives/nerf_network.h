@@ -196,11 +196,12 @@ public:
 			forward->density_network_output = GPUMatrixDynamic<T>{feat_out.data(), feat_out.m(), feat_out.n(), feat_out.layout()};
 			forward->density_network_ctx = m_density_network->forward(stream, forward->density_network_input, &forward->density_network_output, use_inference_params, prepare_input_gradients);
 		} else {
-			// Non-baseline: run density MLP into a temporary buffer, then compute features later
+			// Non-baseline: run density MLP into a temporary buffer, then compute features below
 			forward->density_network_output = GPUMatrixDynamic<T>{m_density_network->padded_output_width(), batch_size, stream, m_dir_encoding->preferred_output_layout()};
 			forward->density_network_ctx = m_density_network->forward(stream, forward->density_network_input, &forward->density_network_output, use_inference_params, prepare_input_gradients);
-			// Placeholder: zero-initialize features (to be replaced by surface/volume computation)
+			// Compute features depending on mode
 			auto feat_out = forward->rgb_network_input.slice_rows(0, m_feature_width);
+			// TODO: implement surface (ReLU(-dot(Phi, n_hat))), volume (divergence), and hybrid/dual modes
 			CUDA_CHECK_THROW(cudaMemsetAsync(feat_out.data(), 0, feat_out.n_bytes(), stream));
 		}
 
