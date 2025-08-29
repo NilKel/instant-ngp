@@ -366,7 +366,14 @@ __global__ void train_nerf(
 
 		// we know the suffix of this ray compared to where we are up to. note the suffix depends on this step's alpha as suffix = (1-alpha)*(somecolor), so dsuffix/dalpha = -somecolor = -suffix/(1-alpha)
 		const vec3 suffix = color.rgb() - color2.rgb();
-		const vec3 dloss_by_drgb = weight * lg.gradient;
+		#if defined(NGP_SURFACE_SAMPLE_LOSS)
+			// Per-sample radiance loss: use the step RGB instead of composited color
+			vec3 rgb_step = network_to_rgb_vec(local_network_output.rgb(), rgb_activation);
+			LossAndGradient lg_step = loss_and_gradient(rgbtarget, rgb_step, loss_type);
+			const vec3 dloss_by_drgb = weight * lg_step.gradient;
+		#else
+			const vec3 dloss_by_drgb = weight * lg.gradient;
+		#endif
 
 		tvec<network_precision_t, 4> local_dL_doutput;
 
