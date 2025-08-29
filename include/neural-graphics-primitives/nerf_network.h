@@ -102,6 +102,15 @@ public:
 		local_rgb_network_config["n_output_dims"] = 3;
 		m_rgb_network.reset(create_network<T>(local_rgb_network_config));
 
+		// Optional second RGB head for dual_separate mode (constructed now, used later)
+		if (m_radiance_head_mode == "dual_separate") {
+			json local_rgb_network_config2 = rgb_network;
+			local_rgb_network_config2["n_input_dims"] = m_rgb_network_input_width;
+			local_rgb_network_config2["n_output_dims"] = 3;
+			m_rgb_network_surface.reset(create_network<T>(local_rgb_network_config2));
+			m_rgb_network_volume.reset(create_network<T>(local_rgb_network_config2));
+		}
+
 		m_density_model = std::make_shared<NetworkWithInputEncoding<T>>(m_pos_encoding, m_density_network);
 	}
 
@@ -660,6 +669,8 @@ public:
 private:
 	std::shared_ptr<Network<T>> m_density_network;
 	std::shared_ptr<Network<T>> m_rgb_network;
+	std::shared_ptr<Network<T>> m_rgb_network_surface; // Added for dual_separate mode
+	std::shared_ptr<Network<T>> m_rgb_network_volume; // Added for dual_separate mode
 	std::shared_ptr<Encoding<T>> m_pos_encoding;
 	std::shared_ptr<Encoding<T>> m_dir_encoding;
 
