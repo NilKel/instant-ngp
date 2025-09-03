@@ -127,6 +127,8 @@ if __name__ == "__main__":
 					folder_parts = [data_root, dataset]
 					if args.configuration:
 						folder_parts.append(args.configuration)
+					if args.loss_mode:
+						folder_parts.append(args.loss_mode)
 					folder_parts.append(args.name)
 					out_rel = os.path.join(*folder_parts)
 					out_abs = os.path.join(ROOT_DIR, out_rel)
@@ -312,7 +314,7 @@ if __name__ == "__main__":
 		maxpsnr = 0
 
 		# Evaluate metrics on black background
-		testbed.background_color = [0.0, 0.0, 0.0, 1.0]
+		testbed.background_color = [1.0, 1.0, 1.0, 1.0]
 
 		# Prior nerf papers don't typically do multi-sample anti aliasing.
 		# So snap all pixels to the pixel centers.
