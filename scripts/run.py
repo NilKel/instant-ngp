@@ -461,7 +461,7 @@ if __name__ == "__main__":
 		except Exception as e:
 			print(f"Warning: failed to save stride-25 training views: {e}")
 
-	# Also render test views every 25 if available
+	# Also render test views every 25 if available, saving both GT and rendered
 	try:
 		if args.test_transforms and os.path.exists(args.test_transforms):
 			with open(args.test_transforms) as f:
@@ -474,8 +474,16 @@ if __name__ == "__main__":
 						continue
 					res = testbed.nerf.training.dataset.metadata[i].resolution
 					testbed.set_camera_to_training_view(i)
-					img = testbed.render(res[0], res[1], 8, True)
-					write_image(os.path.join(images_dir, f"test_{i:04d}.png"), img)
+					
+					# Save ground truth image
+					testbed.render_ground_truth = True
+					gt_img = testbed.render(res[0], res[1], 1, True)
+					write_image(os.path.join(images_dir, f"gt_{i:04d}.png"), gt_img)
+					
+					# Save rendered image
+					testbed.render_ground_truth = False
+					rendered_img = testbed.render(res[0], res[1], 8, True)
+					write_image(os.path.join(images_dir, f"test_{i:04d}.png"), rendered_img)
 	except Exception as e:
 		print(f"Warning: failed to save stride-25 test views: {e}")
 
