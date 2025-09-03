@@ -263,6 +263,21 @@ if __name__ == "__main__":
 					except Exception as e:
 						print(f"Warning: failed to save periodic checkpoint: {e}")
 
+				# Save training views at the final training iteration
+				if images_dir and testbed.training_step == n_steps - 1:
+					try:
+						os.makedirs(images_dir, exist_ok=True)
+						print(f"\nSaving training views at final iteration {testbed.training_step}...")
+						for i in range(testbed.nerf.training.dataset.n_images):
+							if i % 25 != 0:
+								continue
+							res = testbed.nerf.training.dataset.metadata[i].resolution
+							testbed.set_camera_to_training_view(i)
+							img = testbed.render(res[0], res[1], 8, True)
+							write_image(os.path.join(images_dir, f"train_{i:04d}.png"), img)
+					except Exception as e:
+						print(f"Warning: failed to save training views at final iteration: {e}")
+
 				# Update progress bar
 				if testbed.training_step < old_training_step or old_training_step == 0:
 					old_training_step = 0
@@ -446,22 +461,7 @@ if __name__ == "__main__":
 
 		shutil.rmtree("tmp")
 
-	# After training: optional rendering of training views every 25 (train + test)
-	if output_dir_abs and testbed.nerf.training.dataset.n_images > 0:
-		try:
-			os.makedirs(images_dir, exist_ok=True)
-			with tqdm(range(testbed.nerf.training.dataset.n_images), unit="images", desc=f"Saving training views (stride 25)") as t2:
-				for i in t2:
-					if i % 25 != 0:
-						continue
-					res = testbed.nerf.training.dataset.metadata[i].resolution
-					testbed.set_camera_to_training_view(i)
-					img = testbed.render(res[0], res[1], 8, True)
-					write_image(os.path.join(images_dir, f"train_{i:04d}.png"), img)
-		except Exception as e:
-			print(f"Warning: failed to save stride-25 training views: {e}")
-
-	# Also render test views every 25 if available, saving both GT and rendered
+	# Render test views every 25 if available, saving both GT and rendered
 	try:
 		if args.test_transforms and os.path.exists(args.test_transforms):
 			with open(args.test_transforms) as f:
