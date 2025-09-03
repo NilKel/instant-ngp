@@ -74,6 +74,7 @@ def parse_args():
 	parser.add_argument("--sharpen", default=0, help="Set amount of sharpening applied to NeRF training images. Range 0.0 to 1.0.")
 	parser.add_argument("--use_sdf", action="store_true", help="If set, treat density MLP's first output as SDF and convert to density for alpha blending.")
 	parser.add_argument("--eikonal_lambda", type=float, default=0.0, help="Eikonal loss weight for SDF normals (||\u2207SDF||-1)^2. Default 0.0.")
+	parser.add_argument("--background_color", choices=["white", "black"], default="white", help="Background color for training and testing. Default: white.")
 
 
 	return parser.parse_args()
@@ -186,6 +187,13 @@ if __name__ == "__main__":
 
 	testbed.nerf.sharpen = float(args.sharpen)
 	testbed.exposure = args.exposure
+	
+	# Set background color for both training and testing
+	if args.background_color == "white":
+		testbed.background_color = [1.0, 1.0, 1.0, 1.0]
+	elif args.background_color == "black":
+		testbed.background_color = [0.0, 0.0, 0.0, 1.0]
+	
 	testbed.shall_train = args.train if args.gui else True
 
 	# Apply SDF mode if requested
@@ -328,8 +336,7 @@ if __name__ == "__main__":
 		minpsnr = 1000
 		maxpsnr = 0
 
-		# Evaluate metrics on black background
-		testbed.background_color = [1.0, 1.0, 1.0, 1.0]
+		# Background color already set from args.background_color above
 
 		# Prior nerf papers don't typically do multi-sample anti aliasing.
 		# So snap all pixels to the pixel centers.
