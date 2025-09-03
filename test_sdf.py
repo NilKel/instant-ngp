@@ -1,0 +1,1 @@
+import pyngp as ngp; tb = ngp.Testbed(); print("use_sdf available:", hasattr(tb, "use_sdf")); print("Current use_sdf:", tb.use_sdf if hasattr(tb, "use_sdf") else "Not available"); tb.use_sdf = True; print("Set use_sdf:", tb.use_sdf)

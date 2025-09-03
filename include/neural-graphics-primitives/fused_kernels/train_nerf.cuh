@@ -18,8 +18,8 @@
 #include <neural-graphics-primitives/nerf_device.cuh>
 
 using namespace ngp;
-
-__global__ void train_nerf(
+ 
+ __global__ void train_nerf(
 	const uint32_t n_rays,
 	BoundingBox aabb,
 	const uint32_t max_samples,
@@ -178,7 +178,8 @@ __global__ void train_nerf(
 		++j;
 
 		// Composit color
-		float alpha = 1.f - __expf(-network_to_density(nerf_out.w, density_activation) * dt);
+		float sigma = to_sigma(nerf_out.w, density_activation);
+		float alpha = 1.f - __expf(-sigma * dt);
 		float weight = alpha * (1.0f - color.a);
 		color += vec4(network_to_rgb_vec(nerf_out.xyz(), rgb_activation) * weight, weight);
 
@@ -260,6 +261,33 @@ __global__ void train_nerf(
 	// lg.gradient /= img_pdf * uv_pdf;
 
 	float mean_loss = mean(lg.loss);
+	// Eikonal regularization (SDF): encourage ||∇SDF||=1 at sampled hitpoint via finite differences
+	if (kUseSdf && kSdfEikonalLambda > 0.0f) {
+		// Use central differences of SDF around the hitpoint
+		// Build a NerfCoordinate template and vary its position
+		const float h = fmaxf(1e-4f, 0.5f * STEPSIZE());
+		auto make_coord = [&](const vec3& p) {
+			constexpr uint32_t N_NERF_COORDS = sizeof(NerfCoordinate) / sizeof(float);
+			vec<N_NERF_COORDS + N_EXTRA_DIMS> nin;
+			*(NerfCoordinate*)&nin[0] = {warp_position(p, aabb), warp_direction(ray.d), warp_dt(calc_dt(t, cone_angle))};
+			NGP_PRAGMA_UNROLL
+			for (uint32_t ei = 0; ei < N_EXTRA_DIMS; ++ei) { nin[N_NERF_COORDS + ei] = extra_dims[ei]; }
+			return nin;
+		};
+		vec4 out_px = eval_nerf(make_coord(hitpoint + vec3(h,0,0)), params);
+		vec4 out_mx = eval_nerf(make_coord(hitpoint - vec3(h,0,0)), params);
+		vec4 out_py = eval_nerf(make_coord(hitpoint + vec3(0,h,0)), params);
+		vec4 out_my = eval_nerf(make_coord(hitpoint - vec3(0,h,0)), params);
+		vec4 out_pz = eval_nerf(make_coord(hitpoint + vec3(0,0,h)), params);
+		vec4 out_mz = eval_nerf(make_coord(hitpoint - vec3(0,0,h)), params);
+		float sdf_dx = (out_px.w - out_mx.w) / (2.0f * h);
+		float sdf_dy = (out_py.w - out_my.w) / (2.0f * h);
+		float sdf_dz = (out_pz.w - out_mz.w) / (2.0f * h);
+		float grad_norm = sqrtf(sdf_dx * sdf_dx + sdf_dy * sdf_dy + sdf_dz * sdf_dz) + 1e-8f;
+		float eik = (grad_norm - 1.0f) * (grad_norm - 1.0f);
+		mean_loss += kSdfEikonalLambda * eik;
+	}
+
 	if (can_write && loss_output) {
 		loss_output[ray_idx] = mean_loss / (float)n_rays;
 	}

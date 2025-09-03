@@ -702,6 +702,8 @@ PYBIND11_MODULE(pyngp, m) {
 			[](py::object& obj) { return obj.cast<Testbed&>().root_dir().str(); },
 			[](const py::object& obj, const std::string& value) { obj.cast<Testbed&>().set_root_dir(value); }
 		)
+		.def_property("use_sdf", &Testbed::use_sdf, &Testbed::set_use_sdf)
+		.def_property("sdf_eikonal_lambda", &Testbed::sdf_eikonal_lambda, &Testbed::set_sdf_eikonal_lambda)
 		;
 
 
@@ -858,6 +860,7 @@ PYBIND11_MODULE(pyngp, m) {
 		.def_readwrite("calculate_iou_online", &Testbed::Sdf::calculate_iou_online)
 		.def_readwrite("groundtruth_mode", &Testbed::Sdf::groundtruth_mode)
 		.def_readwrite("brdf", &Testbed::Sdf::brdf);
+
 
 	py::class_<Testbed::Sdf::Training>(sdf, "Training")
 		.def_readwrite("generate_sdf_data_online", &Testbed::Sdf::Training::generate_sdf_data_online)

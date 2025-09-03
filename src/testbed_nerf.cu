@@ -47,6 +47,8 @@ CMRC_DECLARE(ngp);
 
 namespace ngp {
 
+__global__ void extract_xyz_from_coords(uint32_t n, ngp::BoundingBox aabb, tcnn::PitchedPtr<ngp::NerfCoordinate> src, float* dst);
+
 static constexpr uint32_t MARCH_ITER = 10000;
 
 static constexpr uint32_t MIN_STEPS_INBETWEEN_COMPACTION = 1;
@@ -630,7 +632,7 @@ __global__ void composite_kernel_nerf(
 
 		float T = 1.f - local_rgba.a;
 		float dt = unwarp_dt(input->dt);
-		float alpha = 1.f - __expf(-network_to_density(float(local_network_output[3]), density_activation) * dt);
+					float alpha = 1.f - __expf(-to_sigma(float(local_network_output[3]), density_activation) * dt);
 		if (show_accel >= 0) {
 			alpha = 1.f;
 		}
@@ -642,7 +644,13 @@ __global__ void composite_kernel_nerf(
 			// Network input contains the gradient of the network output w.r.t. input.
 			// So to compute density gradients, we need to apply the chain rule.
 			// The normal is then in the opposite direction of the density gradient (i.e. the direction of decreasing density)
-			vec3 normal = -network_to_density_derivative(float(local_network_output[3]), density_activation) * warped_pos;
+			vec3 normal;
+			if (kUseSdf) {
+				// For SDF, normal = grad(SDF); sign is outward by convention
+				normal = normalize(warped_pos); // placeholder: proper autodiff gradient path not available here
+			} else {
+				normal = -network_to_density_derivative(float(local_network_output[3]), density_activation) * warped_pos;
+			}
 			rgb = normalize(normal);
 		} else if (render_mode == ERenderMode::Positions) {
 			rgb = (pos - 0.5f) / 2.0f + 0.5f;
@@ -3124,8 +3132,16 @@ void Testbed::train_nerf_step(uint32_t target_batch_size, Testbed::NerfCounters&
 			hg_enc->set_max_level_gpu(m_max_level_rand_training ? max_level_compacted : nullptr);
 		}
 
-		linear_kernel(
-			compute_loss_kernel_train_nerf,
+										// Update device SDF flag and eikonal lambda before training pass
+	CUDA_CHECK_THROW(cudaMemcpyToSymbol(kUseSdf, &m_nerf.m_use_sdf, sizeof(bool)));
+	CUDA_CHECK_THROW(cudaMemcpyToSymbol(kSdfEikonalLambda, &m_nerf.m_sdf_eikonal_lambda, sizeof(float)));
+	
+	// Update NerfNetwork's eikonal lambda for backward pass
+	if (m_nerf_network) {
+		m_nerf_network->set_sdf_eikonal_lambda(m_nerf.m_sdf_eikonal_lambda);
+	}
+			linear_kernel(
+				compute_loss_kernel_train_nerf,
 			0,
 			stream,
 			counters.rays_per_batch,
@@ -3265,6 +3281,8 @@ void Testbed::train_nerf_step(uint32_t target_batch_size, Testbed::NerfCounters&
 	if (hg_enc) {
 		hg_enc->set_max_level_gpu(nullptr);
 	}
+
+
 }
 
 
@@ -3643,6 +3661,20 @@ std::vector<float> Testbed::Nerf::get_rendering_extra_dims_cpu() const {
 	);
 
 	return extra_dims_cpu;
+}
+
+extern __device__ __constant__ bool kUseSdf;
+extern __device__ __constant__ float kSdfEikonalLambda;
+
+// Kernel to extract xyz from compacted NerfCoordinates into CM buffer of shape (3 x N)
+__global__ void extract_xyz_from_coords(uint32_t n, ngp::BoundingBox aabb, tcnn::PitchedPtr<ngp::NerfCoordinate> src, float* dst) {
+	uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
+	if (i >= n) return;
+	const NerfCoordinate* c = src(i);
+	vec3 p = unwarp_position(c->pos.p, aabb);
+	dst[0 * n + i] = p.x;
+	dst[1 * n + i] = p.y;
+	dst[2 * n + i] = p.z;
 }
 
 } // namespace ngp

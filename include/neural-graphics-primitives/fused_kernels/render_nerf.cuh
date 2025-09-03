@@ -140,7 +140,8 @@ __global__ void render_nerf(
 		t += dt;
 
 		// Composit color
-		float alpha = 1.f - __expf(-network_to_density(nerf_out.w, density_activation) * dt);
+		float sigma = to_sigma(nerf_out.w, density_activation);
+		float alpha = 1.f - __expf(-sigma * dt);
 		float weight = alpha * (1.0f - color.a);
 		color += vec4(network_to_rgb_vec(nerf_out.xyz(), rgb_activation) * weight, weight);
 

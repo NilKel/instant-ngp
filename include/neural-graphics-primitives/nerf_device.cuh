@@ -615,4 +615,24 @@ inline NGP_HOST_DEVICE LossAndGradient loss_and_gradient(const vec3& target, con
 	}
 }
 
+// SDF-to-density via logistic distribution (Yu et al.)
+inline NGP_HOST_DEVICE float sdf_to_density_logistic(float sdf, float sharpness) {
+	float s = fabsf(sharpness);
+	float e = expf(-s * sdf);
+	float denom = (1.0f + e);
+	denom = denom * denom + 1e-8f;
+	return (s * e) / denom;
+}
+
+extern __device__ __constant__ bool kUseSdf;
+extern __device__ __constant__ float kSdfEikonalLambda;
+
+inline NGP_HOST_DEVICE float to_sigma(float raw_density_output, ENerfActivation activation) {
+	if (kUseSdf) {
+		// Interpret raw as SDF
+		return sdf_to_density_logistic(raw_density_output, 10.0f);
+	}
+	return network_to_density(raw_density_output, activation);
+}
+
 }

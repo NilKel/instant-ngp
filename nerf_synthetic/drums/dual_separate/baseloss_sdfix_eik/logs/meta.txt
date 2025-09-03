@@ -1,0 +1,3 @@
+configuration=dual_separate
+loss_mode=baseline
+use_sdf=True

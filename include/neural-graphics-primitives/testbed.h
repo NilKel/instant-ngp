@@ -73,6 +73,11 @@ public:
 	Testbed(ETestbedMode mode = ETestbedMode::None);
 	~Testbed();
 
+	bool use_sdf() const { return m_nerf.m_use_sdf; }
+	void set_use_sdf(bool v) { m_nerf.m_use_sdf = v; }
+	float sdf_eikonal_lambda() const { return m_nerf.m_sdf_eikonal_lambda; }
+	void set_sdf_eikonal_lambda(float v) { m_nerf.m_sdf_eikonal_lambda = v; }
+
 	Testbed(ETestbedMode mode, const fs::path& data_path) : Testbed(mode) { load_training_data(data_path); }
 	Testbed(ETestbedMode mode, const fs::path& data_path, const fs::path& network_config_path) : Testbed(mode, data_path) {
 		reload_network_from_file(network_config_path);
@@ -865,6 +870,13 @@ public:
 
 		ENerfActivation rgb_activation = ENerfActivation::Exponential;
 		ENerfActivation density_activation = ENerfActivation::Exponential;
+		// Whether to interpret density network's first output as SDF and convert to density
+		bool m_use_sdf = false;
+		bool use_sdf() const { return m_use_sdf; }
+		void set_use_sdf(bool v) { m_use_sdf = v; }
+		float m_sdf_eikonal_lambda = 0.0f; // weight for eikonal loss when using SDF
+		float sdf_eikonal_lambda() const { return m_sdf_eikonal_lambda; }
+		void set_sdf_eikonal_lambda(float v) { m_sdf_eikonal_lambda = v; }
 
 		vec3 light_dir = vec3(0.5f);
 		// which training image's latent code should be used for rendering

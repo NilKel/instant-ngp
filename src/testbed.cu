@@ -70,6 +70,8 @@
 using namespace std::literals::chrono_literals;
 
 namespace ngp {
+__device__ __constant__ bool kUseSdf = false;
+__device__ __constant__ float kSdfEikonalLambda = 0.0f;
 
 int do_system(const std::string& cmd) {
 #ifdef _WIN32

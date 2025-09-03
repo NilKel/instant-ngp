@@ -51,6 +51,18 @@ __global__ void accumulate_divergence_single_kernel(
 	uint32_t n, uint32_t feature_idx, uint32_t component_idx, const float* __restrict__ dL_dpos, uint32_t dpos_stride, T* __restrict__ out, uint32_t out_stride
 );
 
+// Eikonal helper
+template <typename T>
+__global__ void compute_eikonal_v_kernel(
+	uint32_t batch_size,
+	uint32_t input_width,
+	const float* __restrict__ g, uint32_t g_stride,
+	float* __restrict__ v, uint32_t v_stride
+);
+
+// Scale array kernel
+static __global__ void nerf_scale_array_kernel(uint32_t n, float s, float* x);
+
 
 template <typename T>
 __global__ void extract_density(
@@ -201,6 +213,10 @@ public:
 	uint32_t padded_density_output_width() const {
 		return m_density_network->padded_output_width();
 	}
+	
+	void set_sdf_eikonal_lambda(float lambda) {
+		m_sdf_eikonal_lambda = lambda;
+	}
 
 	std::unique_ptr<Context> forward_impl(cudaStream_t stream, const GPUMatrixDynamic<float>& input, GPUMatrixDynamic<T>* output = nullptr, bool use_inference_params = false, bool prepare_input_gradients = false) override {
 		// Make sure our temporary buffers have the correct size for the given batch size
@@ -271,6 +287,9 @@ public:
 					GradientMode::Overwrite
 				);
 
+				// Store analytic gradient w.r.t. positions (used as normals when in SDF mode)
+				forward->dSDF_dPos = dL_dpos_input.slice_rows(0, m_pos_encoding->input_width());
+
 				// Compute features = ReLU(-dot(Phi_i, n_hat))
 				compute_surface_features_kernel<T><<<n_blocks_linear(batch_size), N_THREADS_LINEAR, 0, stream>>>(
 					batch_size,
@@ -302,6 +321,7 @@ public:
 					m_density_network->backward(stream, *forward->density_network_ctx, forward->density_network_input, forward->density_network_output, dL_ddensity_out, &dL_ddensity_in, use_inference_params, GradientMode::Overwrite);
 					GPUMatrixDynamic<float> dL_dpos_input;
 					m_pos_encoding->backward(stream, *forward->pos_encoding_ctx, input.slice_rows(0, m_pos_encoding->input_width()), forward->density_network_input, dL_ddensity_in, &dL_dpos_input, use_inference_params, GradientMode::Overwrite);
+					forward->dSDF_dPos = dL_dpos_input.slice_rows(0, m_pos_encoding->input_width());
 					auto surf_slice = feat_out.slice_rows(0, D);
 					compute_surface_features_kernel<T><<<n_blocks_linear(batch_size), N_THREADS_LINEAR, 0, stream>>>(
 						batch_size,
@@ -458,6 +478,62 @@ public:
 				dL_dpos_encoding_input = dL_dinput->slice_rows(0, m_pos_encoding->input_width());
 			}
 
+			// SDF Eikonal loss: add second-order gradients when dSDF_dPos is available
+			if (forward.dSDF_dPos.data() && m_sdf_eikonal_lambda > 0.0f) {
+				// Build dL_dsdf_dinput vector including Eikonal term: 2*(||∇SDF|| - 1) * ∇SDF / ||∇SDF||
+				GPUMatrixDynamic<float> dL_dsdf_dinput{m_pos_encoding->input_width(), batch_size, stream, CM};
+				compute_eikonal_v_kernel<T><<<n_blocks_linear(batch_size), N_THREADS_LINEAR, 0, stream>>>(
+					batch_size,
+					m_pos_encoding->input_width(),
+					forward.dSDF_dPos.data(), forward.dSDF_dPos.layout() == AoS ? forward.dSDF_dPos.stride() : 1,
+					dL_dsdf_dinput.data(), dL_dsdf_dinput.layout() == AoS ? dL_dsdf_dinput.stride() : 1
+				);
+				if (m_sdf_eikonal_lambda != 1.0f) {
+					linear_kernel(nerf_scale_array_kernel, 0, stream, dL_dsdf_dinput.n_elements(), m_sdf_eikonal_lambda, dL_dsdf_dinput.data());
+				}
+
+				// Apply backward_backward_input for second-order Eikonal gradients
+				// First get dSDF_denc by seeding unit grad on SDF and backprop through density network
+				GPUMatrixDynamic<T> dSDF_dSDF_seed{forward.density_network_output.m(), batch_size, stream, forward.density_network_output.layout()};
+				CUDA_CHECK_THROW(cudaMemsetAsync(dSDF_dSDF_seed.data(), 0, dSDF_dSDF_seed.n_bytes(), stream));
+				set_first_channel_one_kernel<T><<<n_blocks_linear(batch_size), N_THREADS_LINEAR, 0, stream>>>(
+					batch_size,
+					dSDF_dSDF_seed.data(),
+					dSDF_dSDF_seed.layout() == AoS ? dSDF_dSDF_seed.stride() : 1
+				);
+
+				GPUMatrixDynamic<T> dSDF_denc{forward.density_network_input.m(), batch_size, stream, forward.density_network_input.layout()};
+				m_density_network->backward(stream, *forward.density_network_ctx, forward.density_network_input, forward.density_network_output, dSDF_dSDF_seed, &dSDF_denc, use_inference_params, GradientMode::Ignore);
+
+				// backward_backward_input through pos encoding
+				GPUMatrixDynamic<T> pos_encoding_dy{forward.density_network_input.m(), batch_size, stream, forward.density_network_input.layout()};
+				GPUMatrixDynamic<float> dL_dsdf_dinput_d_input;
+				m_pos_encoding->backward_backward_input(
+					stream,
+					*forward.pos_encoding_ctx,
+					input.slice_rows(0, m_pos_encoding->input_width()),
+					dL_dsdf_dinput,
+					dSDF_denc,
+					&pos_encoding_dy,
+					&dL_dsdf_dinput_d_input,
+					use_inference_params,
+					GradientMode::Accumulate
+				);
+
+				// backward_backward_input through density network
+				m_density_network->backward_backward_input(
+					stream,
+					*forward.density_network_ctx,
+					forward.density_network_input,
+					pos_encoding_dy,
+					dSDF_dSDF_seed,
+					nullptr,
+					nullptr,
+					use_inference_params,
+					GradientMode::Accumulate
+				);
+			}
+
 			m_pos_encoding->backward(
 				stream,
 				*forward.pos_encoding_ctx,
@@ -557,6 +633,8 @@ public:
 			);
 		}
 	}
+
+
 
 	void set_params_impl(T* params, T* inference_params, T* gradients) override {
 		m_density_model->set_params(params, inference_params, gradients);
@@ -865,6 +943,9 @@ private:
 	uint32_t m_feature_width = 16;
 	std::string m_radiance_head_mode = std::string("baseline");
 	std::string m_loss_mode = std::string("");
+	
+	// SDF mode parameters
+	float m_sdf_eikonal_lambda = 0.0f;
 
 	// // Storage of forward pass data
 	struct ForwardContext : public Context {
@@ -878,10 +959,36 @@ private:
 
 		std::unique_ptr<Context> density_network_ctx;
 		std::unique_ptr<Context> rgb_network_ctx;
+
+		// Analytic spatial gradient of the first density-head channel w.r.t. input position (∇SDF in SDF mode)
+		GPUMatrixDynamic<float> dSDF_dPos;
 	};
 };
 
 // Kernel implementations
+
+// Helper: compute v = dL/d(∇SDF) for eikonal: v = 2*(||g|| - 1) * g / max(||g||, eps)
+template <typename T>
+__global__ void compute_eikonal_v_kernel(
+	uint32_t batch_size,
+	uint32_t input_width,
+	const float* __restrict__ g, uint32_t g_stride,
+	float* __restrict__ v, uint32_t v_stride
+) {
+	uint32_t b = threadIdx.x + blockIdx.x * blockDim.x;
+	if (b >= batch_size) return;
+	float gx = g[0 * g_stride + b];
+	float gy = input_width > 1 ? g[1 * g_stride + b] : 0.f;
+	float gz = input_width > 2 ? g[2 * g_stride + b] : 0.f;
+	float norm = sqrtf(gx*gx + gy*gy + gz*gz) + 1e-8f;
+	float factor = 2.0f * (norm - 1.0f) / norm;
+	if (input_width > 0) v[0 * v_stride + b] = factor * gx;
+	if (input_width > 1) v[1 * v_stride + b] = factor * gy;
+	if (input_width > 2) v[2 * v_stride + b] = factor * gz;
+	for (uint32_t r = 3; r < input_width; ++r) {
+		v[r * v_stride + b] = 0.f;
+	}
+}
 
 template <typename T>
 __global__ void set_first_channel_one_kernel(
@@ -906,8 +1013,10 @@ __global__ void compute_surface_features_kernel(
 	float nx = dpos[b * dpos_stride + 0];
 	float ny = dpos[b * dpos_stride + 1];
 	float nz = dpos[b * dpos_stride + 2];
-	float norm = sqrtf(nx*nx + ny*ny + nz*nz) + 1e-8f;
-	nx /= norm; ny /= norm; nz /= norm;
+	if (!kUseSdf) {
+		float norm = sqrtf(nx*nx + ny*ny + nz*nz) + 1e-8f;
+		nx /= norm; ny /= norm; nz /= norm;
+	}
 
 	for (uint32_t i = 0; i < D; ++i) {
 		T px = phi[(i*3+0) * phi_stride + b];
@@ -934,6 +1043,12 @@ __global__ void accumulate_divergence_single_kernel(
 	uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
 	if (i >= n) return;
 	out[i * out_stride + feature_idx] += dL_dpos[i * dpos_stride + component_idx];
+}
+
+static __global__ void nerf_scale_array_kernel(uint32_t n, float s, float* x) {
+	uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
+	if (i >= n) return;
+	x[i] *= s;
 }
 
 }

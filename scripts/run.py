@@ -72,6 +72,8 @@ def parse_args():
 	parser.add_argument("--vr", action="store_true", help="Render to a VR headset.")
 
 	parser.add_argument("--sharpen", default=0, help="Set amount of sharpening applied to NeRF training images. Range 0.0 to 1.0.")
+	parser.add_argument("--use_sdf", action="store_true", help="If set, treat density MLP's first output as SDF and convert to density for alpha blending.")
+	parser.add_argument("--eikonal_lambda", type=float, default=0.0, help="Eikonal loss weight for SDF normals (||\u2207SDF||-1)^2. Default 0.0.")
 
 
 	return parser.parse_args()
@@ -94,7 +96,7 @@ if __name__ == "__main__":
 	if args.loss_mode == "surface":
 		os.environ["NGP_SURFACE_SAMPLE_LOSS"] = "1"
 	else:
-		os.environ.pop("NGP_SURFACE_SAMPLE_LOSS", None)
+		os.environ.pop("NGP_SURFACE_LOSS", None)
 
 	testbed = ngp.Testbed()
 	testbed.root_dir = ROOT_DIR
@@ -122,15 +124,26 @@ if __name__ == "__main__":
 				if len(parts) >= 2 and parts[-1] == "transforms_train.json":
 					dataset = parts[-2]  # scene
 					data_root = parts[-3]  # dataset folder name
-					out_rel = os.path.join(data_root, dataset, args.name)
+					folder_parts = [data_root, dataset]
+					if args.configuration:
+						folder_parts.append(args.configuration)
+					folder_parts.append(args.name)
+					out_rel = os.path.join(*folder_parts)
 					out_abs = os.path.join(ROOT_DIR, out_rel)
 					os.makedirs(out_abs, exist_ok=True)
+					# Track output directory for downstream saves
+					output_dir_abs = out_abs
 					# Prepare subfolders commonly used
 					for sub in ["checkpoints", "logs", "images", "evaluation", "mesh", "recording"]:
 						os.makedirs(os.path.join(out_abs, sub), exist_ok=True)
 					print(f"Outputs will be stored under: {out_abs}")
 			except Exception as e:
 				print(f"Warning: failed to create structured output folders: {e}")
+
+	# Ensure variable exists even if no name provided
+	output_dir_abs = locals().get('output_dir_abs', None)
+	images_dir = os.path.join(output_dir_abs, "images") if output_dir_abs else None
+	logs_dir = os.path.join(output_dir_abs, "logs") if output_dir_abs else None
 
 	if args.gui:
 		# Pick a sensible GUI resolution depending on arguments.
@@ -173,6 +186,18 @@ if __name__ == "__main__":
 	testbed.exposure = args.exposure
 	testbed.shall_train = args.train if args.gui else True
 
+	# Apply SDF mode if requested
+	if getattr(args, "use_sdf", False):
+		print("[run.py] Enabling SDF mode: interpreting sigma as SDF and converting to density.")
+		try:
+			testbed.use_sdf = True
+			# Set eikonal lambda (defaults to 0.0)
+			try:
+				testbed.sdf_eikonal_lambda = float(args.eikonal_lambda)
+			except Exception:
+				pass
+		except Exception as e:
+			print(f"[run.py] Warning: could not set testbed.use_sdf: {e}")
 
 	network_stem = os.path.splitext(os.path.basename(args.network))[0] if args.network else "base"
 	if testbed.mode == ngp.TestbedMode.Sdf:
@@ -206,6 +231,9 @@ if __name__ == "__main__":
 	old_training_step = 0
 	n_steps = args.n_steps
 
+	# Fixed checkpoint path (overwritten) if an output directory is present
+	checkpoint_path = os.path.join(output_dir_abs, "checkpoints", "latest.msgpack") if output_dir_abs else None
+
 	# If we loaded a snapshot, didn't specify a number of steps, _and_ didn't open a GUI,
 	# don't train by default and instead assume that the goal is to render screenshots,
 	# compute PSNR, or render a video.
@@ -225,6 +253,14 @@ if __name__ == "__main__":
 					else:
 						break
 
+				# Overwrite checkpoint every 5000 steps
+				if checkpoint_path and (testbed.training_step % 5000 == 0) and testbed.training_step > 0:
+					try:
+						os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
+						testbed.save_snapshot(checkpoint_path, False)
+					except Exception as e:
+						print(f"Warning: failed to save periodic checkpoint: {e}")
+
 				# Update progress bar
 				if testbed.training_step < old_training_step or old_training_step == 0:
 					old_training_step = 0
@@ -240,12 +276,34 @@ if __name__ == "__main__":
 	if args.save_snapshot:
 		os.makedirs(os.path.dirname(args.save_snapshot), exist_ok=True)
 		testbed.save_snapshot(args.save_snapshot, False)
+	elif output_dir_abs:
+		# Overwrite the fixed checkpoint file at the end as well
+		final_snap = os.path.join(output_dir_abs, "checkpoints", "latest.msgpack")
+		try:
+			print(f"Saving final snapshot to {final_snap}")
+			testbed.save_snapshot(final_snap, False)
+		except Exception as e:
+			print(f"Warning: could not save final snapshot: {e}")
+
+	# Auto-evaluation: if scene was given and no explicit test_transforms, try to use dataset test transforms
+	if not args.test_transforms and args.scene:
+		try:
+			scene_dir = os.path.dirname(args.scene)
+			candidate = os.path.join(scene_dir, "transforms_test.json")
+			if os.path.exists(candidate):
+				args.test_transforms = candidate
+		except Exception:
+			pass
 
 	if args.test_transforms:
 		print("Evaluating test transforms from ", args.test_transforms)
 		with open(args.test_transforms) as f:
 			test_transforms = json.load(f)
 		data_dir=os.path.dirname(args.test_transforms)
+		# If we have an output folder, stage eval there
+		eval_dir = os.path.join(output_dir_abs, "evaluation") if output_dir_abs else os.getcwd()
+		os.makedirs(eval_dir, exist_ok=True)
+
 		totmse = 0
 		totpsnr = 0
 		totssim = 0
@@ -278,12 +336,12 @@ if __name__ == "__main__":
 				image = testbed.render(resolution[0], resolution[1], spp, True)
 
 				if i == 0:
-					write_image(f"ref.png", ref_image)
-					write_image(f"out.png", image)
+					write_image(os.path.join(eval_dir, "ref.png"), ref_image)
+					write_image(os.path.join(eval_dir, "out.png"), image)
 
 					diffimg = np.absolute(image - ref_image)
 					diffimg[...,3:4] = 1.0
-					write_image("diff.png", diffimg)
+					write_image(os.path.join(eval_dir, "diff.png"), diffimg)
 
 				A = np.clip(linear_to_srgb(image[...,:3]), 0.0, 1.0)
 				R = np.clip(linear_to_srgb(ref_image[...,:3]), 0.0, 1.0)
@@ -302,6 +360,11 @@ if __name__ == "__main__":
 		psnr = totpsnr/(totcount or 1)
 		ssim = totssim/(totcount or 1)
 		print(f"PSNR={psnr} [min={minpsnr} max={maxpsnr}] SSIM={ssim}")
+		try:
+			with open(os.path.join(eval_dir, "metrics.json"), "w") as f:
+				json.dump({"psnr": psnr, "psnr_avgmse": psnr_avgmse, "ssim": ssim, "minpsnr": minpsnr, "maxpsnr": maxpsnr}, f, indent=2)
+		except Exception as e:
+			print(f"Warning: could not write metrics.json: {e}")
 
 	if args.save_mesh:
 		res = args.marching_cubes_res or 256
@@ -380,3 +443,47 @@ if __name__ == "__main__":
 			os.system(f"ffmpeg -y -framerate {args.video_fps} -i tmp/%04d.jpg -c:v libx264 -pix_fmt yuv420p {args.video_output}")
 
 		shutil.rmtree("tmp")
+
+	# After training: optional rendering of training views every 25 (train + test)
+	if output_dir_abs and testbed.nerf.training.dataset.n_images > 0:
+		try:
+			os.makedirs(images_dir, exist_ok=True)
+			with tqdm(range(testbed.nerf.training.dataset.n_images), unit="images", desc=f"Saving training views (stride 25)") as t2:
+				for i in t2:
+					if i % 25 != 0:
+						continue
+					res = testbed.nerf.training.dataset.metadata[i].resolution
+					testbed.set_camera_to_training_view(i)
+					img = testbed.render(res[0], res[1], 8, True)
+					write_image(os.path.join(images_dir, f"train_{i:04d}.png"), img)
+		except Exception as e:
+			print(f"Warning: failed to save stride-25 training views: {e}")
+
+	# Also render test views every 25 if available
+	try:
+		if args.test_transforms and os.path.exists(args.test_transforms):
+			with open(args.test_transforms) as f:
+				_ = json.load(f)
+			# Load test set for indexing
+			testbed.load_training_data(args.test_transforms)
+			with tqdm(range(testbed.nerf.training.dataset.n_images), unit="images", desc=f"Saving test views (stride 25)") as t3:
+				for i in t3:
+					if i % 25 != 0:
+						continue
+					res = testbed.nerf.training.dataset.metadata[i].resolution
+					testbed.set_camera_to_training_view(i)
+					img = testbed.render(res[0], res[1], 8, True)
+					write_image(os.path.join(images_dir, f"test_{i:04d}.png"), img)
+	except Exception as e:
+		print(f"Warning: failed to save stride-25 test views: {e}")
+
+	# Write basic logs (loss progression)
+	if output_dir_abs:
+		try:
+			os.makedirs(logs_dir, exist_ok=True)
+			with open(os.path.join(logs_dir, "meta.txt"), "w") as f:
+				f.write(f"configuration={args.configuration}\n")
+				f.write(f"loss_mode={args.loss_mode}\n")
+				f.write(f"use_sdf={getattr(args, 'use_sdf', False)}\n")
+		except Exception as e:
+			print(f"Warning: could not write logs: {e}")
