@@ -203,6 +203,7 @@ void Testbed::set_mode(ETestbedMode mode) {
 	m_image = {};
 	m_mesh = {};
 	m_nerf = {};
+	m_nerf.m_parent = this;  // Set parent pointer for access to m_nerf_network
 	m_sdf = {};
 	m_volume = {};
 

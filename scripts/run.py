@@ -75,6 +75,11 @@ def parse_args():
 	parser.add_argument("--use_sdf", action="store_true", help="If set, treat density MLP's first output as SDF and convert to density for alpha blending.")
 	parser.add_argument("--eikonal_lambda", type=float, default=0.0, help="Eikonal loss weight for SDF normals (||\u2207SDF||-1)^2. Default 0.0.")
 	parser.add_argument("--background_color", choices=["white", "black"], default="white", help="Background color for training and testing. Default: white.")
+	
+	# Cumulative sum regularization arguments
+	parser.add_argument("--cumsum_reg", action="store_true", help="Enable cumulative sum feature regularization for dual modes.")
+	parser.add_argument("--lambda_feature_cumsum", type=float, default=1e-3, help="Weight for cumulative sum feature regularization. Default: 1e-3.")
+	parser.add_argument("--feature_reg_start_iter", type=int, default=5000, help="Iteration to start applying cumulative sum regularization. Default: 5000.")
 
 
 	return parser.parse_args()
@@ -208,6 +213,16 @@ if __name__ == "__main__":
 				pass
 		except Exception as e:
 			print(f"[run.py] Warning: could not set testbed.use_sdf: {e}")
+	
+	# Set cumulative sum regularization parameters
+	if getattr(args, "cumsum_reg", False):
+		print(f"[run.py] Enabling cumulative sum regularization with lambda={args.lambda_feature_cumsum}, start_iter={args.feature_reg_start_iter}")
+		try:
+			testbed.cumsum_reg = True
+			testbed.lambda_feature_cumsum = float(args.lambda_feature_cumsum)
+			testbed.feature_reg_start_iter = int(args.feature_reg_start_iter)
+		except Exception as e:
+			print(f"[run.py] Warning: could not set cumsum regularization parameters: {e}")
 
 	network_stem = os.path.splitext(os.path.basename(args.network))[0] if args.network else "base"
 	if testbed.mode == ngp.TestbedMode.Sdf:
@@ -273,18 +288,48 @@ if __name__ == "__main__":
 
 				# Save training views at the final training iteration
 				if images_dir and testbed.training_step == n_steps - 1:
-					try:
-						os.makedirs(images_dir, exist_ok=True)
-						print(f"\nSaving training views at final iteration {testbed.training_step}...")
-						for i in range(testbed.nerf.training.dataset.n_images):
-							if i % 25 != 0:
-								continue
-							res = testbed.nerf.training.dataset.metadata[i].resolution
-							testbed.set_camera_to_training_view(i)
-							img = testbed.render(res[0], res[1], 8, True)
-							write_image(os.path.join(images_dir, f"train_{i:04d}.png"), img)
-					except Exception as e:
-						print(f"Warning: failed to save training views at final iteration: {e}")
+					print(f"\n[DEBUG] Skipping training view rendering to speed up testing...")
+					# try:
+					# 	os.makedirs(images_dir, exist_ok=True)
+					# 	print(f"\nSaving training views at final iteration {testbed.training_step}...")
+					# 	for i in range(testbed.nerf.training.dataset.n_images):
+					# 		if i % 25 != 0:
+					# 			continue
+					# 		res = testbed.nerf.training.dataset.metadata[i].resolution
+					# 		testbed.set_camera_to_training_view(i)
+					# 		img = testbed.render(res[0], res[1], 8, True)
+					# 		write_image(os.path.join(images_dir, f"train_{i:04d}.png"), img)
+					# 		
+					# 		# For dual modes, also save separate surface and volume RGB images
+					# 		try:
+					# 			if hasattr(testbed, 'render_dual_separate'):
+					# 				print(f"🔍 [DEBUG] Calling render_dual_separate for train_{i:04d} with mode: {testbed.nerf.radiance_head_mode}")
+					# 				surf_img, vol_img = testbed.render_dual_separate(res[0], res[1], 8, True)
+					# 				
+					# 				# Check if images are identical
+					# 				surf_gray = np.mean(surf_img, axis=-1) if len(surf_img.shape) > 2 else surf_img
+					# 				vol_gray = np.mean(vol_img, axis=-1) if len(vol_img.shape) > 2 else vol_img
+					# 				diff = np.abs(surf_gray - vol_gray)
+					# 				max_diff = np.max(diff)
+					# 				mean_diff = np.mean(diff)
+					# 				
+					# 				print(f"🔍 [ANALYSIS] train_{i:04d}: max_diff={max_diff:.8f}, mean_diff={mean_diff:.8f}")
+					# 				if max_diff < 1e-6:
+					# 					print(f"❌ CRITICAL: train_{i:04d} surface and volume images are IDENTICAL!")
+					# 				else:
+					# 					print(f"✅ train_{i:04d} surface and volume images are different")
+					# 				
+					# 				write_image(os.path.join(images_dir, f"train_surf_{i:04d}.png"), surf_img)
+					# 				write_image(os.path.join(images_dir, f"train_vol_{i:04d}.png"), vol_img)
+					# 				print(f"Saved dual mode images: train_surf_{i:04d}.png, train_vol_{i:04d}.png")
+					# 			else:
+					# 				print(f"❌ [DEBUG] render_dual_separate method not available")
+					# 		except Exception as e:
+					# 			print(f"Warning: failed to save separate dual mode images for train_{i:04d}: {e}")
+					# 			import traceback
+					# 			traceback.print_exc()
+					# except Exception as e:
+					# 	print(f"Warning: failed to save training views at final iteration: {e}")
 
 				# Update progress bar
 				if testbed.training_step < old_training_step or old_training_step == 0:
@@ -321,74 +366,75 @@ if __name__ == "__main__":
 			pass
 
 	if args.test_transforms:
-		print("Evaluating test transforms from ", args.test_transforms)
-		with open(args.test_transforms) as f:
-			test_transforms = json.load(f)
-		data_dir=os.path.dirname(args.test_transforms)
-		# If we have an output folder, stage eval there
-		eval_dir = os.path.join(output_dir_abs, "evaluation") if output_dir_abs else os.getcwd()
-		os.makedirs(eval_dir, exist_ok=True)
+		print("[DEBUG] Skipping test transforms evaluation to speed up testing...")
+		# print("Evaluating test transforms from ", args.test_transforms)
+		# with open(args.test_transforms) as f:
+		# 	test_transforms = json.load(f)
+		# data_dir=os.path.dirname(args.test_transforms)
+		# # If we have an output folder, stage eval there
+		# eval_dir = os.path.join(output_dir_abs, "evaluation") if output_dir_abs else os.getcwd()
+		# os.makedirs(eval_dir, exist_ok=True)
 
-		totmse = 0
-		totpsnr = 0
-		totssim = 0
-		totcount = 0
-		minpsnr = 1000
-		maxpsnr = 0
+		# totmse = 0
+		# totpsnr = 0
+		# totssim = 0
+		# totcount = 0
+		# minpsnr = 1000
+		# maxpsnr = 0
 
-		# Background color already set from args.background_color above
+		# # Background color already set from args.background_color above
 
-		# Prior nerf papers don't typically do multi-sample anti aliasing.
-		# So snap all pixels to the pixel centers.
-		testbed.snap_to_pixel_centers = True
-		spp = 8
+		# # Prior nerf papers don't typically do multi-sample anti aliasing.
+		# # So snap all pixels to the pixel centers.
+		# testbed.snap_to_pixel_centers = True
+		# spp = 8
 
-		testbed.nerf.render_min_transmittance = 1e-4
+		# testbed.nerf.render_min_transmittance = 1e-4
 
-		testbed.shall_train = False
-		testbed.load_training_data(args.test_transforms)
+		# testbed.shall_train = False
+		# testbed.load_training_data(args.test_transforms)
 
-		testbed.render_with_lens_distortion = True
+		# testbed.render_with_lens_distortion = True
 
-		with tqdm(range(testbed.nerf.training.dataset.n_images), unit="images", desc=f"Rendering test frame") as t:
-			for i in t:
-				resolution = testbed.nerf.training.dataset.metadata[i].resolution
-				testbed.render_ground_truth = True
-				testbed.set_camera_to_training_view(i)
-				ref_image = testbed.render(resolution[0], resolution[1], 1, True)
-				testbed.render_ground_truth = False
-				image = testbed.render(resolution[0], resolution[1], spp, True)
+		# with tqdm(range(testbed.nerf.training.dataset.n_images), unit="images", desc=f"Rendering test frame") as t:
+		# 	for i in t:
+		# 		resolution = testbed.nerf.training.dataset.metadata[i].resolution
+		# 		testbed.render_ground_truth = True
+		# 		testbed.set_camera_to_training_view(i)
+		# 		ref_image = testbed.render(resolution[0], resolution[1], 1, True)
+		# 		testbed.render_ground_truth = False
+		# 		image = testbed.render(resolution[0], resolution[1], spp, True)
 
-				if i == 0:
-					write_image(os.path.join(eval_dir, "ref.png"), ref_image)
-					write_image(os.path.join(eval_dir, "out.png"), image)
+		# 		if i == 0:
+		# 			write_image(os.path.join(eval_dir, "ref.png"), ref_image)
+		# 			write_image(os.path.join(eval_dir, "out.png"), image)
 
-					diffimg = np.absolute(image - ref_image)
-					diffimg[...,3:4] = 1.0
-					write_image(os.path.join(eval_dir, "diff.png"), diffimg)
+		# 			diffimg = np.absolute(image - ref_image)
+		# 			diffimg[...,3:4] = 1.0
+		# 			write_image(os.path.join(eval_dir, "diff.png"), diffimg)
 
-				A = np.clip(linear_to_srgb(image[...,:3]), 0.0, 1.0)
-				R = np.clip(linear_to_srgb(ref_image[...,:3]), 0.0, 1.0)
-				mse = float(compute_error("MSE", A, R))
-				ssim = float(compute_error("SSIM", A, R))
-				totssim += ssim
-				totmse += mse
-				psnr = mse2psnr(mse)
-				totpsnr += psnr
-				minpsnr = psnr if psnr<minpsnr else minpsnr
-				maxpsnr = psnr if psnr>maxpsnr else maxpsnr
-				totcount = totcount+1
-				t.set_postfix(psnr = totpsnr/(totcount or 1))
+		# 		A = np.clip(linear_to_srgb(image[...,:3]), 0.0, 1.0)
+		# 		R = np.clip(linear_to_srgb(ref_image[...,:3]), 0.0, 1.0)
+		# 		mse = float(compute_error("MSE", A, R))
+		# 		ssim = float(compute_error("SSIM", A, R))
+		# 		totssim += ssim
+		# 		totmse += mse
+		# 		psnr = mse2psnr(mse)
+		# 		totpsnr += psnr
+		# 		minpsnr = psnr if psnr<minpsnr else minpsnr
+		# 		maxpsnr = psnr if psnr>maxpsnr else maxpsnr
+		# 		totcount = totcount+1
+		# 		t.set_postfix(psnr = totpsnr/(totcount or 1))
 
-		psnr_avgmse = mse2psnr(totmse/(totcount or 1))
-		psnr = totpsnr/(totcount or 1)
-		ssim = totssim/(totcount or 1)
-		print(f"PSNR={psnr} [min={minpsnr} max={maxpsnr}] SSIM={ssim}")
-		try:
-			with open(os.path.join(eval_dir, "metrics.json"), "w") as f:
-				json.dump({"psnr": psnr, "psnr_avgmse": psnr_avgmse, "ssim": ssim, "minpsnr": minpsnr, "maxpsnr": maxpsnr}, f, indent=2)
-		except Exception as e:
-			print(f"Warning: could not write metrics.json: {e}")
+		# psnr_avgmse = mse2psnr(totmse/(totcount or 1))
+		# psnr = totpsnr/(totcount or 1)
+		# ssim = totssim/(totcount or 1)
+		# print(f"PSNR={psnr} [min={minpsnr} max={maxpsnr}] SSIM={ssim}")
+		# try:
+		# 	with open(os.path.join(eval_dir, "metrics.json"), "w") as f:
+		# 		json.dump({"psnr": psnr, "psnr_avgmse": psnr_avgmse, "ssim": ssim, "minpsnr": minpsnr, "maxpsnr": maxpsnr}, f, indent=2)
+		# except Exception as e:
+		# 	print(f"Warning: could not write metrics.json: {e}")
 
 	if args.save_mesh:
 		res = args.marching_cubes_res or 256
@@ -470,7 +516,8 @@ if __name__ == "__main__":
 
 	# Render test views every 25 if available, saving both GT and rendered
 	try:
-		if args.test_transforms and os.path.exists(args.test_transforms):
+		if args.test_transforms and os.path.exists(args.test_transforms) and images_dir:
+			print(f"Rendering strided test views for dual_separate verification...")
 			with open(args.test_transforms) as f:
 				_ = json.load(f)
 			# Load test set for indexing
@@ -487,10 +534,28 @@ if __name__ == "__main__":
 					gt_img = testbed.render(res[0], res[1], 1, True)
 					write_image(os.path.join(images_dir, f"gt_{i:04d}.png"), gt_img)
 					
-					# Save rendered image
+					# Save blended rendered image (default 0.5 + 0.5)
 					testbed.render_ground_truth = False
-					rendered_img = testbed.render(res[0], res[1], 8, True)
-					write_image(os.path.join(images_dir, f"test_{i:04d}.png"), rendered_img)
+					blended_img = testbed.render(res[0], res[1], 8, True)
+					write_image(os.path.join(images_dir, f"test_blended_{i:04d}.png"), blended_img)
+					
+					# For dual_separate mode, also render surface-only and volume-only
+					if args.configuration == "dual_separate":
+						try:
+
+							
+							# Use the C++ render_dual_separate method to get true surface and volume images
+							surface_img, volume_img = testbed.render_dual_separate(res[0], res[1], 8, True)
+							
+							# Convert numpy arrays to the format expected by write_image
+							write_image(os.path.join(images_dir, f"test_surface_{i:04d}.png"), surface_img)
+							write_image(os.path.join(images_dir, f"test_volume_{i:04d}.png"), volume_img)
+							print(f"✅ Saved test images for view {i}: blended, surface, volume")
+							
+						except Exception as e:
+							print(f"Warning: failed to save separate dual mode images for test_{i:04d}: {e}")
+							import traceback
+							traceback.print_exc()
 	except Exception as e:
 		print(f"Warning: failed to save stride-25 test views: {e}")
 

@@ -1,4 +1,5 @@
 {
 	"radiance_head_mode": "dual_separate",
+	"loss_mode": "surface",
 	"parent": "base.json"
 } 

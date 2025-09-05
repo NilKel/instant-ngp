@@ -78,6 +78,14 @@ public:
 	float sdf_eikonal_lambda() const { return m_nerf.m_sdf_eikonal_lambda; }
 	void set_sdf_eikonal_lambda(float v) { m_nerf.m_sdf_eikonal_lambda = v; }
 
+	// Cumulative sum feature regularization
+	bool cumsum_reg() const { return m_nerf.m_cumsum_reg; }
+	void set_cumsum_reg(bool v) { m_nerf.m_cumsum_reg = v; }
+	float lambda_feature_cumsum() const { return m_nerf.m_lambda_feature_cumsum; }
+	void set_lambda_feature_cumsum(float v) { m_nerf.m_lambda_feature_cumsum = v; }
+	uint32_t feature_reg_start_iter() const { return m_nerf.m_feature_reg_start_iter; }
+	void set_feature_reg_start_iter(uint32_t v) { m_nerf.m_feature_reg_start_iter = v; }
+
 	Testbed(ETestbedMode mode, const fs::path& data_path) : Testbed(mode) { load_training_data(data_path); }
 	Testbed(ETestbedMode mode, const fs::path& data_path, const fs::path& network_config_path) : Testbed(mode, data_path) {
 		reload_network_from_file(network_config_path);
@@ -223,6 +231,8 @@ public:
 			const float* extra_dims_gpu,
 			cudaStream_t stream
 		);
+
+
 
 		void enlarge(size_t n_elements, uint32_t padded_output_width, uint32_t n_extra_dims, cudaStream_t stream);
 		RaysNerfSoa& rays_hit() { return m_rays_hit; }
@@ -490,6 +500,7 @@ public:
 
 	void train_nerf(uint32_t target_batch_size, bool get_loss_scalar, cudaStream_t stream);
 	void train_nerf_step(uint32_t target_batch_size, NerfCounters& counters, cudaStream_t stream);
+	float compute_cumsum_regularization_loss(cudaStream_t stream);
 	void train_sdf(size_t target_batch_size, bool get_loss_scalar, cudaStream_t stream);
 	void train_image(size_t target_batch_size, bool get_loss_scalar, cudaStream_t stream);
 	void set_train(bool mtrain);
@@ -526,6 +537,11 @@ public:
 		render_to_cpu(int width, int height, int spp, bool linear, float start_t, float end_t, float fps, float shutter_fraction);
 	pybind11::array_t<float>
 		render_to_cpu_rgba(int width, int height, int spp, bool linear, float start_t, float end_t, float fps, float shutter_fraction);
+	std::pair<pybind11::array_t<float>, pybind11::array_t<float>>
+		render_dual_separate(int width, int height, int spp, bool linear);
+	// Internal method for dual mode rendering
+	std::pair<std::vector<float>, std::vector<float>>
+		render_dual_separate_internal(int width, int height, int spp, bool linear);
 	pybind11::array_t<float> view(bool linear, size_t view) const;
 	void override_sdf_training_data(pybind11::array_t<float> points, pybind11::array_t<float> distances);
 #	ifdef NGP_GUI
@@ -744,6 +760,8 @@ public:
 	bool m_gui_redraw = true;
 
 	struct Nerf {
+		Testbed* m_parent = nullptr;  // Pointer to parent Testbed
+		
 		struct Training {
 			NerfDataset dataset;
 			int n_images_for_training = 0;      // how many images to train from, as a high watermark compared to the dataset size
@@ -877,6 +895,26 @@ public:
 		float m_sdf_eikonal_lambda = 0.0f; // weight for eikonal loss when using SDF
 		float sdf_eikonal_lambda() const { return m_sdf_eikonal_lambda; }
 		void set_sdf_eikonal_lambda(float v) { m_sdf_eikonal_lambda = v; }
+
+		// Cumulative sum feature regularization
+		bool m_cumsum_reg = false;
+		bool cumsum_reg() const { return m_cumsum_reg; }
+		void set_cumsum_reg(bool v) { m_cumsum_reg = v; }
+		float m_lambda_feature_cumsum = 1e-3f;
+		float lambda_feature_cumsum() const { return m_lambda_feature_cumsum; }
+		void set_lambda_feature_cumsum(float v) { m_lambda_feature_cumsum = v; }
+		uint32_t m_feature_reg_start_iter = 5000;
+		uint32_t feature_reg_start_iter() const { return m_feature_reg_start_iter; }
+		void set_feature_reg_start_iter(uint32_t v) { m_feature_reg_start_iter = v; }
+
+		// Render mode override for dual_separate rendering
+		int m_render_mode_override = -1;  // -1 = no override, 6 = surface-only, 7 = volume-only
+		int render_mode_override() const { return m_render_mode_override; }
+		void set_render_mode_override(int v) { m_render_mode_override = v; }
+		
+		// Radiance head mode (implemented in testbed.cu)
+		std::string radiance_head_mode() const;
+		void set_radiance_head_mode(const std::string& mode);
 
 		vec3 light_dir = vec3(0.5f);
 		// which training image's latent code should be used for rendering

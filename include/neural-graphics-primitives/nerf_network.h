@@ -51,6 +51,62 @@ __global__ void accumulate_divergence_single_kernel(
 	uint32_t n, uint32_t feature_idx, uint32_t component_idx, const float* __restrict__ dL_dpos, uint32_t dpos_stride, T* __restrict__ out, uint32_t out_stride
 );
 
+template <typename T>
+__global__ void combine_rgb_outputs_kernel(
+	uint32_t batch_size,
+	float weight_surface, float weight_volume,
+	const T* __restrict__ surface_rgb, uint32_t surf_stride,
+	const T* __restrict__ volume_rgb, uint32_t vol_stride,
+	T* __restrict__ output_rgb, uint32_t out_stride
+);
+
+template <typename T>
+__global__ void compute_divergence_features_kernel(
+	uint32_t batch_size,
+	uint32_t D,
+	const T* __restrict__ phi, uint32_t phi_stride,
+	const float* __restrict__ dphi_dx, uint32_t dphi_dx_stride,
+	const float* __restrict__ dphi_dy, uint32_t dphi_dy_stride,
+	const float* __restrict__ dphi_dz, uint32_t dphi_dz_stride,
+	T* __restrict__ out, uint32_t out_stride
+);
+
+template <typename T>
+__global__ void set_placeholder_normals_kernel(
+	uint32_t batch_size,
+	T* __restrict__ normals, uint32_t normal_stride
+);
+
+template <typename T>
+__global__ void set_single_component_seed_kernel(
+	uint32_t batch_size, uint32_t component_idx,
+	T* __restrict__ seed_data, uint32_t stride
+);
+
+template <typename T>
+__global__ void accumulate_single_divergence_kernel(
+	uint32_t batch_size, uint32_t feature_idx, uint32_t spatial_dim,
+	const T* __restrict__ spatial_gradients, uint32_t grad_stride,
+	T* __restrict__ divergence_features, uint32_t div_stride
+);
+
+template <typename T>
+__global__ void set_spatial_components_kernel(
+	uint32_t batch_size, 
+	uint32_t spatial_dim, 
+	uint32_t num_vectors,
+	T* __restrict__ dL_dout, uint32_t stride
+);
+
+template <typename T>
+__global__ void compute_divergence_accumulate_kernel(
+	uint32_t batch_size,
+	uint32_t num_features,
+	uint32_t spatial_dim,
+	const float* __restrict__ spatial_gradients, uint32_t spatial_stride,
+	float* __restrict__ divergence_features, uint32_t divergence_stride
+);
+
 // Eikonal helper
 template <typename T>
 __global__ void compute_eikonal_v_kernel(
@@ -132,8 +188,10 @@ public:
 			m_feature_width = 15; // D = 15 from Phi dot n_hat
 		} else if (m_radiance_head_mode == "volume") {
 			m_feature_width = 15; // D = 15 divergence
-		} else if (m_radiance_head_mode == "hybrid" || m_radiance_head_mode == "dual_merge" || m_radiance_head_mode == "dual_separate") {
-			m_feature_width = 30; // 15 surface + 15 volume
+		} else if (m_radiance_head_mode == "hybrid" || m_radiance_head_mode == "dual_merge") {
+			m_feature_width = 30; // 15 surface + 15 volume concatenated
+		} else if (m_radiance_head_mode == "dual_separate") {
+			m_feature_width = 15; // Each separate MLP gets 15D features (like baseline gets 16D)
 		} else {
 			m_feature_width = 16;
 		}
@@ -143,16 +201,20 @@ public:
 		if (!density_network.contains("n_output_dims")) {
 			// Expand density output to carry vector potential Phi (15x3) in non-baseline modes.
 			// Channel 0 remains the raw density channel as before; channels 1..45 reserved for Phi.
+			// For dual_separate, we need 1 + 45 = 46 channels total
 			local_density_network_config["n_output_dims"] = (m_radiance_head_mode == "baseline") ? 16 : 46;
 		}
 		m_density_network.reset(create_network<T>(local_density_network_config));
 
 		// RGB input width is [features (mode-dependent)] + [dir encoding]
+		// All modes use the same structure: feature_width + direction encoding
 		m_rgb_network_input_width = next_multiple(m_feature_width + m_dir_encoding->padded_output_width(), rgb_alignment);
 
 		json local_rgb_network_config = rgb_network;
 		local_rgb_network_config["n_input_dims"] = m_rgb_network_input_width;
+		// Standard RGB network always outputs 3D RGB
 		local_rgb_network_config["n_output_dims"] = 3;
+
 		m_rgb_network.reset(create_network<T>(local_rgb_network_config));
 
 		// Enable per-sample loss via json flag loss_mode=="surface"
@@ -162,9 +224,12 @@ public:
 
 		// Optional second RGB head for dual_separate mode (constructed now, used later)
 		if (m_radiance_head_mode == "dual_separate") {
+			// Create two identical RGB networks, same structure as main network
+			// Each gets 15D features + dir encoding, just like baseline gets 16D features + dir
+			
 			json local_rgb_network_config2 = rgb_network;
-			local_rgb_network_config2["n_input_dims"] = m_rgb_network_input_width;
-			local_rgb_network_config2["n_output_dims"] = 3;
+			local_rgb_network_config2["n_input_dims"] = m_rgb_network_input_width;  // Same as main network
+			local_rgb_network_config2["n_output_dims"] = 3;  // Both output 3D RGB
 			m_rgb_network_surface.reset(create_network<T>(local_rgb_network_config2));
 			m_rgb_network_volume.reset(create_network<T>(local_rgb_network_config2));
 		}
@@ -217,10 +282,92 @@ public:
 	void set_sdf_eikonal_lambda(float lambda) {
 		m_sdf_eikonal_lambda = lambda;
 	}
+	
+	void set_cumsum_regularization_enabled(bool enabled) {
+		m_cumsum_regularization_enabled = enabled;
+	}
+
+	const std::string& radiance_head_mode() const {
+		return m_radiance_head_mode;
+	}
+	
+	void set_radiance_head_mode(const std::string& mode) {
+		m_radiance_head_mode = mode;
+	}
+	
+	// Render with custom surface/volume weights (for dual_separate mode)
+	void render_with_dual_weights(
+		cudaStream_t stream,
+		const GPUMatrixDynamic<float>& input,
+		GPUMatrixDynamic<T>* output,
+		float weight_surface, 
+		float weight_volume,
+		bool use_inference_params = true
+	) {
+		if (m_radiance_head_mode != "dual_separate" || !output) {
+			// Fall back to normal forward pass
+			auto ctx = forward(stream, input, output, use_inference_params, false);
+			return;
+		}
+		
+		uint32_t batch_size = input.n();
+		
+		// Do forward pass to get surface and volume outputs
+		auto forward_ctx = forward(stream, input, output, use_inference_params, false);
+		auto& forward = dynamic_cast<const ForwardContext&>(*forward_ctx);
+		
+		// Re-combine with custom weights
+		if (forward.surface_rgb_output.n_elements() > 0 && forward.volume_rgb_output.n_elements() > 0) {
+			combine_rgb_outputs_kernel<T><<<n_blocks_linear(batch_size), N_THREADS_LINEAR, 0, stream>>>(
+				batch_size,
+				weight_surface, weight_volume,
+				forward.surface_rgb_output.data(),
+				forward.surface_rgb_output.layout() == AoS ? forward.surface_rgb_output.stride() : 1,
+				forward.volume_rgb_output.data(),
+				forward.volume_rgb_output.layout() == AoS ? forward.volume_rgb_output.stride() : 1,
+				output->data(),
+				output->layout() == AoS ? output->stride() : 1
+			);
+		}
+	}
+
+	// Access cumsum regularization features from trainer context
+	T* get_surface_features_from_context(const Context* trainer_ctx) const {
+		// Try to access the network's ForwardContext through the trainer context
+		// The trainer context should contain a model_ctx which is our ForwardContext
+		auto* forward_ctx = dynamic_cast<const ForwardContext*>(trainer_ctx);
+		return forward_ctx && forward_ctx->surface_features.n_elements() > 0 ? 
+			forward_ctx->surface_features.data() : nullptr;
+	}
+
+	T* get_volume_features_from_context(const Context* trainer_ctx) const {
+		auto* forward_ctx = dynamic_cast<const ForwardContext*>(trainer_ctx);
+		return forward_ctx && forward_ctx->volume_features.n_elements() > 0 ? 
+			forward_ctx->volume_features.data() : nullptr;
+	}
+
+	T* get_sample_densities_from_context(const Context* trainer_ctx) const {
+		auto* forward_ctx = dynamic_cast<const ForwardContext*>(trainer_ctx);
+		return forward_ctx && forward_ctx->sample_densities.n_elements() > 0 ? 
+			forward_ctx->sample_densities.data() : nullptr;
+	}
+
+	// Direct access to global feature storage for training kernel
+	T* get_global_surface_features() const { 
+		return m_global_surface_features.size() > 0 ? m_global_surface_features.data() : nullptr; 
+	}
+	T* get_global_volume_features() const { 
+		return m_global_volume_features.size() > 0 ? m_global_volume_features.data() : nullptr; 
+	}
+	T* get_global_sample_densities() const { 
+		return m_global_sample_densities.size() > 0 ? m_global_sample_densities.data() : nullptr; 
+	}
 
 	std::unique_ptr<Context> forward_impl(cudaStream_t stream, const GPUMatrixDynamic<float>& input, GPUMatrixDynamic<T>* output = nullptr, bool use_inference_params = false, bool prepare_input_gradients = false) override {
 		// Make sure our temporary buffers have the correct size for the given batch size
 		uint32_t batch_size = input.n();
+		
+		
 
 		auto forward = std::make_unique<ForwardContext>();
 
@@ -246,7 +393,7 @@ public:
 			forward->density_network_ctx = m_density_network->forward(stream, forward->density_network_input, &forward->density_network_output, use_inference_params, prepare_input_gradients);
 			// Compute features depending on mode
 			auto feat_out = forward->rgb_network_input.slice_rows(0, m_feature_width);
-			if (m_radiance_head_mode == "surface") {
+			if (m_radiance_head_mode == "surface" || m_radiance_head_mode == "dual_separate") {
 				// density output layout: [sigma | Phi_flattened (3*D)]
 				const uint32_t D = 15;
 				auto phi_out = forward->density_network_output.slice_rows(1, 1 + 3 * D);
@@ -333,6 +480,29 @@ public:
 						surf_slice.data(),
 						surf_slice.layout() == AoS ? surf_slice.stride() : 1
 					);
+					
+					// Store surface features for cumsum regularization if enabled
+					if (m_cumsum_regularization_enabled && prepare_input_gradients) {
+						// Store in both ForwardContext and global memory for training access
+						forward->surface_features = GPUMatrixDynamic<T>{D, batch_size, stream, surf_slice.layout()};
+						CUDA_CHECK_THROW(cudaMemcpyAsync(
+							forward->surface_features.data(),
+							surf_slice.data(),
+							surf_slice.n_bytes(),
+							cudaMemcpyDeviceToDevice,
+							stream
+						));
+						
+						// Also store in global memory for direct training kernel access
+						m_global_surface_features.resize(D * batch_size);
+						CUDA_CHECK_THROW(cudaMemcpyAsync(
+							m_global_surface_features.data(),
+							surf_slice.data(),
+							surf_slice.n_bytes(),
+							cudaMemcpyDeviceToDevice,
+							stream
+						));
+					}
 				}
 
 				// Volume divergence features into target slice
@@ -369,42 +539,86 @@ public:
 						);
 					}
 				}
+				
+				// Store volume features for cumsum regularization if enabled
+				if (m_cumsum_regularization_enabled && prepare_input_gradients && 
+				    (m_radiance_head_mode == "dual_merge" || m_radiance_head_mode == "dual_separate")) {
+					// Store in both ForwardContext and global memory for training access
+					forward->volume_features = GPUMatrixDynamic<T>{D, batch_size, stream, volm_slice.layout()};
+					CUDA_CHECK_THROW(cudaMemcpyAsync(
+						forward->volume_features.data(),
+						volm_slice.data(),
+						volm_slice.n_bytes(),
+						cudaMemcpyDeviceToDevice,
+						stream
+					));
+					
+					// Also store in global memory for direct training kernel access
+					m_global_volume_features.resize(D * batch_size);
+					CUDA_CHECK_THROW(cudaMemcpyAsync(
+						m_global_volume_features.data(),
+						volm_slice.data(),
+						volm_slice.n_bytes(),
+						cudaMemcpyDeviceToDevice,
+						stream
+					));
+				}
 			} else {
 				// Unknown mode
 				CUDA_CHECK_THROW(cudaMemsetAsync(feat_out.data(), 0, feat_out.n_bytes(), stream));
 			}
 		}
 
-		// Placeholder: feature head routing (no-op for now)
-		// Modes: baseline | surface | volume | hybrid | dual_separate | dual_merge
-		// - surface: compute normals n = \nabla sigma(x) from density via autograd, normalize n_hat, then
-		//   surface_feature[i] = ReLU(dot(Phi_i (3D), n_hat)) for D feature vectors.
-		// - volume: divergence_feature[i] = d Phi_ix / dx + d Phi_iy / dy + d Phi_iz / dz.
-		// - hybrid: concat(surface, volume) and pad RGB MLP input via tcnn::next_multiple.
-		// - dual_separate: construct two RGB inputs (surface/volume) for two identical RGB heads.
-		// - dual_merge: feed both feature streams to the same head as separate inputs.
-		// NOTE: This block is intentionally non-intrusive; current behavior remains baseline.
-		// Actual computation will be added with proper buffers and autograd gradients.
-
-		auto dir_out = forward->rgb_network_input.slice_rows(m_feature_width, m_dir_encoding->padded_output_width());
-		forward->dir_encoding_ctx = m_dir_encoding->forward(
-			stream,
-			input.slice_rows(m_dir_offset, m_dir_encoding->input_width()),
-			&dir_out,
-			use_inference_params,
-			prepare_input_gradients
-		);
-
-		if (output) {
-			forward->rgb_network_output = GPUMatrixDynamic<T>{output->data(), m_rgb_network->padded_output_width(), batch_size, output->layout()};
+		// Direction encoding (skip for dual_separate as it handles this internally)
+		if (m_radiance_head_mode != "dual_separate") {
+			auto dir_out = forward->rgb_network_input.slice_rows(m_feature_width, m_dir_encoding->padded_output_width());
+			forward->dir_encoding_ctx = m_dir_encoding->forward(
+				stream,
+				input.slice_rows(m_dir_offset, m_dir_encoding->input_width()),
+				&dir_out,
+				use_inference_params,
+				prepare_input_gradients
+			);
 		}
 
-		forward->rgb_network_ctx = m_rgb_network->forward(stream, forward->rgb_network_input, output ? &forward->rgb_network_output : nullptr, use_inference_params, prepare_input_gradients);
+
+
+ else {
+			// Standard behavior for all other modes (use main network)
+			if (output) {
+				forward->rgb_network_output = GPUMatrixDynamic<T>{output->data(), m_rgb_network->padded_output_width(), batch_size, output->layout()};
+			}
+			forward->rgb_network_ctx = m_rgb_network->forward(stream, forward->rgb_network_input, output ? &forward->rgb_network_output : nullptr, use_inference_params, prepare_input_gradients);
+		}
 
 		if (output) {
 			linear_kernel(extract_density<T>, 0, stream,
 				batch_size, m_dir_encoding->preferred_output_layout() == AoS ? forward->density_network_output.stride() : 1, padded_output_width(), forward->density_network_output.data(), output->data()+3
 			);
+			
+			// Store density values for cumsum regularization if enabled
+			if (m_cumsum_regularization_enabled && prepare_input_gradients && 
+			    (m_radiance_head_mode == "dual_merge" || m_radiance_head_mode == "dual_separate")) {
+				// Store in both ForwardContext and global memory for training access
+				forward->sample_densities = GPUMatrixDynamic<T>{1, batch_size, stream, forward->density_network_output.layout()};
+				CUDA_CHECK_THROW(cudaMemcpyAsync(
+					forward->sample_densities.data(),
+					output->data() + 3,
+					batch_size * sizeof(T),
+					cudaMemcpyDeviceToDevice,
+					stream
+				));
+				
+				// Also store in global memory for direct training kernel access
+				m_global_sample_densities.resize(batch_size);
+				CUDA_CHECK_THROW(cudaMemcpyAsync(
+					m_global_sample_densities.data(),
+					output->data() + 3,
+					batch_size * sizeof(T),
+					cudaMemcpyDeviceToDevice,
+					stream
+				));
+			}
 		}
 
 		return forward;
@@ -422,9 +636,88 @@ public:
 	) override {
 		const auto& forward = dynamic_cast<const ForwardContext&>(ctx);
 
-		// Make sure our teporary buffers have the correct size for the given batch size
+		// Make sure our temporary buffers have the correct size for the given batch size
 		uint32_t batch_size = input.n();
 
+		// Handle dual_separate mode differently
+		if (m_radiance_head_mode == "dual_separate") {
+			// For dual_separate, we only backprop through the surface network for now
+			// This simplifies the gradient flow while we debug the architecture
+			
+			GPUMatrix<T> dL_drgb{m_rgb_network_surface->padded_output_width(), batch_size, stream};
+			CUDA_CHECK_THROW(cudaMemsetAsync(dL_drgb.data(), 0, dL_drgb.n_bytes(), stream));
+			linear_kernel(extract_rgb<T>, 0, stream,
+				batch_size*3, dL_drgb.m(), dL_doutput.m(), dL_doutput.data(), dL_drgb.data()
+			);
+
+			// Use surface RGB output for backward pass (channels 0,1,2)
+			const GPUMatrixDynamic<T> rgb_network_output{(T*)output.data(), m_rgb_network_surface->padded_output_width(), batch_size, output.layout()};
+			GPUMatrixDynamic<T> dL_drgb_network_input{m_rgb_network_input_width, batch_size, stream, m_dir_encoding->preferred_output_layout()};
+			
+			// Only backprop through surface network for now
+			if (forward.surface_rgb_ctx) {
+				m_rgb_network_surface->backward(stream, *forward.surface_rgb_ctx, forward.rgb_network_input, rgb_network_output, dL_drgb, &dL_drgb_network_input, use_inference_params, param_gradients_mode);
+			}
+			
+			// Continue with standard dir encoding and density backward pass
+			// Backprop through dir encoding if it is trainable or if we need input gradients
+			if (m_dir_encoding->n_params() > 0 || dL_dinput) {
+				GPUMatrixDynamic<T> dL_ddir_encoding_output = dL_drgb_network_input.slice_rows(m_density_network->padded_output_width(), m_dir_encoding->padded_output_width());
+				GPUMatrixDynamic<float> dL_ddir_encoding_input;
+				if (dL_dinput) {
+					dL_ddir_encoding_input = dL_dinput->slice_rows(m_dir_offset, m_dir_encoding->input_width());
+				}
+
+				m_dir_encoding->backward(
+					stream,
+					*forward.dir_encoding_ctx,
+					input.slice_rows(m_dir_offset, m_dir_encoding->input_width()),
+					forward.rgb_network_input.slice_rows(m_density_network->padded_output_width(), m_dir_encoding->padded_output_width()),
+					dL_ddir_encoding_output,
+					dL_dinput ? &dL_ddir_encoding_input : nullptr,
+					use_inference_params,
+					param_gradients_mode
+				);
+			}
+
+			GPUMatrixDynamic<T> dL_ddensity_network_output = dL_drgb_network_input.slice_rows(0, m_density_network->padded_output_width());
+			linear_kernel(add_density_gradient<T>, 0, stream,
+				batch_size,
+				dL_doutput.m(),
+				dL_doutput.data(),
+				dL_ddensity_network_output.layout() == RM ? 1 : dL_ddensity_network_output.stride(),
+				dL_ddensity_network_output.data()
+			);
+
+			GPUMatrixDynamic<T> dL_ddensity_network_input;
+			if (m_pos_encoding->n_params() > 0 || dL_dinput) {
+				dL_ddensity_network_input = GPUMatrixDynamic<T>{m_pos_encoding->padded_output_width(), batch_size, stream, m_pos_encoding->preferred_output_layout()};
+			}
+
+			m_density_network->backward(stream, *forward.density_network_ctx, forward.density_network_input, forward.density_network_output, dL_ddensity_network_output, dL_ddensity_network_input.data() ? &dL_ddensity_network_input : nullptr, use_inference_params, param_gradients_mode);
+
+			// Backprop through pos encoding if it is trainable or if we need input gradients
+			if (dL_ddensity_network_input.data()) {
+				GPUMatrixDynamic<float> dL_dpos_encoding_input;
+				if (dL_dinput) {
+					dL_dpos_encoding_input = dL_dinput->slice_rows(0, m_pos_encoding->input_width());
+				}
+
+				m_pos_encoding->backward(
+					stream,
+					*forward.pos_encoding_ctx,
+					input.slice_rows(0, m_pos_encoding->input_width()),
+					forward.density_network_input,
+					dL_ddensity_network_input,
+					dL_dinput ? &dL_dpos_encoding_input : nullptr,
+					use_inference_params,
+					param_gradients_mode
+				);
+			}
+			return; // Early return for dual_separate mode
+		}
+
+		// Standard backward pass for other modes
 		GPUMatrix<T> dL_drgb{m_rgb_network->padded_output_width(), batch_size, stream};
 		CUDA_CHECK_THROW(cudaMemsetAsync(dL_drgb.data(), 0, dL_drgb.n_bytes(), stream));
 		linear_kernel(extract_rgb<T>, 0, stream,
@@ -476,62 +769,6 @@ public:
 			GPUMatrixDynamic<float> dL_dpos_encoding_input;
 			if (dL_dinput) {
 				dL_dpos_encoding_input = dL_dinput->slice_rows(0, m_pos_encoding->input_width());
-			}
-
-			// SDF Eikonal loss: add second-order gradients when dSDF_dPos is available
-			if (forward.dSDF_dPos.data() && m_sdf_eikonal_lambda > 0.0f) {
-				// Build dL_dsdf_dinput vector including Eikonal term: 2*(||∇SDF|| - 1) * ∇SDF / ||∇SDF||
-				GPUMatrixDynamic<float> dL_dsdf_dinput{m_pos_encoding->input_width(), batch_size, stream, CM};
-				compute_eikonal_v_kernel<T><<<n_blocks_linear(batch_size), N_THREADS_LINEAR, 0, stream>>>(
-					batch_size,
-					m_pos_encoding->input_width(),
-					forward.dSDF_dPos.data(), forward.dSDF_dPos.layout() == AoS ? forward.dSDF_dPos.stride() : 1,
-					dL_dsdf_dinput.data(), dL_dsdf_dinput.layout() == AoS ? dL_dsdf_dinput.stride() : 1
-				);
-				if (m_sdf_eikonal_lambda != 1.0f) {
-					linear_kernel(nerf_scale_array_kernel, 0, stream, dL_dsdf_dinput.n_elements(), m_sdf_eikonal_lambda, dL_dsdf_dinput.data());
-				}
-
-				// Apply backward_backward_input for second-order Eikonal gradients
-				// First get dSDF_denc by seeding unit grad on SDF and backprop through density network
-				GPUMatrixDynamic<T> dSDF_dSDF_seed{forward.density_network_output.m(), batch_size, stream, forward.density_network_output.layout()};
-				CUDA_CHECK_THROW(cudaMemsetAsync(dSDF_dSDF_seed.data(), 0, dSDF_dSDF_seed.n_bytes(), stream));
-				set_first_channel_one_kernel<T><<<n_blocks_linear(batch_size), N_THREADS_LINEAR, 0, stream>>>(
-					batch_size,
-					dSDF_dSDF_seed.data(),
-					dSDF_dSDF_seed.layout() == AoS ? dSDF_dSDF_seed.stride() : 1
-				);
-
-				GPUMatrixDynamic<T> dSDF_denc{forward.density_network_input.m(), batch_size, stream, forward.density_network_input.layout()};
-				m_density_network->backward(stream, *forward.density_network_ctx, forward.density_network_input, forward.density_network_output, dSDF_dSDF_seed, &dSDF_denc, use_inference_params, GradientMode::Ignore);
-
-				// backward_backward_input through pos encoding
-				GPUMatrixDynamic<T> pos_encoding_dy{forward.density_network_input.m(), batch_size, stream, forward.density_network_input.layout()};
-				GPUMatrixDynamic<float> dL_dsdf_dinput_d_input;
-				m_pos_encoding->backward_backward_input(
-					stream,
-					*forward.pos_encoding_ctx,
-					input.slice_rows(0, m_pos_encoding->input_width()),
-					dL_dsdf_dinput,
-					dSDF_denc,
-					&pos_encoding_dy,
-					&dL_dsdf_dinput_d_input,
-					use_inference_params,
-					GradientMode::Accumulate
-				);
-
-				// backward_backward_input through density network
-				m_density_network->backward_backward_input(
-					stream,
-					*forward.density_network_ctx,
-					forward.density_network_input,
-					pos_encoding_dy,
-					dSDF_dSDF_seed,
-					nullptr,
-					nullptr,
-					use_inference_params,
-					GradientMode::Accumulate
-				);
 			}
 
 			m_pos_encoding->backward(
@@ -645,6 +882,15 @@ public:
 
 		m_rgb_network->set_params(params + offset, inference_params + offset, gradients + offset);
 		offset += m_rgb_network->n_params();
+		
+		// Set parameters for dual_separate networks if they exist
+		if (m_radiance_head_mode == "dual_separate" && m_rgb_network_surface && m_rgb_network_volume) {
+			m_rgb_network_surface->set_params(params + offset, inference_params + offset, gradients + offset);
+			offset += m_rgb_network_surface->n_params();
+			
+			m_rgb_network_volume->set_params(params + offset, inference_params + offset, gradients + offset);
+			offset += m_rgb_network_volume->n_params();
+		}
 
 		m_pos_encoding->set_params(params + offset, inference_params + offset, gradients + offset);
 		offset += m_pos_encoding->n_params();
@@ -659,6 +905,15 @@ public:
 
 		m_rgb_network->initialize_params(rnd, params_full_precision, scale);
 		params_full_precision += m_rgb_network->n_params();
+		
+		// Initialize parameters for dual_separate networks if they exist
+		if (m_radiance_head_mode == "dual_separate" && m_rgb_network_surface && m_rgb_network_volume) {
+			m_rgb_network_surface->initialize_params(rnd, params_full_precision, scale);
+			params_full_precision += m_rgb_network_surface->n_params();
+			
+			m_rgb_network_volume->initialize_params(rnd, params_full_precision, scale);
+			params_full_precision += m_rgb_network_volume->n_params();
+		}
 
 		m_pos_encoding->initialize_params(rnd, params_full_precision, scale);
 		params_full_precision += m_pos_encoding->n_params();
@@ -668,10 +923,22 @@ public:
 	}
 
 	size_t n_params() const override {
-		return m_pos_encoding->n_params() + m_density_network->n_params() + m_dir_encoding->n_params() + m_rgb_network->n_params();
+		size_t total = m_pos_encoding->n_params() + m_density_network->n_params() + m_dir_encoding->n_params() + m_rgb_network->n_params();
+		
+		// Add parameters for dual_separate networks if they exist
+		if (m_radiance_head_mode == "dual_separate" && m_rgb_network_surface && m_rgb_network_volume) {
+			total += m_rgb_network_surface->n_params() + m_rgb_network_volume->n_params();
+		}
+		
+		return total;
 	}
 
 	uint32_t padded_output_width() const override {
+		// For dual_separate, each separate network should have the same output as baseline (4 channels: RGB+density)
+		// But the final output needs space for volume RGB in channels 12,13,14
+		if (m_radiance_head_mode == "dual_separate") {
+			return 16; // Enough space for surface RGB (0,1,2), density (3), and volume RGB (12,13,14)
+		}
 		return std::max(m_rgb_network->padded_output_width(), (uint32_t)4);
 	}
 
@@ -756,6 +1023,11 @@ public:
 	}
 
 	std::string generate_device_function(const std::string& name) const override {
+		// For dual_separate mode, disable JIT compilation since it uses separate execution path
+		if (m_radiance_head_mode == "dual_separate") {
+			return "";  // Empty device function disables JIT compilation
+		}
+		
 		std::string density_network = name + "_density_network";
 		std::string rgb_network = name + "_rgb_network";
 		std::string pos_encoding = name + "_pos_encoding";
@@ -912,6 +1184,13 @@ public:
 	void convert_params_to_jit_layout(cudaStream_t stream, bool use_inference_params) override {
 		m_density_network->convert_params_to_jit_layout(stream, use_inference_params);
 		m_rgb_network->convert_params_to_jit_layout(stream, use_inference_params);
+		
+		// Include dual networks if they exist
+		if (m_radiance_head_mode == "dual_separate" && m_rgb_network_surface && m_rgb_network_volume) {
+			m_rgb_network_surface->convert_params_to_jit_layout(stream, use_inference_params);
+			m_rgb_network_volume->convert_params_to_jit_layout(stream, use_inference_params);
+		}
+		
 		m_pos_encoding->convert_params_to_jit_layout(stream, use_inference_params);
 		m_dir_encoding->convert_params_to_jit_layout(stream, use_inference_params);
 	}
@@ -919,6 +1198,13 @@ public:
 	void convert_params_from_jit_layout(cudaStream_t stream, bool use_inference_params) override {
 		m_density_network->convert_params_from_jit_layout(stream, use_inference_params);
 		m_rgb_network->convert_params_from_jit_layout(stream, use_inference_params);
+		
+		// Include dual networks if they exist
+		if (m_radiance_head_mode == "dual_separate" && m_rgb_network_surface && m_rgb_network_volume) {
+			m_rgb_network_surface->convert_params_from_jit_layout(stream, use_inference_params);
+			m_rgb_network_volume->convert_params_from_jit_layout(stream, use_inference_params);
+		}
+		
 		m_pos_encoding->convert_params_from_jit_layout(stream, use_inference_params);
 		m_dir_encoding->convert_params_from_jit_layout(stream, use_inference_params);
 	}
@@ -935,6 +1221,7 @@ private:
 	std::shared_ptr<NetworkWithInputEncoding<T>> m_density_model;
 
 	uint32_t m_rgb_network_input_width;
+	uint32_t m_dual_rgb_input_width = 0; // For dual_separate mode
 	uint32_t m_n_pos_dims;
 	uint32_t m_n_dir_dims;
 	uint32_t m_n_extra_dims; // extra dimensions are assumed to be part of a compound encoding with dir_dims
@@ -946,6 +1233,12 @@ private:
 	
 	// SDF mode parameters
 	float m_sdf_eikonal_lambda = 0.0f;
+	bool m_cumsum_regularization_enabled = false;
+	
+	// Global storage for cumsum regularization features (accessible during training)
+	mutable GPUMemory<T> m_global_surface_features;
+	mutable GPUMemory<T> m_global_volume_features; 
+	mutable GPUMemory<T> m_global_sample_densities;
 
 	// // Storage of forward pass data
 	struct ForwardContext : public Context {
@@ -962,6 +1255,19 @@ private:
 
 		// Analytic spatial gradient of the first density-head channel w.r.t. input position (∇SDF in SDF mode)
 		GPUMatrixDynamic<float> dSDF_dPos;
+		
+		// Cumsum regularization feature storage (only allocated when needed)
+		GPUMatrixDynamic<T> surface_features;  // 15D surface features per sample
+		GPUMatrixDynamic<T> volume_features;   // 15D volume features per sample
+		GPUMatrixDynamic<T> sample_densities;  // Density per sample
+
+		// Contexts for dual networks
+		std::unique_ptr<Context> surface_rgb_ctx;
+		std::unique_ptr<Context> volume_rgb_ctx;
+		
+		// Separate RGB outputs for dual rendering modes
+		GPUMatrixDynamic<T> surface_rgb_output;
+		GPUMatrixDynamic<T> volume_rgb_output;
 	};
 };
 
@@ -1037,12 +1343,222 @@ __global__ void set_phi_component_single_kernel(
 }
 
 template <typename T>
+__global__ void set_single_component_seed_kernel(
+	uint32_t batch_size, uint32_t component_idx,
+	T* __restrict__ seed_data, uint32_t stride
+) {
+	uint32_t idx = threadIdx.x + blockIdx.x * blockDim.x;
+	if (idx >= batch_size) return;
+	
+	// Set unit gradient for this specific component
+	seed_data[idx * stride + component_idx] = (T)1.0f;
+}
+
+template <typename T>
+__global__ void accumulate_single_divergence_kernel(
+	uint32_t batch_size, uint32_t feature_idx, uint32_t spatial_dim,
+	const T* __restrict__ spatial_gradients, uint32_t grad_stride,
+	T* __restrict__ divergence_features, uint32_t div_stride
+) {
+	uint32_t idx = threadIdx.x + blockIdx.x * blockDim.x;
+	if (idx >= batch_size) return;
+	
+	// Extract the spatial gradient for this dimension
+	T spatial_grad = spatial_gradients[idx * grad_stride + spatial_dim];
+	
+	// Accumulate to this feature's divergence: ∇·Φᵢ += ∂Φᵢ_spatial_dim/∂spatial_dim
+	divergence_features[feature_idx * div_stride + idx] += spatial_grad;
+}
+
+
+
+template <typename T>
 __global__ void accumulate_divergence_single_kernel(
 	uint32_t n, uint32_t feature_idx, uint32_t component_idx, const float* __restrict__ dL_dpos, uint32_t dpos_stride, T* __restrict__ out, uint32_t out_stride
 ) {
 	uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
 	if (i >= n) return;
 	out[i * out_stride + feature_idx] += dL_dpos[i * dpos_stride + component_idx];
+}
+
+template <typename T>
+__global__ void combine_rgb_outputs_kernel(
+	uint32_t batch_size,
+	float weight_surface, float weight_volume,
+	const T* __restrict__ surface_rgb, uint32_t surf_stride,
+	const T* __restrict__ volume_rgb, uint32_t vol_stride,
+	T* __restrict__ output_rgb, uint32_t out_stride
+) {
+	uint32_t b = threadIdx.x + blockIdx.x * blockDim.x;
+	if (b >= batch_size) return;
+
+	T w_surf = (T)weight_surface;
+	T w_vol = (T)weight_volume;
+	
+	output_rgb[b * out_stride + 0] = w_surf * surface_rgb[b * surf_stride + 0] + w_vol * volume_rgb[b * vol_stride + 0];
+	output_rgb[b * out_stride + 1] = w_surf * surface_rgb[b * surf_stride + 1] + w_vol * volume_rgb[b * vol_stride + 1];
+	output_rgb[b * out_stride + 2] = w_surf * surface_rgb[b * surf_stride + 2] + w_vol * volume_rgb[b * vol_stride + 2];
+}
+
+template <typename T>
+__global__ void set_placeholder_normals_kernel(
+	uint32_t batch_size,
+	T* __restrict__ normals, uint32_t normal_stride
+) {
+	uint32_t b = threadIdx.x + blockIdx.x * blockDim.x;
+	if (b >= batch_size) return;
+
+	// Set simple placeholder normals (unit vector in X direction)
+	// This eliminates the expensive double forward pass for analytical gradients
+	normals[0 * normal_stride + b] = T(1.0f);
+	normals[1 * normal_stride + b] = T(0.0f);
+	normals[2 * normal_stride + b] = T(0.0f);
+}
+
+template <typename T>
+__global__ void set_spatial_components_kernel(
+	uint32_t batch_size, 
+	uint32_t spatial_dim, 
+	uint32_t num_vectors,
+	T* __restrict__ dL_dout, uint32_t stride
+) {
+	uint32_t b = threadIdx.x + blockIdx.x * blockDim.x;
+	if (b >= batch_size) return;
+
+	// Set gradient seeds for all components of the specified spatial dimension
+	// For spatial_dim=0: set gradients for components 1, 4, 7, 10, ... (x components)
+	// For spatial_dim=1: set gradients for components 2, 5, 8, 11, ... (y components)  
+	// For spatial_dim=2: set gradients for components 3, 6, 9, 12, ... (z components)
+	for (uint32_t i = 0; i < num_vectors; ++i) {
+		uint32_t component_idx = 1 + i * 3 + spatial_dim; // Start at 1 (skip density), then every 3rd component
+		dL_dout[b * stride + component_idx] = T(1.0f);
+	}
+}
+
+template <typename T>
+__global__ void compute_divergence_accumulate_kernel(
+	uint32_t batch_size,
+	uint32_t num_features,
+	uint32_t spatial_dim,
+	const float* __restrict__ spatial_gradients, uint32_t spatial_stride,
+	float* __restrict__ divergence_features, uint32_t divergence_stride
+) {
+	uint32_t b = threadIdx.x + blockIdx.x * blockDim.x;
+	if (b >= batch_size) return;
+
+	// For each of the 15 vector fields, accumulate ∂Φᵢ_spatial_dim/∂spatial_dim into divergence
+	// The spatial_gradients contain gradients of all 15 vector field components w.r.t. the spatial dimension
+	for (uint32_t i = 0; i < num_features; ++i) {
+		// The gradients are organized by component: grad[0] = ∂Φ₀ₓ/∂spatial_dim, grad[1] = ∂Φ₁ₓ/∂spatial_dim, etc.
+		float gradient_value = spatial_gradients[i * spatial_stride + b];
+		divergence_features[i * divergence_stride + b] += gradient_value;
+	}
+}
+
+template <typename T>
+__global__ void compute_divergence_features_kernel(
+	uint32_t batch_size,
+	uint32_t D,
+	const T* __restrict__ phi, uint32_t phi_stride,
+	const float* __restrict__ dphi_dx, uint32_t dphi_dx_stride,
+	const float* __restrict__ dphi_dy, uint32_t dphi_dy_stride, 
+	const float* __restrict__ dphi_dz, uint32_t dphi_dz_stride,
+	T* __restrict__ out, uint32_t out_stride
+) {
+	uint32_t b = threadIdx.x + blockIdx.x * blockDim.x;
+	if (b >= batch_size) return;
+
+	// For each of the 15 feature dimensions, compute true divergence of Φ_i
+	// Φ is organized as [15, 3]: 15 3D vector fields
+	// True divergence of Φ_i = dΦ_i_x/dx + dΦ_i_y/dy + dΦ_i_z/dz
+	
+	for (uint32_t i = 0; i < D; ++i) {
+		// For feature i, get gradients of each component
+		float dphix_dx = dphi_dx[(i*3 + 0) * dphi_dx_stride + b]; // d(Φ_i_x)/dx
+		float dphiy_dy = dphi_dy[(i*3 + 1) * dphi_dy_stride + b]; // d(Φ_i_y)/dy  
+		float dphiz_dz = dphi_dz[(i*3 + 2) * dphi_dz_stride + b]; // d(Φ_i_z)/dz
+		
+		// True divergence: sum of partial derivatives
+		float divergence = dphix_dx + dphiy_dy + dphiz_dz;
+		
+		out[i * out_stride + b] = (T)divergence;
+	}
+}
+
+template <typename T>
+__global__ void compute_cumsum_regularization_kernel(
+	uint32_t n_rays,
+	uint32_t n_samples_per_ray,
+	uint32_t feature_dim,
+	const T* __restrict__ surface_features,   // [feature_dim, n_rays * n_samples_per_ray]
+	const T* __restrict__ volume_features,    // [feature_dim, n_rays * n_samples_per_ray] 
+	const T* __restrict__ sample_densities,   // [1, n_rays * n_samples_per_ray]
+	const float* __restrict__ forward_weights, // [n_rays * n_samples_per_ray]
+	float* __restrict__ reg_loss_output,      // [n_rays]
+	uint32_t surface_stride,
+	uint32_t volume_stride,
+	uint32_t density_stride
+) {
+	uint32_t ray_idx = blockIdx.x * blockDim.x + threadIdx.x;
+	if (ray_idx >= n_rays) return;
+	
+	float reg_loss = 0.0f;
+	
+	// Initialize accumulator for density-weighted volume features
+	T vol_feat_accum[15] = {0}; // Assuming feature_dim = 15
+	
+	// Iterate backward through samples (farthest to closest)
+	for (int sample_idx = n_samples_per_ray - 1; sample_idx >= 0; sample_idx--) {
+		uint32_t global_idx = ray_idx * n_samples_per_ray + sample_idx;
+		
+		// Get forward weight for this sample
+		float weight = forward_weights[global_idx];
+		if (weight < 1e-8f) continue; // Skip samples with negligible weight
+		
+		// Get surface features (anchor)
+		T surf_feat[15];
+		for (uint32_t d = 0; d < feature_dim; d++) {
+			surf_feat[d] = surface_features[d * surface_stride + global_idx];
+		}
+		
+		// Normalize surface features
+		float surf_norm = 0.0f;
+		for (uint32_t d = 0; d < feature_dim; d++) {
+			surf_norm += float(surf_feat[d]) * float(surf_feat[d]);
+		}
+		surf_norm = sqrtf(surf_norm + 1e-8f);
+		
+		// Normalize volume feature accumulator
+		float vol_norm = 0.0f;
+		for (uint32_t d = 0; d < feature_dim; d++) {
+			vol_norm += float(vol_feat_accum[d]) * float(vol_feat_accum[d]);
+		}
+		vol_norm = sqrtf(vol_norm + 1e-8f);
+		
+		// Compute normalized difference
+		float sample_loss = 0.0f;
+		if (surf_norm > 1e-8f && vol_norm > 1e-8f) {
+			for (uint32_t d = 0; d < feature_dim; d++) {
+				float surf_normalized = float(surf_feat[d]) / surf_norm;
+				float vol_normalized = float(vol_feat_accum[d]) / vol_norm;
+				float diff = surf_normalized - vol_normalized;
+				sample_loss += diff * diff;
+			}
+			sample_loss /= float(feature_dim); // Mean over features
+		}
+		
+		// Accumulate weighted loss
+		reg_loss += weight * sample_loss;
+		
+		// Update accumulator with density-weighted volume features
+		T density = sample_densities[global_idx];
+		for (uint32_t d = 0; d < feature_dim; d++) {
+			T vol_feat = volume_features[d * volume_stride + global_idx];
+			vol_feat_accum[d] += density * vol_feat;
+		}
+	}
+	
+	reg_loss_output[ray_idx] = reg_loss;
 }
 
 static __global__ void nerf_scale_array_kernel(uint32_t n, float s, float* x) {

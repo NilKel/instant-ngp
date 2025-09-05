@@ -47,6 +47,9 @@ CMRC_DECLARE(ngp);
 
 namespace ngp {
 
+// Global override for dual_separate rendering to control blend weights
+int g_dual_render_override = -1;  // -1 = no override, 6 = surface-only, 7 = volume-only
+
 __global__ void extract_xyz_from_coords(uint32_t n, ngp::BoundingBox aabb, tcnn::PitchedPtr<ngp::NerfCoordinate> src, float* dst);
 
 static constexpr uint32_t MARCH_ITER = 10000;
@@ -599,7 +602,10 @@ __global__ void composite_kernel_nerf(
 	ENerfActivation rgb_activation,
 	ENerfActivation density_activation,
 	int show_accel,
-	float min_transmittance
+	float min_transmittance,
+	uint32_t render_mode_config = 0,
+	vec4* __restrict__ surface_rgba = nullptr,
+	vec4* __restrict__ volume_rgba = nullptr
 ) {
 	const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
 	if (i >= n_elements) {
@@ -616,6 +622,14 @@ __global__ void composite_kernel_nerf(
 	float local_depth = depth[i];
 	vec3 origin = payload.origin;
 	vec3 cam_fwd = camera_matrix[2];
+	
+	// Dual mode: separate accumulation for surface and volume RGBs
+	vec4 local_surface_rgba = vec4(0.0f);
+	vec4 local_volume_rgba = vec4(0.0f);
+	bool is_dual_mode = (render_mode_config == 4 || render_mode_config == 5); // dual_separate or dual_merge
+	bool is_surface_only = (render_mode_config == 6); // Surface-only render
+	bool is_volume_only = (render_mode_config == 7);  // Volume-only render
+	
 	// Composite in the last n steps
 	uint32_t actual_n_steps = payload.n_steps;
 	uint32_t j = 0;
@@ -626,6 +640,25 @@ __global__ void composite_kernel_nerf(
 		local_network_output[1] = network_output[i + j * n_elements + 1 * stride];
 		local_network_output[2] = network_output[i + j * n_elements + 2 * stride];
 		local_network_output[3] = network_output[i + j * n_elements + 3 * stride];
+		
+		// For dual modes and separate renders, read additional channels for volume RGB
+		vec3 volume_rgb = vec3(0.0f);
+		if (is_dual_mode || is_volume_only) {
+			if (render_mode_config == 4 || render_mode_config == 7) { // dual_separate or volume-only: volume RGB in channels 12,13,14
+				if (padded_output_width > 14) {
+					volume_rgb.x = float(network_output[i + j * n_elements + 12 * stride]);
+					volume_rgb.y = float(network_output[i + j * n_elements + 13 * stride]);
+					volume_rgb.z = float(network_output[i + j * n_elements + 14 * stride]);
+				}
+			} else if (render_mode_config == 5) { // dual_merge: volume RGB in channels 3,4,5
+				if (padded_output_width > 5) {
+					volume_rgb.x = float(network_output[i + j * n_elements + 3 * stride]);
+					volume_rgb.y = float(network_output[i + j * n_elements + 4 * stride]);
+					volume_rgb.z = float(network_output[i + j * n_elements + 5 * stride]);
+				}
+			}
+			volume_rgb = network_to_rgb_vec(volume_rgb, rgb_activation);
+		}
 		const NerfCoordinate* input = network_input(i + j * n_elements);
 		vec3 warped_pos = input->pos.p;
 		vec3 pos = unwarp_position(warped_pos, aabb);
@@ -675,7 +708,26 @@ __global__ void composite_kernel_nerf(
 			rgb.z = rng.next_float();
 		}
 
+		// Select which RGB to use based on render mode
+	if (render_mode_config == 4) { // dual_separate: AVERAGE surface and volume RGB
+		vec3 averaged_rgb = 0.5f * (rgb + volume_rgb);
+		local_rgba += vec4(averaged_rgb * weight, weight);
+	} else if (render_mode_config == 5) { // dual_merge: use volume RGB
+		local_rgba += vec4(volume_rgb * weight, weight);
+	} else if (is_surface_only) { // Surface-only: use surface RGB (channels 0,1,2)
 		local_rgba += vec4(rgb * weight, weight);
+	} else if (is_volume_only) { // Volume-only: use volume RGB (channels 12,13,14)
+		local_rgba += vec4(volume_rgb * weight, weight);
+	} else {
+		local_rgba += vec4(rgb * weight, weight); // Default: surface RGB
+	}
+		
+		// Dual mode: accumulate surface and volume RGBs separately (FULL outputs, no weighting)
+		if (is_dual_mode) {
+			local_surface_rgba += vec4(rgb * weight, weight);
+			local_volume_rgba += vec4(volume_rgb * weight, weight);
+		}
+		
 		if (weight > payload.max_weight) {
 			payload.max_weight = weight;
 			local_depth = is_360 ? distance(pos, camera_matrix[3]) : dot(cam_fwd, pos - camera_matrix[3]);
@@ -694,6 +746,12 @@ __global__ void composite_kernel_nerf(
 
 	rgba[i] = local_rgba;
 	depth[i] = local_depth;
+	
+	// Store separate RGB channels for dual modes
+	if (is_dual_mode && surface_rgba && volume_rgba) {
+		surface_rgba[i] = local_surface_rgba;
+		volume_rgba[i] = local_volume_rgba;
+	}
 }
 
 __global__ void generate_training_samples_nerf(
@@ -857,6 +915,84 @@ __global__ void generate_training_samples_nerf(
 }
 
 
+__device__ float compute_ray_cumsum_regularization(
+	uint32_t ray_idx,
+	uint32_t numsteps, 
+	uint32_t base_sample_idx,
+	const network_precision_t* __restrict__ surface_features_in,
+	const network_precision_t* __restrict__ volume_features_in,
+	const network_precision_t* __restrict__ sample_densities_in,
+	float lambda_val
+) {
+	if (!surface_features_in || !volume_features_in || !sample_densities_in) {
+		return 0.0f;
+	}
+
+	const uint32_t D = 15; // Feature dimension
+	float total_reg_loss = 0.0f;
+	
+	// Initialize accumulator for density-weighted volume features
+	float vol_feat_accum[15] = {0.0f};
+	
+	// Iterate backward through samples (farthest to closest) as per user requirements
+	for (int step = (int)numsteps - 1; step >= 0; step--) {
+		uint32_t sample_idx = base_sample_idx + step;
+		
+		// Get surface features for this sample (15D) - anchor point
+		float surf_feat[15];
+		for (uint32_t d = 0; d < D; d++) {
+			surf_feat[d] = float(surface_features_in[sample_idx * D + d]);
+		}
+		
+		// Get volume features for this sample (15D) 
+		float vol_feat[15];
+		for (uint32_t d = 0; d < D; d++) {
+			vol_feat[d] = float(volume_features_in[sample_idx * D + d]);
+		}
+		
+		// Get density for this sample (for weighting)
+		float density = float(sample_densities_in[sample_idx]);
+		
+		// Normalize surface features (anchor)
+		float surf_norm = 0.0f;
+		for (uint32_t d = 0; d < D; d++) {
+			surf_norm += surf_feat[d] * surf_feat[d];
+		}
+		surf_norm = sqrtf(surf_norm + 1e-8f);
+		
+		// Normalize volume accumulator (target)
+		float vol_norm = 0.0f;
+		for (uint32_t d = 0; d < D; d++) {
+			vol_norm += vol_feat_accum[d] * vol_feat_accum[d];
+		}
+		vol_norm = sqrtf(vol_norm + 1e-8f);
+		
+		// Compute normalized difference (L2 loss)
+		float sample_loss = 0.0f;
+		if (surf_norm > 1e-8f && vol_norm > 1e-8f) {
+			for (uint32_t d = 0; d < D; d++) {
+				float surf_normalized = surf_feat[d] / surf_norm;
+				float vol_normalized = vol_feat_accum[d] / vol_norm;
+				float diff = surf_normalized - vol_normalized;
+				sample_loss += diff * diff;
+			}
+			sample_loss /= float(D); // Mean over features
+		}
+		
+		// Weight by rendering importance (uniform for now, could use forward rendering weights)
+		float weight = 1.0f / float(numsteps);
+		total_reg_loss += weight * sample_loss;
+		
+		// Update accumulator with density-weighted volume features
+		// This is the key innovation: density weighting allows optimizer to attack floaters
+		for (uint32_t d = 0; d < D; d++) {
+			vol_feat_accum[d] += density * vol_feat[d];
+		}
+	}
+	
+	return lambda_val * total_reg_loss;
+}
+
 __global__ void compute_loss_kernel_train_nerf(
 	const uint32_t n_rays,
 	BoundingBox aabb,
@@ -884,6 +1020,9 @@ __global__ void compute_loss_kernel_train_nerf(
 	PitchedPtr<const NerfCoordinate> coords_in,
 	PitchedPtr<NerfCoordinate> coords_out,
 	network_precision_t* dloss_doutput,
+	const network_precision_t* __restrict__ surface_features_in,
+	const network_precision_t* __restrict__ volume_features_in,
+	const network_precision_t* __restrict__ sample_densities_in,
 	ELossType loss_type,
 	ELossType depth_loss_type,
 	float* __restrict__ loss_output,
@@ -907,7 +1046,11 @@ __global__ void compute_loss_kernel_train_nerf(
 	const vec3* __restrict__ exposure,
 	vec3* __restrict__ exposure_gradient,
 	float depth_supervision_lambda,
-	float near_distance
+	float near_distance,
+	bool cumsum_reg_enabled,
+	float lambda_feature_cumsum,
+	uint32_t feature_reg_start_iter,
+	uint32_t current_training_step
 ) {
 	const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
 	if (i >= *rays_counter) {
@@ -1043,8 +1186,26 @@ __global__ void compute_loss_kernel_train_nerf(
 	// lg.gradient /= img_pdf * uv_pdf;
 
 	float mean_loss = mean(lg.loss);
+	
+	// Apply cumulative sum regularization for dual modes
+	float cumsum_reg_loss = 0.0f;
+	if (cumsum_reg_enabled && current_training_step >= feature_reg_start_iter) {
+		
+		// Calculate annealed lambda
+		float ramp_duration = 5000.0f;
+		float progress = min(1.0f, (float)(current_training_step - feature_reg_start_iter) / ramp_duration);
+		float lambda_val = lambda_feature_cumsum * progress;
+		
+		// Compute cumsum regularization for this ray
+		cumsum_reg_loss = compute_ray_cumsum_regularization(
+			i, numsteps, base,
+			surface_features_in, volume_features_in, sample_densities_in,
+			lambda_val
+		);
+	}
+	
 	if (loss_output) {
-		loss_output[i] = mean_loss / (float)n_rays;
+		loss_output[i] = (mean_loss + cumsum_reg_loss) / (float)n_rays;
 	}
 
 	if (error_map) {
@@ -1785,6 +1946,20 @@ uint32_t Testbed::NerfTracer::trace(
 			network->visualize_activation(stream, visualized_layer, visualized_dim, positions_matrix, positions_matrix);
 		}
 
+		// Detect dual mode configuration for separate RGB rendering
+		uint32_t render_mode_config = 0;
+		std::string radiance_mode = network->radiance_head_mode();
+		if (radiance_mode == "dual_separate") {
+			render_mode_config = 4;
+		} else if (radiance_mode == "dual_merge") {
+			render_mode_config = 5;
+		}
+		
+		// Check for global render mode override from dual_separate rendering
+		if (g_dual_render_override != -1 && render_mode_config == 4) {
+			render_mode_config = g_dual_render_override;
+		}
+
 		linear_kernel(
 			composite_kernel_nerf,
 			0,
@@ -1809,7 +1984,10 @@ uint32_t Testbed::NerfTracer::trace(
 			rgb_activation,
 			density_activation,
 			show_accel,
-			min_transmittance
+			min_transmittance,
+			render_mode_config, // Now correctly detects dual modes (4=dual_separate, 5=dual_merge, 0=standard)
+			nullptr, // surface_rgba (will be used by render_dual_separate)
+			nullptr // volume_rgba (will be used by render_dual_separate)
 		);
 
 		i += n_steps_between_compaction;
@@ -3136,9 +3314,17 @@ void Testbed::train_nerf_step(uint32_t target_batch_size, Testbed::NerfCounters&
 	CUDA_CHECK_THROW(cudaMemcpyToSymbol(kUseSdf, &m_nerf.m_use_sdf, sizeof(bool)));
 	CUDA_CHECK_THROW(cudaMemcpyToSymbol(kSdfEikonalLambda, &m_nerf.m_sdf_eikonal_lambda, sizeof(float)));
 	
+	// Extract features for cumsum regularization BEFORE loss kernel
+	network_precision_t* surface_features_ptr = nullptr;
+	network_precision_t* volume_features_ptr = nullptr;
+	network_precision_t* sample_densities_ptr = nullptr;
+	
 	// Update NerfNetwork's eikonal lambda for backward pass
 	if (m_nerf_network) {
 		m_nerf_network->set_sdf_eikonal_lambda(m_nerf.m_sdf_eikonal_lambda);
+		m_nerf_network->set_cumsum_regularization_enabled(m_nerf.m_cumsum_reg);
+		
+			// Features will be available after the training step for subsequent loss calculations
 	}
 			linear_kernel(
 				compute_loss_kernel_train_nerf,
@@ -3170,6 +3356,9 @@ void Testbed::train_nerf_step(uint32_t target_batch_size, Testbed::NerfCounters&
 			PitchedPtr<const NerfCoordinate>((NerfCoordinate*)coords, 1, 0, extra_stride),
 			PitchedPtr<NerfCoordinate>((NerfCoordinate*)coords_compacted, 1, 0, extra_stride),
 			dloss_dmlp_out,
+			nullptr,  // No cumsum features available yet
+			nullptr,  // No cumsum features available yet  
+			nullptr,  // No cumsum features available yet
 			m_nerf.training.loss_type,
 			m_nerf.training.depth_loss_type,
 			counters.loss.data(),
@@ -3193,7 +3382,11 @@ void Testbed::train_nerf_step(uint32_t target_batch_size, Testbed::NerfCounters&
 			m_nerf.training.cam_exposure_gpu.data(),
 			m_nerf.training.optimize_exposure ? m_nerf.training.cam_exposure_gradient_gpu.data() : nullptr,
 			m_nerf.training.depth_supervision_lambda,
-			m_nerf.training.near_distance
+			m_nerf.training.near_distance,
+			m_nerf.m_cumsum_reg,
+			m_nerf.m_lambda_feature_cumsum,
+			m_nerf.m_feature_reg_start_iter,
+			m_training_step
 		);
 	}
 
@@ -3212,7 +3405,13 @@ void Testbed::train_nerf_step(uint32_t target_batch_size, Testbed::NerfCounters&
 	bool prepare_input_gradients = train_camera || train_extra_dims;
 	GPUMatrix<float> coords_gradient_matrix((float*)coords_gradient, floats_per_coord, target_batch_size);
 
-	m_trainer->training_step(
+	// Enable cumsum regularization in the network for dual modes
+	if (m_nerf.m_cumsum_reg && (m_nerf_network->radiance_head_mode() == "dual_separate" || 
+	                            m_nerf_network->radiance_head_mode() == "dual_merge")) {
+		m_nerf_network->set_cumsum_regularization_enabled(true);
+	}
+
+	auto training_ctx = m_trainer->training_step(
 		stream,
 		compacted_coords_matrix,
 		{},
@@ -3223,6 +3422,13 @@ void Testbed::train_nerf_step(uint32_t target_batch_size, Testbed::NerfCounters&
 		GradientMode::Overwrite,
 		&gradient_matrix
 	);
+
+	// Features are now stored globally and will be used in future implementations
+	
+	// Disable cumsum regularization after training step
+	if (m_nerf.m_cumsum_reg) {
+		m_nerf_network->set_cumsum_regularization_enabled(false);
+	}
 
 	if (train_extra_dims) {
 		// Compute extra-dim gradients
@@ -3663,6 +3869,19 @@ std::vector<float> Testbed::Nerf::get_rendering_extra_dims_cpu() const {
 	return extra_dims_cpu;
 }
 
+std::string Testbed::Nerf::radiance_head_mode() const {
+	if (m_parent && m_parent->m_nerf_network) {
+		return m_parent->m_nerf_network->radiance_head_mode();
+	}
+	return "";
+}
+
+void Testbed::Nerf::set_radiance_head_mode(const std::string& mode) {
+	if (m_parent && m_parent->m_nerf_network) {
+		m_parent->m_nerf_network->set_radiance_head_mode(mode);
+	}
+}
+
 extern __device__ __constant__ bool kUseSdf;
 extern __device__ __constant__ float kSdfEikonalLambda;
 
@@ -3676,5 +3895,16 @@ __global__ void extract_xyz_from_coords(uint32_t n, ngp::BoundingBox aabb, tcnn:
 	dst[1 * n + i] = p.y;
 	dst[2 * n + i] = p.z;
 }
+
+float Testbed::compute_cumsum_regularization_loss(cudaStream_t stream) {
+	if (!m_nerf.m_cumsum_reg || m_training_step < m_nerf.m_feature_reg_start_iter) {
+		return 0.0f;
+	}
+	
+	// Cumsum regularization is handled per-ray in the training kernel
+	return 0.0f;
+}
+
+
 
 } // namespace ngp

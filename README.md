@@ -361,3 +361,8 @@ Many thanks to the authors of these brilliant projects!
 Copyright © 2022, NVIDIA Corporation. All rights reserved.
 
 This work is made available under the Nvidia Source Code License-NC. Click [here](LICENSE.txt) to view a copy of this license.
+
+
+
+Training command:
+(ingp) nilkel@nilkel-Workstation:~/Projects/instant-ngp$ python scripts/run.py --scene /home/nilkel/Projects/data/nerf_synthetic/drums/transforms_train.json --name sdf001_cumsum --n_steps 80000 --configuration dual_separate --loss_mode baseline --use_sdf --eikonal_lambda 0.001  --cumsum_reg --lambda_feature_cumsum 1e-3 --feature_reg_start_iter 5000 --background_color black

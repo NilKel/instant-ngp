@@ -241,6 +241,70 @@ py::array_t<float> Testbed::render_to_cpu_rgba(
 	return render_to_cpu(width, height, spp, linear, start_time, end_time, fps, shutter_fraction).first;
 }
 
+std::pair<py::array_t<float>, py::array_t<float>> Testbed::render_dual_separate(int width, int height, int spp, bool linear) {
+	if (m_testbed_mode != ETestbedMode::Nerf) {
+		throw std::runtime_error("render_dual_separate requires Nerf mode");
+	}
+	
+	// Create FULL resolution surface and volume result buffers
+	py::array_t<float> surface_result({height, width, 4});
+	py::array_t<float> volume_result({height, width, 4});
+	
+	// Get raw pointers to the data
+	py::buffer_info surface_buf = surface_result.request();
+	py::buffer_info volume_buf = volume_result.request();
+	float* surface_data = (float*)surface_buf.ptr;
+	float* volume_data = (float*)volume_buf.ptr;
+	
+	// Use render_dual_separate_internal to get the FULL, UNWEIGHTED outputs
+	auto result_pair = render_dual_separate_internal(width, height, spp, linear);
+	
+	// Copy the full results (no weighting, no splitting)
+	std::memcpy(surface_data, result_pair.first.data(), width * height * 4 * sizeof(float));
+	std::memcpy(volume_data, result_pair.second.data(), width * height * 4 * sizeof(float));
+	
+	return {surface_result, volume_result};
+}
+
+std::pair<std::vector<float>, std::vector<float>> Testbed::render_dual_separate_internal(int width, int height, int spp, bool linear) {
+	if (m_testbed_mode != ETestbedMode::Nerf) {
+		throw std::runtime_error("render_dual_separate_internal requires Nerf mode");
+	}
+	
+	// Simple approach: modify the composite kernel blend weights by using special render mode configs
+	// The kernel already has logic for is_surface_only (mode 6) and is_volume_only (mode 7)
+	
+	// For now, let's use a global flag approach since the NerfTracer is local to render_nerf
+	// We'll add a global override that the composite kernel can check
+	
+	// Pass 1: Render with surface-only weighting
+	// Temporarily set a global flag for surface-only rendering
+	extern int g_dual_render_override;  // Declare global variable
+	
+	g_dual_render_override = 6;  // Surface-only mode
+	auto surface_result = render_to_cpu(width, height, spp, linear, -1.f, -1.f, 30.f, 1.0f);
+	py::buffer_info surface_buf = surface_result.first.request();
+	float* surface_data_ptr = (float*)surface_buf.ptr;
+	
+	// Pass 2: Render with volume-only weighting  
+	g_dual_render_override = 7;  // Volume-only mode
+	auto volume_result = render_to_cpu(width, height, spp, linear, -1.f, -1.f, 30.f, 1.0f);
+	py::buffer_info volume_buf = volume_result.first.request();
+	float* volume_data_ptr = (float*)volume_buf.ptr;
+	
+	// Reset override
+	g_dual_render_override = -1;  // No override
+	
+	// Copy results
+	std::vector<float> surface_data(width * height * 4);
+	std::vector<float> volume_data(width * height * 4);
+	
+	std::memcpy(surface_data.data(), surface_data_ptr, width * height * 4 * sizeof(float));
+	std::memcpy(volume_data.data(), volume_data_ptr, width * height * 4 * sizeof(float));
+	
+	return {surface_data, volume_data};
+}
+
 py::array_t<float> Testbed::view(bool linear, size_t view_idx) const {
 	if (m_views.size() <= view_idx) {
 		throw std::runtime_error{fmt::format("View #{} does not exist.", view_idx)};
@@ -524,6 +588,15 @@ PYBIND11_MODULE(pyngp, m) {
 			py::arg("fps") = 30.f,
 			py::arg("shutter_fraction") = 1.0f
 		)
+		.def(
+			"render_dual_separate",
+			&Testbed::render_dual_separate,
+			"Renders separate surface and volume RGB images for dual modes. Returns (surface_image, volume_image).",
+			py::arg("width") = 1920,
+			py::arg("height") = 1080,
+			py::arg("spp") = 1,
+			py::arg("linear") = true
+		)
 		.def("train", &Testbed::train, py::call_guard<py::gil_scoped_release>(), "Perform a single training step with a specified batch size.")
 		.def("reset", &Testbed::reset_network, py::arg("reset_density_grid") = true, "Reset training.")
 		.def("reset_camera", &Testbed::reset_camera, "Reset camera to default state.")
@@ -704,6 +777,9 @@ PYBIND11_MODULE(pyngp, m) {
 		)
 		.def_property("use_sdf", &Testbed::use_sdf, &Testbed::set_use_sdf)
 		.def_property("sdf_eikonal_lambda", &Testbed::sdf_eikonal_lambda, &Testbed::set_sdf_eikonal_lambda)
+		.def_property("cumsum_reg", &Testbed::cumsum_reg, &Testbed::set_cumsum_reg)
+		.def_property("lambda_feature_cumsum", &Testbed::lambda_feature_cumsum, &Testbed::set_lambda_feature_cumsum)
+		.def_property("feature_reg_start_iter", &Testbed::feature_reg_start_iter, &Testbed::set_feature_reg_start_iter)
 		;
 
 
@@ -714,6 +790,7 @@ PYBIND11_MODULE(pyngp, m) {
 		.def_readwrite("sharpen", &Testbed::Nerf::sharpen)
 		.def_readwrite("rendering_min_transmittance", &Testbed::Nerf::render_min_transmittance)
 		.def_readwrite("render_min_transmittance", &Testbed::Nerf::render_min_transmittance)
+		.def_property("radiance_head_mode", &Testbed::Nerf::radiance_head_mode, &Testbed::Nerf::set_radiance_head_mode)
 		.def_readwrite("cone_angle_constant", &Testbed::Nerf::cone_angle_constant)
 		.def_readwrite("visualize_cameras", &Testbed::Nerf::visualize_cameras)
 		.def_readwrite("render_gbuffer_hard_edges", &Testbed::Nerf::render_gbuffer_hard_edges)
