@@ -341,6 +341,19 @@ void Testbed::reload_network_from_file(const fs::path& path) {
 	if (!is_snapshot) {
 		reset_network();
 	}
+
+	// Apply backprop normals flag if exported by Python runner
+	{
+		const char* bnorm = std::getenv("NGP_BNORMALS");
+		if (bnorm && m_nerf_network) {
+			// Only if this network implementation supports it
+			try {
+				m_nerf_network->set_backprop_normals(true);
+			} catch (...) {
+				// ignore if not supported
+			}
+		}
+	}
 }
 
 void Testbed::reload_network_from_json(const json& json, const std::string& config_base_path) {

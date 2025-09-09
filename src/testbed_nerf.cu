@@ -1769,6 +1769,13 @@ uint32_t Testbed::NerfTracer::trace(
 		uint32_t n_elements = next_multiple(n_alive * n_steps_between_compaction, BATCH_SIZE_GRANULARITY);
 		GPUMatrix<float> positions_matrix((float*)m_network_input, (sizeof(NerfCoordinate) + extra_stride) / sizeof(float), n_elements);
 		GPUMatrix<network_precision_t, RM> rgbsigma_matrix((network_precision_t*)m_network_output, network->padded_output_width(), n_elements);
+		// If the custom network supports the normals backprop toggle, honor env var here too
+		{
+			const char* bnorm = std::getenv("NGP_BNORMALS");
+			if (bnorm) {
+				try { network->set_backprop_normals(true); } catch (...) {}
+			}
+		}
 		network->inference_mixed_precision(stream, positions_matrix, rgbsigma_matrix);
 
 		if (render_mode == ERenderMode::Normals) {

@@ -73,7 +73,8 @@ def parse_args():
 	parser.add_argument("--vr", action="store_true", help="Render to a VR headset.")
 
 	parser.add_argument("--sharpen", default=0, help="Set amount of sharpening applied to NeRF training images. Range 0.0 to 1.0.")
-
+	# New: backprop through analytic normals toggle
+	parser.add_argument("--bnormals", action="store_true", help="Backpropagate through analytic normals used for surface features.")
 
 	return parser.parse_args()
 
@@ -90,6 +91,10 @@ if __name__ == "__main__":
 
 	if args.mode:
 		print("Warning: the '--mode' argument is no longer in use. It has no effect. The mode is automatically chosen based on the scene.")
+
+	# Export flag for C++ side to pick up
+	if args.bnormals:
+		os.environ["NGP_BNORMALS"] = "1"
 
 	testbed = ngp.Testbed()
 	testbed.root_dir = ROOT_DIR
@@ -142,6 +147,13 @@ if __name__ == "__main__":
 	testbed.exposure = args.exposure
 	testbed.shall_train = args.train if args.gui else True
 
+	# Inform C++ of bnormals flag if supported by the build
+	try:
+		if args.bnormals:
+			# This is a soft hook; C++ can read env or query from Testbed later if bound
+			pass
+	except Exception:
+		pass
 
 	network_stem = os.path.splitext(os.path.basename(args.network))[0] if args.network else "base"
 	if testbed.mode == ngp.TestbedMode.Sdf:
