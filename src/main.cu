@@ -54,6 +54,20 @@ int main_func(const std::vector<std::string>& arguments) {
 		{'n', 'c', "network", "config"},
 	};
 
+	ValueFlag<string> name_flag{
+		parser,
+		"NAME",
+		"Name for the output directory. The output will be stored in outputs/dataset/scene/method/name.",
+		{"name"},
+	};
+
+	ValueFlag<string> method_flag{
+		parser,
+		"METHOD",
+		"Method to use (baseline or surface).",
+		{"method"},
+	};
+
 	Flag no_gui_flag{
 		parser,
 		"NO_GUI",
@@ -162,6 +176,14 @@ int main_func(const std::vector<std::string>& arguments) {
 		testbed.load_snapshot(static_cast<fs::path>(get(snapshot_flag)));
 	} else if (network_config_flag) {
 		testbed.reload_network_from_file(get(network_config_flag));
+	}
+
+	if (name_flag) {
+		testbed.set_output_name(get(name_flag));
+	}
+
+	if (method_flag) {
+		testbed.set_method(get(method_flag));
 	}
 
 	testbed.m_train = !no_train_flag;

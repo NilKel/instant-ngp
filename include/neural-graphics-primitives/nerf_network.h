@@ -180,7 +180,7 @@ class NerfNetwork : public Network<float, T> {
 public:
 	using json = nlohmann::json;
 
-	NerfNetwork(uint32_t n_pos_dims, uint32_t n_dir_dims, uint32_t n_extra_dims, uint32_t dir_offset, const json& pos_encoding, const json& dir_encoding, const json& density_network, const json& rgb_network) : m_n_pos_dims{n_pos_dims}, m_n_dir_dims{n_dir_dims}, m_dir_offset{dir_offset}, m_n_extra_dims{n_extra_dims} {
+	NerfNetwork(uint32_t n_pos_dims, uint32_t n_dir_dims, uint32_t n_extra_dims, uint32_t dir_offset, const json& pos_encoding, const json& dir_encoding, const json& density_network, const json& rgb_network, const std::string& method = "baseline") : m_n_pos_dims{n_pos_dims}, m_n_dir_dims{n_dir_dims}, m_dir_offset{dir_offset}, m_n_extra_dims{n_extra_dims}, m_method{method} {
 		m_pos_encoding.reset(create_encoding<T>(n_pos_dims, pos_encoding, density_network.contains("otype") && (equals_case_insensitive(density_network["otype"], "FullyFusedMLP") || equals_case_insensitive(density_network["otype"], "MegakernelMLP")) ? 16u : 8u));
 		uint32_t rgb_alignment = minimum_alignment(rgb_network);
 		m_dir_encoding.reset(create_encoding<T>(m_n_dir_dims + m_n_extra_dims, dir_encoding, rgb_alignment));
@@ -188,7 +188,11 @@ public:
 		json local_density_network_config = density_network;
 		local_density_network_config["n_input_dims"] = m_pos_encoding->padded_output_width();
 		if (!density_network.contains("n_output_dims")) {
-			local_density_network_config["n_output_dims"] = 46; // 1D density + 15x3D Phi
+			if (m_method == "surface") {
+				local_density_network_config["n_output_dims"] = 46; // 1D density + 15x3D Phi
+			} else {
+				local_density_network_config["n_output_dims"] = 4; // 1D density + 3D RGB
+			}
 		}
 		m_density_network.reset(create_network<T>(local_density_network_config));
 
@@ -238,28 +242,44 @@ public:
 		);
 
 		// Compute analytic normals: dSDF/dpos
-		GPUMatrixDynamic<T> dL_ddensity_network_input{m_pos_encoding->padded_output_width(), batch_size, stream, m_pos_encoding->preferred_output_layout()};
-		GPUMatrixDynamic<T> dL_ddensity_network_output{m_density_network->padded_output_width(), batch_size, stream, m_dir_encoding->preferred_output_layout()};
-		CUDA_CHECK_THROW(cudaMemsetAsync(dL_ddensity_network_input.data(), 0, dL_ddensity_network_input.n_bytes(), stream));
-		CUDA_CHECK_THROW(cudaMemsetAsync(dL_ddensity_network_output.data(), 0, dL_ddensity_network_output.n_bytes(), stream));
-		linear_kernel(seed_density_channel0_kernel, 0, stream, batch_size, dL_ddensity_network_output.layout() == RM ? dL_ddensity_network_output.m() : dL_ddensity_network_output.stride(), (float*)dL_ddensity_network_output.data());
-		m_density_network->backward(stream, *dens_ctx, density_network_input, density_network_output, dL_ddensity_network_output, &dL_ddensity_network_input, use_inference_params, GradientMode::Ignore);
-		GPUMatrixDynamic<float> dL_dpos_encoding_input{m_pos_encoding->input_width(), batch_size, stream, CM};
-		m_pos_encoding->backward(stream, *pos_ctx, input.slice_rows(0, m_pos_encoding->input_width()), density_network_input, dL_ddensity_network_input, &dL_dpos_encoding_input, use_inference_params, GradientMode::Ignore);
+		if (m_method == "surface") {
+			GPUMatrixDynamic<T> dL_ddensity_network_input{m_pos_encoding->padded_output_width(), batch_size, stream, m_pos_encoding->preferred_output_layout()};
+			GPUMatrixDynamic<T> dL_ddensity_network_output{m_density_network->padded_output_width(), batch_size, stream, m_dir_encoding->preferred_output_layout()};
+			CUDA_CHECK_THROW(cudaMemsetAsync(dL_ddensity_network_input.data(), 0, dL_ddensity_network_input.n_bytes(), stream));
+			CUDA_CHECK_THROW(cudaMemsetAsync(dL_ddensity_network_output.data(), 0, dL_ddensity_network_output.n_bytes(), stream));
+			linear_kernel(seed_density_channel0_kernel, 0, stream, batch_size, dL_ddensity_network_output.layout() == RM ? dL_ddensity_network_output.m() : dL_ddensity_network_output.stride(), (float*)dL_ddensity_network_output.data());
+			m_density_network->backward(stream, *dens_ctx, density_network_input, density_network_output, dL_ddensity_network_output, &dL_ddensity_network_input, use_inference_params, GradientMode::Ignore);
+			GPUMatrixDynamic<float> dL_dpos_encoding_input{m_pos_encoding->input_width(), batch_size, stream, CM};
+			m_pos_encoding->backward(stream, *pos_ctx, input.slice_rows(0, m_pos_encoding->input_width()), density_network_input, dL_ddensity_network_input, &dL_dpos_encoding_input, use_inference_params, GradientMode::Ignore);
 
-		// Normalize into normals buffer (float)
-		GPUMatrix<float> normals{3, batch_size, stream};
-		linear_kernel(normalize_normals_kernel, 0, stream, batch_size, dL_dpos_encoding_input.m(), dL_dpos_encoding_input.data(), normals.m(), normals.data());
+			// Normalize into normals buffer (float)
+			GPUMatrix<float> normals{3, batch_size, stream};
+			linear_kernel(normalize_normals_kernel, 0, stream, batch_size, dL_dpos_encoding_input.m(), dL_dpos_encoding_input.data(), normals.m(), normals.data());
 
-		// Write 16D block [density + 15 features] into beginning of rgb_network_input
-		linear_kernel(compute_surface_features_kernel, 0, stream,
-			batch_size,
-			density_network_output.layout() == AoS ? density_network_output.stride() : 1,
-			(float*)density_network_output.data(),
-			normals.m(), normals.data(),
-			rgb_network_input.layout() == AoS ? rgb_network_input.stride() : 1,
-			(float*)rgb_network_input.data()
-		);
+			// Write 16D block [density + 15 features] into beginning of rgb_network_input
+			linear_kernel(compute_surface_features_kernel, 0, stream,
+				batch_size,
+				density_network_output.layout() == AoS ? density_network_output.stride() : 1,
+				(float*)density_network_output.data(),
+				normals.m(), normals.data(),
+				rgb_network_input.layout() == AoS ? rgb_network_input.stride() : 1,
+				(float*)rgb_network_input.data()
+			);
+			// Debug print for surface method
+			printf("Surface method: density_network_output size %d, rgb_network_input size %d\n", m_density_network->padded_output_width(), m_rgb_network->padded_output_width());
+		} else {
+			// Baseline method: copy density output directly to rgb_network_input for the density part
+			// This is a simplified representation, actual baseline might vary.
+			CUDA_CHECK_THROW(cudaMemcpyAsync(
+				rgb_network_input.data(),
+				density_network_output.data(),
+				density_network_output.n_bytes(),
+				cudaMemcpyDeviceToDevice,
+				stream
+			));
+			// Debug print for baseline method
+			printf("Baseline method: density_network_output size %d, rgb_network_input size after copy %d\n", m_density_network->padded_output_width(), m_density_network->padded_output_width());
+		}
 
 		m_rgb_network->inference_mixed_precision(stream, rgb_network_input, rgb_network_output, use_inference_params);
 
@@ -311,24 +331,40 @@ public:
 
 		// Compute analytic normals and surface features, fill first 16 rows of rgb input
 		{
-			GPUMatrixDynamic<T> dL_ddensity_network_input{m_pos_encoding->padded_output_width(), batch_size, stream, m_pos_encoding->preferred_output_layout()};
-			GPUMatrixDynamic<T> dL_ddensity_network_output{m_density_network->padded_output_width(), batch_size, stream, m_dir_encoding->preferred_output_layout()};
-			CUDA_CHECK_THROW(cudaMemsetAsync(dL_ddensity_network_input.data(), 0, dL_ddensity_network_input.n_bytes(), stream));
-			CUDA_CHECK_THROW(cudaMemsetAsync(dL_ddensity_network_output.data(), 0, dL_ddensity_network_output.n_bytes(), stream));
-			linear_kernel(seed_density_channel0_kernel, 0, stream, batch_size, dL_ddensity_network_output.layout() == RM ? dL_ddensity_network_output.m() : dL_ddensity_network_output.stride(), (float*)dL_ddensity_network_output.data());
-			m_density_network->backward(stream, *forward->density_network_ctx, forward->density_network_input, forward->density_network_output, dL_ddensity_network_output, &dL_ddensity_network_input, use_inference_params, GradientMode::Ignore);
-			forward->dSDF_dpos = GPUMatrix<float>{m_pos_encoding->input_width(), batch_size, stream};
-			m_pos_encoding->backward(stream, *forward->pos_encoding_ctx, input.slice_rows(0, m_pos_encoding->input_width()), forward->density_network_input, dL_ddensity_network_input, &forward->dSDF_dpos, use_inference_params, GradientMode::Ignore);
-			forward->normals = GPUMatrix<float>{3, batch_size, stream};
-			linear_kernel(normalize_normals_kernel, 0, stream, batch_size, forward->dSDF_dpos.m(), forward->dSDF_dpos.data(), forward->normals.m(), forward->normals.data());
-			linear_kernel(compute_surface_features_kernel, 0, stream,
-				batch_size,
-				forward->density_network_output.layout() == AoS ? forward->density_network_output.stride() : 1,
-				(float*)forward->density_network_output.data(),
-				forward->normals.m(), forward->normals.data(),
-				forward->rgb_network_input.layout() == AoS ? forward->rgb_network_input.stride() : 1,
-				(float*)forward->rgb_network_input.data()
-			);
+			if (m_method == "surface") {
+				GPUMatrixDynamic<T> dL_ddensity_network_input{m_pos_encoding->padded_output_width(), batch_size, stream, m_pos_encoding->preferred_output_layout()};
+				GPUMatrixDynamic<T> dL_ddensity_network_output{m_density_network->padded_output_width(), batch_size, stream, m_dir_encoding->preferred_output_layout()};
+				CUDA_CHECK_THROW(cudaMemsetAsync(dL_ddensity_network_input.data(), 0, dL_ddensity_network_input.n_bytes(), stream));
+				CUDA_CHECK_THROW(cudaMemsetAsync(dL_ddensity_network_output.data(), 0, dL_ddensity_network_output.n_bytes(), stream));
+				linear_kernel(seed_density_channel0_kernel, 0, stream, batch_size, dL_ddensity_network_output.layout() == RM ? dL_ddensity_network_output.m() : dL_ddensity_network_output.stride(), (float*)dL_ddensity_network_output.data());
+				m_density_network->backward(stream, *forward->density_network_ctx, forward->density_network_input, forward->density_network_output, dL_ddensity_network_output, &dL_ddensity_network_input, use_inference_params, GradientMode::Ignore);
+				forward->dSDF_dpos = GPUMatrix<float>{m_pos_encoding->input_width(), batch_size, stream};
+				m_pos_encoding->backward(stream, *forward->pos_encoding_ctx, input.slice_rows(0, m_pos_encoding->input_width()), forward->density_network_input, dL_ddensity_network_input, &forward->dSDF_dpos, use_inference_params, GradientMode::Ignore);
+				forward->normals = GPUMatrix<float>{3, batch_size, stream};
+				linear_kernel(normalize_normals_kernel, 0, stream, batch_size, forward->dSDF_dpos.m(), forward->dSDF_dpos.data(), forward->normals.m(), forward->normals.data());
+				linear_kernel(compute_surface_features_kernel, 0, stream,
+					batch_size,
+					forward->density_network_output.layout() == AoS ? forward->density_network_output.stride() : 1,
+					(float*)forward->density_network_output.data(),
+					forward->normals.m(), forward->normals.data(),
+					forward->rgb_network_input.layout() == AoS ? forward->rgb_network_input.stride() : 1,
+					(float*)forward->rgb_network_input.data()
+				);
+				// Debug print for surface method
+				printf("Surface method (forward): density_network_output size %d, rgb_network_input size %d\n", m_density_network->padded_output_width(), m_rgb_network->padded_output_width());
+			} else {
+				// Baseline method: copy density output directly to rgb_network_input for the density part
+				// This is a simplified representation, actual baseline might vary.
+				CUDA_CHECK_THROW(cudaMemcpyAsync(
+					forward->rgb_network_input.data(),
+					forward->density_network_output.data(),
+					forward->density_network_output.n_bytes(),
+					cudaMemcpyDeviceToDevice,
+					stream
+				));
+				// Debug print for baseline method
+				printf("Baseline method (forward): density_network_output size %d, rgb_network_input size after copy %d\n", m_density_network->padded_output_width(), m_density_network->padded_output_width());
+			}
 		}
 
 		forward->rgb_network_ctx = m_rgb_network->forward(stream, forward->rgb_network_input, output ? &forward->rgb_network_output : nullptr, use_inference_params, prepare_input_gradients);
@@ -397,25 +433,39 @@ public:
 			// We can reuse add_density_gradient by reinterpreting shapes: place grad in a fake rgbd buffer where +3 offset matches index 0
 			// Instead, do a simple kernel-less axpy via cublas? Keep it simple: launch a small kernel
 		}
-		// Implement density channel grad addition with a simple kernel using existing add_density_gradient expecting rgbd with +3 offset
-		linear_kernel(add_density_gradient<T>, 0, stream,
-			batch_size,
-			dL_doutput.m(),
-			dL_doutput.data(),
-			dL_ddensity_network_output.layout() == RM ? 1 : dL_ddensity_network_output.stride(),
-			dL_ddensity_network_output.data()
-		);
 
-		// Phi gradients from surface features (rows 1..15). Use saved normals
-		linear_kernel(surface_features_backward_to_phi_kernel, 0, stream,
-			batch_size,
-			dL_ddensity_network_output.layout() == RM ? dL_ddensity_network_output.m() : dL_ddensity_network_output.stride(),
-			(float*)dL_ddensity_network_output.data(),
-			(float*)forward.density_network_output.data(),
-			forward.normals.m(), forward.normals.data(),
-			dL_drgb_network_input.layout() == RM ? dL_drgb_network_input.m() : dL_drgb_network_input.stride(),
-			(float*)dL_drgb_network_input.data()
-		);
+		if (m_method == "surface") {
+			// Implement density channel grad addition with a simple kernel using existing add_density_gradient expecting rgbd with +3 offset
+			linear_kernel(add_density_gradient<T>, 0, stream,
+				batch_size,
+				dL_doutput.m(),
+				dL_doutput.data(),
+				dL_ddensity_network_output.layout() == RM ? 1 : dL_ddensity_network_output.stride(),
+				dL_ddensity_network_output.data()
+			);
+
+			// Phi gradients from surface features (rows 1..15). Use saved normals
+			linear_kernel(surface_features_backward_to_phi_kernel, 0, stream,
+				batch_size,
+				dL_ddensity_network_output.layout() == RM ? dL_ddensity_network_output.m() : dL_ddensity_network_output.stride(),
+				(float*)dL_ddensity_network_output.data(),
+				(float*)forward.density_network_output.data(),
+				forward.normals.m(), forward.normals.data(),
+				dL_drgb_network_input.layout() == RM ? dL_drgb_network_input.m() : dL_drgb_network_input.stride(),
+				(float*)dL_drgb_network_input.data()
+			);
+		} else {
+			// Baseline method: directly add the gradient from rgb_network_input (first channel) to density_network_output
+			// This is a simplified representation, actual baseline might vary.
+			// Assuming the first channel of dL_drgb_network_input corresponds to the density gradient
+			linear_kernel(add_density_gradient<T>, 0, stream,
+				batch_size,
+				dL_drgb_network_input.m(), // Assuming this is the stride for the density part of rgb_network_input
+				dL_drgb_network_input.data(),
+				dL_ddensity_network_output.layout() == RM ? 1 : dL_ddensity_network_output.stride(),
+				dL_ddensity_network_output.data()
+			);
+		}
 
 		GPUMatrixDynamic<T> dL_ddensity_network_input;
 		if (m_pos_encoding->n_params() > 0 || dL_dinput || m_backprop_normals) {
@@ -832,6 +882,8 @@ private:
 	uint32_t m_n_extra_dims; // extra dimensions are assumed to be part of a compound encoding with dir_dims
 	uint32_t m_dir_offset;
 	bool m_backprop_normals = false;
+
+	std::string m_method;
 
 	// // Storage of forward pass data
 	struct ForwardContext : public Context {

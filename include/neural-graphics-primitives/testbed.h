@@ -586,6 +586,9 @@ public:
 	bool jit_fusion();
 	void set_jit_fusion(bool val);
 
+	void set_output_name(const std::string& name) { m_output_name = name; }
+	void set_method(const std::string& method) { m_method = method; }
+
 	////////////////////////////////////////////////////////////////
 	// marching cubes related state
 	struct MeshState {
@@ -1226,6 +1229,9 @@ public:
 	nlohmann::json m_network_config;
 
 	default_rng_t m_rng;
+
+	std::string m_output_name = "";
+	std::string m_method = "baseline";
 
 	CudaRenderBuffer m_windowless_render_surface{std::make_shared<CudaSurface2D>()};
 

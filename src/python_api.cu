@@ -708,6 +708,8 @@ PYBIND11_MODULE(pyngp, m) {
 			[](py::object& obj) { return obj.cast<Testbed&>().root_dir().str(); },
 			[](const py::object& obj, const std::string& value) { obj.cast<Testbed&>().set_root_dir(value); }
 		)
+		.def_property("output_name", [](py::object& obj) { return obj.cast<Testbed&>().m_output_name; }, [](py::object& obj, const std::string& value) { obj.cast<Testbed&>().m_output_name = value; })
+		.def_property("method", [](py::object& obj) { return obj.cast<Testbed&>().m_method; }, [](py::object& obj, const std::string& value) { obj.cast<Testbed&>().m_method = value; })
 		;
 
 

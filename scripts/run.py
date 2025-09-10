@@ -66,6 +66,9 @@ def parse_args():
 	parser.add_argument("--width", "--screenshot_w", type=int, default=0, help="Resolution width of GUI and screenshots.")
 	parser.add_argument("--height", "--screenshot_h", type=int, default=0, help="Resolution height of GUI and screenshots.")
 
+	parser.add_argument("--name", default="", help="Name for the output directory. The output will be stored in outputs/dataset/scene/method/name.")
+	parser.add_argument("--method", default="baseline", help="Method to use (baseline or surface).")
+
 	parser.add_argument("--gui", action="store_true", help="Run the testbed GUI interactively.")
 	parser.add_argument("--train", action="store_true", help="If the GUI is enabled, controls whether training starts immediately.")
 	parser.add_argument("--n_steps", type=int, default=-1, help="Number of steps to train for before quitting.")
@@ -146,6 +149,9 @@ if __name__ == "__main__":
 	testbed.nerf.sharpen = float(args.sharpen)
 	testbed.exposure = args.exposure
 	testbed.shall_train = args.train if args.gui else True
+
+	testbed.output_name = args.name
+	testbed.method = args.method
 
 	# Inform C++ of bnormals flag if supported by the build
 	try:
@@ -327,6 +333,76 @@ if __name__ == "__main__":
 		psnr = totpsnr/(totcount or 1)
 		ssim = totssim/(totcount or 1)
 		print(f"PSNR={psnr} [min={minpsnr} max={maxpsnr}] SSIM={ssim}")
+
+	# Post-training evaluation and saving for --name and --method
+	if args.name and args.method:
+		scene_dir_components = os.path.dirname(args.scene).split(os.sep)
+		scene_base_path = os.path.join(scene_dir_components[-2], scene_dir_components[-1])
+		output_dir = os.path.join("outputs", scene_base_path, args.method, args.name)
+		os.makedirs(output_dir, exist_ok=True)
+
+		print(f"Saving results to: {output_dir}")
+
+		totmse = 0
+		totpsnr = 0
+		totssim = 0
+		totcount = 0
+		minpsnr = 1000
+		maxpsnr = 0
+
+		testbed.background_color = [0.0, 0.0, 0.0, 1.0]
+		testbed.snap_to_pixel_centers = True
+		spp = 8 # samples per pixel for evaluation
+
+		testbed.nerf.render_min_transmittance = 1e-4
+		testbed.shall_train = False
+		testbed.render_with_lens_distortion = True
+
+		# Load evaluation transforms if provided, otherwise use training data
+		test_transforms_path = args.scene.replace("transforms_train.json", "transforms_test.json")
+		print(f"Loading evaluation data from: {test_transforms_path}")
+		testbed.load_training_data(test_transforms_path)
+		# The output_dir path should remain based on the original scene for consistency
+
+		with tqdm(range(0, testbed.nerf.training.dataset.n_images, 25), unit="images", desc=f"Rendering test images for {args.method} in {args.name}") as t:
+			for i in t:
+				resolution = testbed.nerf.training.dataset.metadata[i].resolution
+
+				# Render ground truth
+				testbed.render_ground_truth = True
+				testbed.set_camera_to_training_view(i)
+				ref_image = testbed.render(resolution[0], resolution[1], 1, True)
+				write_image(os.path.join(output_dir, f"gt_image_{i:04d}.png"), np.clip(ref_image * 2**testbed.exposure, 0.0, 1.0), quality=100)
+
+				# Render predicted image
+				testbed.render_ground_truth = False
+				image = testbed.render(resolution[0], resolution[1], spp, True)
+				write_image(os.path.join(output_dir, f"rendered_image_{i:04d}.png"), np.clip(image * 2**testbed.exposure, 0.0, 1.0), quality=100)
+
+				A = np.clip(linear_to_srgb(image[...,:3]), 0.0, 1.0)
+				R = np.clip(linear_to_srgb(ref_image[...,:3]), 0.0, 1.0)
+				mse = float(compute_error("MSE", A, R))
+				ssim = float(compute_error("SSIM", A, R))
+				totssim += ssim
+				totmse += mse
+				psnr = mse2psnr(mse)
+				totpsnr += psnr
+				minpsnr = psnr if psnr<minpsnr else minpsnr
+				maxpsnr = psnr if psnr>maxpsnr else maxpsnr
+				totcount = totcount+1
+				t.set_postfix(psnr = totpsnr/(totcount or 1))
+
+		psnr_avgmse = mse2psnr(totmse/(totcount or 1))
+		psnr = totpsnr/(totcount or 1)
+		ssim = totssim/(totcount or 1)
+
+		with open(os.path.join(output_dir, "evaluation_results.txt"), "w") as f:
+			f.write(f"Average PSNR: {psnr}\n")
+			f.write(f"Min PSNR: {minpsnr}\n")
+			f.write(f"Max PSNR: {maxpsnr}\n")
+			f.write(f"Average SSIM: {ssim}\n")
+
+		print(f"Evaluation results saved to {os.path.join(output_dir, 'evaluation_results.txt')}")
 
 	if args.save_mesh:
 		res = args.marching_cubes_res or 256
