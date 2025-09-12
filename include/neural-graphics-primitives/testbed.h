@@ -86,7 +86,7 @@ public:
 	void load_training_data(const fs::path& path);
 	void reload_training_data();
 	void clear_training_data();
-
+	void set_method(const std::string& method);
 	void set_mode(ETestbedMode mode);
 
 	using distance_fun_t = std::function<void(uint32_t, const vec3*, float*, cudaStream_t)>;
@@ -587,7 +587,7 @@ public:
 	void set_jit_fusion(bool val);
 
 	void set_output_name(const std::string& name) { m_output_name = name; }
-	void set_method(const std::string& method) { m_method = method; }
+	// void set_method(const std::string& method) { m_method = method; }
 
 	////////////////////////////////////////////////////////////////
 	// marching cubes related state

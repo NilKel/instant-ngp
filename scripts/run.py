@@ -128,6 +128,9 @@ if __name__ == "__main__":
 		if args.vr:
 			testbed.init_vr()
 
+	testbed.method = args.method
+	# Add debug print to verify method is set
+	print(f"DEBUG: Method set to: {args.method}")
 
 	if args.load_snapshot:
 		scene_info = get_scene(args.load_snapshot)
@@ -151,12 +154,12 @@ if __name__ == "__main__":
 	testbed.shall_train = args.train if args.gui else True
 
 	testbed.output_name = args.name
-	testbed.method = args.method
+	
 
 	# Inform C++ of bnormals flag if supported by the build
 	try:
 		if args.bnormals:
-			# This is a soft hook; C++ can read env or query from Testbed later if bound
+			 # This is a soft hook; C++ can read env or query from Testbed later if bound
 			pass
 	except Exception:
 		pass

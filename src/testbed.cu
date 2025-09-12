@@ -192,6 +192,12 @@ void Testbed::clear_training_data() {
 	m_nerf.training.dataset.metadata.clear();
 }
 
+void Testbed::set_method(const std::string& method) {
+    m_method = method;
+    printf("=== Method set in C++ ===\n");
+    printf("Method: %s\n", m_method.c_str());
+}
+
 void Testbed::set_mode(ETestbedMode mode) {
 	if (mode == m_testbed_mode) {
 		return;
@@ -4277,6 +4283,8 @@ void Testbed::reset_network(bool clear_density_grid) {
 
 	size_t n_encoding_params = 0;
 	if (m_testbed_mode == ETestbedMode::Nerf) {
+		printf("=== Creating NerfNetwork in reset_network ===\n");
+    	printf("Method from testbed: %s\n", m_method.c_str());
 		m_nerf.training.cam_exposure.resize(m_nerf.training.dataset.n_images, AdamOptimizer<vec3>(1e-3f));
 		m_nerf.training.cam_pos_offset.resize(m_nerf.training.dataset.n_images, AdamOptimizer<vec3>(1e-4f));
 		m_nerf.training.cam_rot_offset.resize(m_nerf.training.dataset.n_images, RotationAdamOptimizer(1e-4f));
@@ -4301,11 +4309,52 @@ void Testbed::reset_network(bool clear_density_grid) {
 					encoding_config,
 					dir_encoding_config,
 					network_config,
-					rgb_network_config
+					rgb_network_config,
+					m_method  // ADD THIS LINE
 				)
 			);
 		}
 
+		printf("NerfNetwork created successfully\n");
+		
+		// FORCE JIT FUSION OFF FOR ALL NETWORKS ON ALL DEVICES
+		for (auto& device : m_devices) {
+			// Disable JIT for the main network
+			if (device.network()) {
+				device.network()->set_jit_fusion(false);
+				printf("JIT fusion disabled for device %d main network\n", device.id());
+			}
+			
+			// Disable JIT for the NeRF network specifically
+			if (device.nerf_network()) {
+				device.nerf_network()->set_jit_fusion(false);
+				printf("JIT fusion disabled for device %d nerf network\n", device.id());
+			}
+		}
+		
+		// Also disable at testbed level to make sure
+		this->set_jit_fusion(false);
+		printf("Testbed JIT fusion disabled\n");
+		
+		// Verify the final state
+		printf("Final JIT fusion state: %s\n", this->jit_fusion() ? "enabled" : "disabled");
+		
+		// Force disable JIT for the device networks too
+		for (auto& device : m_devices) {
+			if (device.nerf_network()) {
+				device.nerf_network()->set_jit_fusion(false);
+				printf("JIT fusion disabled for device network\n");
+			}
+		}
+
+		if (m_nerf_network) {
+			printf("Density output width: %d\n", m_nerf_network->padded_density_output_width());
+			if (m_method == "surface") {
+				printf("Expected density output width for surface: 46\n");
+			} else {
+				printf("Expected density output width for baseline: varies\n");
+			}
+		}
 		m_network = m_nerf_network = primary_device().nerf_network();
 
 		m_encoding = m_nerf_network->pos_encoding();
