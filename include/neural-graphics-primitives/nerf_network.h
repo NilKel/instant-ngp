@@ -39,11 +39,6 @@ __global__ void extract_density(
 	const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
 	if (i >= n_elements) return;
 
-	// Bounds checking for first element
-	if (i == 0) {
-		printf("extract_density: n_elements=%d, density_stride=%d, rgbd_stride=%d\n",
-			   n_elements, density_stride, rgbd_stride);
-	}
 	rgbd[i * rgbd_stride] = density[i * density_stride];
 }
 
@@ -58,16 +53,6 @@ __global__ void add_density_from_surface_features(
     const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
     if (i >= n_elements) return;
 
-    // Debug for first element
-    if (i == 0) {
-        printf("add_density_from_surface_features: n_elements=%d, surface_stride=%d, density_stride=%d\n",
-               n_elements, surface_stride, density_stride);
-        printf("add_density_from_surface_features: About to read dL_dsurface_features[%d] (max: %d)\n", 
-               i * surface_stride, n_elements * surface_stride - 1);
-        printf("add_density_from_surface_features: About to write dL_ddensity[%d] (max: %d)\n", 
-               i * density_stride, n_elements * density_stride - 1);
-    }
-
     // Surface feature[0] corresponds to density channel[0]
     // Check bounds
     if (surface_stride == 0 || density_stride == 0) {
@@ -75,8 +60,7 @@ __global__ void add_density_from_surface_features(
         return;
     }
     
-    if (i == 0) printf("add_density_from_surface_features: Performing dL_ddensity[%d] += dL_dsurface_features[%d]\n", 
-                       i * density_stride, i * surface_stride);
+    
     dL_ddensity[i * density_stride] += dL_dsurface_features[i * surface_stride];
 }
 
@@ -93,17 +77,6 @@ __global__ void extract_rgb(
 
 	const uint32_t elem_idx = i / 3;
 	const uint32_t dim_idx = i - elem_idx * 3;
-
-	// Debug for first few elements
-	if (i < 3) {
-		printf("extract_rgb: i=%d, n_elements=%d, rgb_stride=%d, output_stride=%d\n",
-			   i, n_elements, rgb_stride, output_stride);
-		printf("extract_rgb: elem_idx=%d, dim_idx=%d\n", elem_idx, dim_idx);
-		printf("extract_rgb: About to read rgbd[%d] (max: %d)\n", 
-			   elem_idx*output_stride + dim_idx, (n_elements/3)*output_stride - 1);
-		printf("extract_rgb: About to write rgb[%d] (max: %d)\n", 
-			   elem_idx*rgb_stride + dim_idx, (n_elements/3)*rgb_stride - 1);
-	}
 
 	rgb[elem_idx*rgb_stride + dim_idx] = rgbd[elem_idx*output_stride + dim_idx];
 }
@@ -125,12 +98,6 @@ static __global__ void compute_surface_features_kernel(
     const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
     if (i >= n_elements) return;
     
-    // Debug for first element
-    if (i == 0) {
-        printf("compute_surface_features: n_elements=%d, density_stride=%d, normals_stride=%d, rgb_in_stride=%d\n",
-               n_elements, density_stride, normals_stride, rgb_in_stride);
-    }
-
     const float* dens_base = density_out + i * density_stride;
     const float* nbase = normals + i * normals_stride;
     float* rgb_base = rgb_in + i * rgb_in_stride;
@@ -143,7 +110,7 @@ static __global__ void compute_surface_features_kernel(
     for (uint32_t k = 0; k < 15; ++k) {
         const float* phi_k = dens_base + 1 + k*3; // Phi_k = channels [1+3k, 2+3k, 3+3k]
         float dotp = phi_k[0]*nbase[0] + phi_k[1]*nbase[1] + phi_k[2]*nbase[2];
-        float feat = fmaxf(0.0f, -dotp); // ReLU(-dotp)
+        float feat = fmaxf(0.01f * (-dotp), -dotp); // Leaky ReLU(-dotp) with slope 0.01
         rgb_base[1 + k] = feat; // Store in surface feature channels 1..15
     }
 }
@@ -166,17 +133,10 @@ static __global__ void surface_features_backward_to_phi_kernel(
 
     // Bounds checking
     if (dL_ddensity_stride < 48 || density_stride < 48 || normals_stride != 3 || dL_drgb_in_stride < 16) {
-        if (i == 0) printf("ERROR: Invalid strides in surface_features_backward: dL_ddensity_stride=%d, density_stride=%d, normals_stride=%d, dL_drgb_in_stride=%d\n", 
-                          dL_ddensity_stride, density_stride, normals_stride, dL_drgb_in_stride);
+        
         return;
     }
     
-    // Additional debug for first element
-    if (i == 0) {
-        printf("surface_features_backward_to_phi: n_elements=%d, dL_ddensity_stride=%d, density_stride=%d, normals_stride=%d, dL_drgb_in_stride=%d\n",
-               n_elements, dL_ddensity_stride, density_stride, normals_stride, dL_drgb_in_stride);
-    }
-
     float* d_dens_base = dL_ddensity_out + i * dL_ddensity_stride;
     const float* dens_base = density_out + i * density_stride;
     const float* nbase = normals + i * normals_stride;
@@ -187,26 +147,26 @@ static __global__ void surface_features_backward_to_phi_kernel(
         // Bounds check for phi access
         uint32_t phi_offset = 1 + k*3;
         if (phi_offset + 2 >= density_stride) {
-            if (i == 0) printf("ERROR: Phi offset %d + 2 >= density_stride %d\n", phi_offset, density_stride);
             return;
         }
         
         const float* phi_k = dens_base + phi_offset; // Phi_k at channels [1+3k, 2+3k, 3+3k]
         float dotp = phi_k[0]*nbase[0] + phi_k[1]*nbase[1] + phi_k[2]*nbase[2];
         
-        if (dotp < 0.0f) { // ReLU was active: feat = -dotp > 0
-            // Bounds check for gradient access
-            if (1 + k >= dL_drgb_in_stride) {
-                if (i == 0) printf("ERROR: Surface feature index %d >= dL_drgb_in_stride %d\n", 1 + k, dL_drgb_in_stride);
-                return;
-            }
-            
-            float grad_contribution = d_rgb_base[1 + k]; // Gradient from surface feature k+1
-            // Gradient w.r.t. phi_k is -normal * grad_contribution
-            atomicAdd(&d_dens_base[phi_offset + 0], -nbase[0] * grad_contribution);
-            atomicAdd(&d_dens_base[phi_offset + 1], -nbase[1] * grad_contribution);
-            atomicAdd(&d_dens_base[phi_offset + 2], -nbase[2] * grad_contribution);
+        // Handle leaky ReLU backward: grad = 1.0 if -dotp > 0, else 0.01
+        float grad_scale = (-dotp > 0.0f) ? 1.0f : 0.01f;
+        
+        // Always propagate some gradient with leaky ReLU
+        // Bounds check for gradient access
+        if (1 + k >= dL_drgb_in_stride) {
+            return;
         }
+        
+        float grad_contribution = d_rgb_base[1 + k] * grad_scale; // Scale by leaky ReLU gradient
+        // Gradient w.r.t. phi_k is -normal * grad_contribution
+        atomicAdd(&d_dens_base[phi_offset + 0], -nbase[0] * grad_contribution);
+        atomicAdd(&d_dens_base[phi_offset + 1], -nbase[1] * grad_contribution);
+        atomicAdd(&d_dens_base[phi_offset + 2], -nbase[2] * grad_contribution);
     }
 }
 
@@ -248,12 +208,6 @@ static __global__ void normalize_normals_kernel(
 ) {
 	const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
 	if (i >= n_elements) return;
-	
-	// Debug for first element
-	if (i == 0) {
-		printf("normalize_normals: n_elements=%d, grad_stride=%d, normals_stride=%d\n",
-			   n_elements, grad_stride, normals_stride);
-	}
 	
 	const float* g = dL_dpos + i * grad_stride;
 	float nx = g[0];
@@ -363,142 +317,35 @@ public:
 	void set_backprop_normals(bool v) { m_backprop_normals = v; }
 
 	void inference_mixed_precision_impl(cudaStream_t stream, const GPUMatrixDynamic<float>& input, GPUMatrixDynamic<T>& output, bool use_inference_params = true) override {
-		printf("=== INFERENCE START ===\n");
-    	printf("Input: %dx%d, Output: %dx%d\n", input.rows(), input.cols(), output.rows(), output.cols());
 		uint32_t batch_size = input.n();
-		printf("Batch size: %d\n", batch_size);
 
 		GPUMatrixDynamic<T> density_network_input{m_pos_encoding->padded_output_width(), batch_size, stream, m_pos_encoding->preferred_output_layout()};
-		printf("Created density_network_input: %dx%d\n", density_network_input.rows(), density_network_input.cols());
-
 		GPUMatrixDynamic<T> rgb_network_input{m_rgb_network_input_width, batch_size, stream, m_dir_encoding->preferred_output_layout()};
-		printf("Created rgb_network_input: %dx%d\n", rgb_network_input.rows(), rgb_network_input.cols());
 
 		GPUMatrixDynamic<T> density_network_output;
 		if (m_method == "surface") {
 			// Surface mode: separate buffer to avoid size mismatch
 			density_network_output = GPUMatrixDynamic<T>{m_density_network->padded_output_width(), batch_size, stream, RM};
-			printf("Created surface density_network_output: %dx%d\n", density_network_output.rows(), density_network_output.cols());
 		} else {
 			// Baseline: slice from rgb input
 			density_network_output = rgb_network_input.slice_rows(0, m_density_network->padded_output_width());
-			printf("Created baseline density_network_output: %dx%d\n", density_network_output.rows(), density_network_output.cols());
 		}
-
 
 		GPUMatrixDynamic<T> rgb_network_output{output.data(), m_rgb_network->padded_output_width(), batch_size, output.layout()};
 
-		
+		// Standard forward pass first
+		m_pos_encoding->inference_mixed_precision(
+			stream,
+			input.slice_rows(0, m_pos_encoding->input_width()),
+			density_network_input,
+			use_inference_params
+		);
 
-		// Compute analytic normals: dSDF/dpos
+		m_density_network->inference_mixed_precision(stream, density_network_input, density_network_output, use_inference_params);
+
+		// Set up direction encoding
 		if (m_method == "surface") {
-			printf("=== SURFACE: STEP 4 - NeuS2-inspired analytical normals with gradient flow ===\n");
-			
-			// PHASE 1: Forward Pass - Compute Analytical Gradients (NeuS2 approach)
-			printf("=== SURFACE: PHASE 1 - Computing analytical normals (NeuS2 style) ===\n");
-			m_pos_encoding->inference_mixed_precision(
-				stream,
-				input.slice_rows(0, m_pos_encoding->input_width()),
-				density_network_input,
-				use_inference_params
-			);
-
-			m_density_network->inference_mixed_precision(stream, density_network_input, density_network_output, use_inference_params);
-
-			// NeuS2 Phase 1: Set up gradient computation for analytical normals (NeuS style)
-			printf("=== SURFACE: Setting up gradient computation for SDF normals (NeuS approach) ===\n");
-			
-			// Create separate forward pass for normal computation using individual networks (like NeuS)
-			GPUMatrixDynamic<T> density_network_input_normals{m_pos_encoding->padded_output_width(), batch_size, stream, m_pos_encoding->preferred_output_layout()};
-			GPUMatrixDynamic<T> density_network_output_normals{m_density_network->padded_output_width(), batch_size, stream, RM};
-			
-			// Forward pass through pos encoding
-			auto pos_encoding_ctx_normals = m_pos_encoding->forward(
-				stream,
-				input.slice_rows(0, m_pos_encoding->input_width()),
-				&density_network_input_normals,
-				use_inference_params,
-				true  // prepare_input_gradients = true for gradient computation
-			);
-			
-			// Forward pass through density network
-			auto density_network_ctx_normals = m_density_network->forward(
-				stream,
-				density_network_input_normals,
-				&density_network_output_normals,
-				use_inference_params,
-				true  // prepare_input_gradients = true for gradient computation
-			);
-			
-			// Set "loss gradient" to 1.0 for SDF output (channel 0) - NeuS style
-			GPUMatrixDynamic<T> dL_dsdf{m_density_network->padded_output_width(), batch_size, stream, RM};
-			CUDA_CHECK_THROW(cudaMemsetAsync(dL_dsdf.data(), 0, dL_dsdf.n_bytes(), stream));
-			set_constant_value_view(stream, batch_size, T(1.0f), dL_dsdf);
-			
-			// Compute analytical gradients via backprop with GradientMode::Ignore (NeuS approach)
-			printf("=== SURFACE: Computing dSDF/dpos with GradientMode::Ignore (NeuS style) ===\n");
-			GPUMatrixDynamic<T> dL_ddensity_network_input_normals{m_pos_encoding->padded_output_width(), batch_size, stream, m_pos_encoding->preferred_output_layout()};
-			GPUMatrixDynamic<float> dSDF_dpos{m_pos_encoding->input_width(), batch_size, stream, CM};
-			
-			// Step 1: Backward through density network (like NeuS)
-			m_density_network->backward(
-				stream, 
-				*density_network_ctx_normals, 
-				density_network_input_normals, 
-				density_network_output_normals, 
-				dL_dsdf,  // T-typed SDF gradient buffer
-				&dL_ddensity_network_input_normals,  // Output: gradients w.r.t. density network input
-				use_inference_params, 
-				GradientMode::Ignore  // KEY: Don't affect parameter gradients
-			);
-			
-			// Step 2: Backward through pos encoding (like NeuS)
-			m_pos_encoding->backward(
-				stream,
-				*pos_encoding_ctx_normals,
-				input.slice_rows(0, m_pos_encoding->input_width()),
-				density_network_input_normals,
-				dL_ddensity_network_input_normals,
-				&dSDF_dpos,  // Output: analytical gradients dSDF/dpos
-				use_inference_params,
-				GradientMode::Ignore  // KEY: Don't affect parameter gradients
-			);
-			
-			// Store analytical gradients as normals (normalize dSDF/dpos)
-			printf("=== SURFACE: Normalizing analytical gradients to get normals ===\n");
-			GPUMatrix<float> normals{3, batch_size, stream};
-			linear_kernel(normalize_normals_kernel, 0, stream,
-				batch_size,
-				dSDF_dpos.layout() == RM ? dSDF_dpos.rows() : dSDF_dpos.stride(),
-				dSDF_dpos.data(),
-				normals.m(),
-				normals.data()
-			);
-			printf("=== SURFACE: Analytical normals computed with gradient flow preservation ===\n");
-
-			// Zero out RGB input first for clean slate
-			CUDA_CHECK_THROW(cudaMemsetAsync(rgb_network_input.data(), 0, rgb_network_input.n_bytes(), stream));
-			
-			// Feed analytical normals to surface feature computation
-			printf("=== SURFACE: Computing surface features with analytical normals ===\n");
-			printf("Density output: %dx%d, Normals: %dx%d (ANALYTICAL), RGB input: %dx%d\n",
-				density_network_output.rows(), density_network_output.cols(),
-				normals.rows(), normals.cols(),
-				rgb_network_input.rows(), rgb_network_input.cols());
-			
-			// Compute surface features: ReLU(-Phi_k · normals) 
-			linear_kernel(compute_surface_features_kernel, 0, stream,
-				batch_size,
-				density_network_output.layout() == RM ? density_network_output.rows() : density_network_output.stride(),
-				(float*)density_network_output.data(),
-				normals.m(), normals.data(),
-				rgb_network_input.layout() == RM ? rgb_network_input.rows() : rgb_network_input.stride(),
-				(float*)rgb_network_input.data()
-			);
-			printf("=== SURFACE: Surface features computed with analytical normals ===\n");
-			
-			// Handle direction encoding exactly like baseline
-			printf("=== SURFACE: Starting dir encoding (baseline-style) ===\n");
+			// Handle direction encoding first (before computing surface features)
 			uint32_t available_dir_space = m_rgb_network_input_width - 16; // Space after surface features
 			uint32_t dir_encoding_width = std::min(m_dir_encoding->padded_output_width(), available_dir_space);
 			auto dir_out = rgb_network_input.slice_rows(16, dir_encoding_width);
@@ -508,21 +355,86 @@ public:
 				dir_out,
 				use_inference_params
 			);
-			printf("=== SURFACE: Dir encoding completed ===\n");
+
+			// Compute analytical normals using the same approach as forward_impl
+			// Create separate forward pass for normal computation
+			GPUMatrixDynamic<T> density_network_input_normals{m_pos_encoding->padded_output_width(), batch_size, stream, m_pos_encoding->preferred_output_layout()};
+			GPUMatrixDynamic<T> density_network_output_normals{m_density_network->padded_output_width(), batch_size, stream, RM};
 			
-		} else {
-			// Baseline: use standard inference calls, no additional processing needed
-			m_pos_encoding->inference_mixed_precision(
-			stream,
-			input.slice_rows(0, m_pos_encoding->input_width()),
-			density_network_input,
-			use_inference_params
+			// Forward pass through pos encoding for normals
+			auto pos_encoding_ctx_normals = m_pos_encoding->forward(
+				stream,
+				input.slice_rows(0, m_pos_encoding->input_width()),
+				&density_network_input_normals,
+				use_inference_params,
+				true  // prepare_input_gradients = true for gradient computation
+			);
+			
+			// Forward pass through density network for normals
+			auto density_network_ctx_normals = m_density_network->forward(
+				stream,
+				density_network_input_normals,
+				&density_network_output_normals,
+				use_inference_params,
+				true  // prepare_input_gradients = true for gradient computation
+			);
+			
+			// Set up gradient computation for analytical normals
+			GPUMatrixDynamic<T> dL_dsdf{m_density_network->padded_output_width(), batch_size, stream, RM};
+			CUDA_CHECK_THROW(cudaMemsetAsync(dL_dsdf.data(), 0, dL_dsdf.n_bytes(), stream));
+			set_constant_value_view(stream, batch_size, T(1.0f), dL_dsdf);
+			
+			// Compute analytical gradients via backprop with GradientMode::Ignore
+			GPUMatrixDynamic<T> dL_ddensity_network_input_normals{m_pos_encoding->padded_output_width(), batch_size, stream, m_pos_encoding->preferred_output_layout()};
+			GPUMatrixDynamic<float> dSDF_dpos{m_pos_encoding->input_width(), batch_size, stream, CM};
+			
+			// Backward through density network
+			m_density_network->backward(
+				stream, 
+				*density_network_ctx_normals, 
+				density_network_input_normals, 
+				density_network_output_normals, 
+				dL_dsdf,
+				&dL_ddensity_network_input_normals,
+				use_inference_params, 
+				GradientMode::Ignore
+			);
+			
+			// Backward through pos encoding
+			m_pos_encoding->backward(
+				stream,
+				*pos_encoding_ctx_normals,
+				input.slice_rows(0, m_pos_encoding->input_width()),
+				density_network_input_normals,
+				dL_ddensity_network_input_normals,
+				&dSDF_dpos,
+				use_inference_params,
+				GradientMode::Ignore
+			);
+			
+			// Create analytical normals by normalizing dSDF/dpos
+			GPUMatrix<float> normals{3, batch_size, stream};
+			linear_kernel(normalize_normals_kernel, 0, stream,
+				batch_size,
+				dSDF_dpos.layout() == RM ? dSDF_dpos.rows() : dSDF_dpos.stride(),
+				dSDF_dpos.data(),
+				normals.m(),
+				normals.data()
 			);
 
-			m_density_network->inference_mixed_precision(stream, density_network_input, density_network_output, use_inference_params);
-
-			auto dir_out = rgb_network_input.slice_rows(m_density_network->padded_output_width(), m_dir_encoding->padded_output_width());
+			// Compute surface features with analytical normals
+			linear_kernel(compute_surface_features_kernel, 0, stream,
+				batch_size,
+				density_network_output.layout() == RM ? density_network_output.rows() : density_network_output.stride(),
+				(float*)density_network_output.data(),
+				normals.m(), normals.data(),
+				rgb_network_input.layout() == RM ? rgb_network_input.rows() : rgb_network_input.stride(),
+				(float*)rgb_network_input.data()
+			);
 			
+		} else {
+			// Baseline: use standard inference calls
+			auto dir_out = rgb_network_input.slice_rows(m_density_network->padded_output_width(), m_dir_encoding->padded_output_width());
 			m_dir_encoding->inference_mixed_precision(
 				stream,
 				input.slice_rows(m_dir_offset, m_dir_encoding->input_width()),
@@ -531,26 +443,12 @@ public:
 			);
 		}
 
-		printf("=== STARTING RGB NETWORK ===\n");
-		printf("RGB input: %dx%d, RGB output: %dx%d\n", 
-			rgb_network_input.rows(), rgb_network_input.cols(),
-			rgb_network_output.rows(), rgb_network_output.cols());
-
 		m_rgb_network->inference_mixed_precision(stream, rgb_network_input, rgb_network_output, use_inference_params);
-		printf("=== RGB NETWORK COMPLETED ===\n");
 
-		printf("=== STARTING DENSITY EXTRACTION ===\n");
-		
-		// Debug output calculation
+		// Extract density to output
 		uint32_t density_stride = density_network_output.layout() == RM ? 1 : density_network_output.stride();
 		uint32_t rgbd_stride = output.layout() == AoS ? padded_output_width() : 1;
 		T* output_ptr = output.data() + 3 * (output.layout() == AoS ? 1 : batch_size);
-		
-		printf("EXTRACT_DENSITY DEBUG:\n");
-		printf("  batch_size=%d\n", batch_size);
-		printf("  density_stride=%d, rgbd_stride=%d\n", density_stride, rgbd_stride);
-		printf("  output_ptr offset from start=%ld\n", (long)(output_ptr - output.data()));
-		printf("  Max valid offset=%d\n", output.rows() * output.cols() - 1);
 		
 		linear_kernel(extract_density<T>, 0, stream,
 			batch_size,
@@ -559,8 +457,6 @@ public:
 			density_network_output.data(),
 			output_ptr
 		);
-		printf("=== DENSITY EXTRACTION COMPLETED ===\n");
-		printf("=== INFERENCE COMPLETED ===\n");
 	}
 
 	uint32_t padded_density_output_width() const {
@@ -590,8 +486,7 @@ public:
 			// CRITICAL FIX: Ensure we don't exceed the RGB input buffer bounds
 			uint32_t available_dir_space = m_rgb_network_input_width - 16; // Space after surface features
 			uint32_t dir_encoding_width = std::min(m_dir_encoding->padded_output_width(), available_dir_space);
-			printf("SURFACE DIR SLICE: rgb_input_width=%d, dir_encoding_width=%d, available_space=%d\n", 
-			       m_rgb_network_input_width, m_dir_encoding->padded_output_width(), available_dir_space);
+			
 			dir_out = forward->rgb_network_input.slice_rows(16, dir_encoding_width);
 			forward->density_network_ctx = m_density_network->forward(stream, forward->density_network_input, &forward->density_network_output, use_inference_params, true);
 		} else {
@@ -630,15 +525,8 @@ public:
 		// } else {
 			
 		// }
-		// NeuS2-inspired SURFACE: Analytical normals with gradient flow preservation
-			if (m_method == "surface") {
-			printf("=== FORWARD: NeuS2-inspired analytical normals with gradient flow ===\n");
-				
-			// Zero out RGB input first
-				CUDA_CHECK_THROW(cudaMemsetAsync(forward->rgb_network_input.data(), 0, forward->rgb_network_input.n_bytes(), stream));
-				
-			// NeuS2 Phase 1: Compute analytical normals with gradient flow preservation (NeuS style)
-			printf("=== FORWARD: Computing analytical normals (NeuS style) ===\n");
+		// Surface mode: compute analytical normals and surface features
+		if (m_method == "surface") {
 			
 			// Create separate forward pass for normal computation using individual networks (like NeuS)
 			GPUMatrixDynamic<T> density_network_input_normals{m_pos_encoding->padded_output_width(), batch_size, stream, m_pos_encoding->preferred_output_layout()};
@@ -707,7 +595,6 @@ public:
 				forward->normals.m(),
 				forward->normals.data()
 			);
-			printf("=== FORWARD: Analytical normals computed with gradient flow preservation ===\n");
 			
 			// Compute surface features with analytical normals and actual Phi
 			linear_kernel(compute_surface_features_kernel, 0, stream,
@@ -718,7 +605,6 @@ public:
 				forward->rgb_network_input.layout() == RM ? forward->rgb_network_input.rows() : forward->rgb_network_input.stride(),
 				(float*)forward->rgb_network_input.data()
 			);
-			printf("=== FORWARD: Surface features computed with analytical normals (NeuS2) ===\n");
 		}
 
 		forward->rgb_network_ctx = m_rgb_network->forward(stream, forward->rgb_network_input, output ? &forward->rgb_network_output : nullptr, use_inference_params, prepare_input_gradients);
@@ -742,35 +628,30 @@ public:
 		bool use_inference_params = false,
 		GradientMode param_gradients_mode = GradientMode::Overwrite
 	) override {
-		printf("=== BACKWARD START ===\n");
-		printf("Input: %dx%d, Output: %dx%d, dL_doutput: %dx%d\n", 
-			input.rows(), input.cols(), output.rows(), output.cols(), 
-			dL_doutput.rows(), dL_doutput.cols());
+		
 		
 		const auto& forward = dynamic_cast<const ForwardContext&>(ctx);
 		uint32_t batch_size = input.n();
-		printf("Backward batch size: %d\n", batch_size);
-
-		printf("=== BACKWARD: Creating RGB gradient buffer ===\n");
+		
 		GPUMatrix<T> dL_drgb{m_rgb_network->padded_output_width(), batch_size, stream};
 		CUDA_CHECK_THROW(cudaMemsetAsync(dL_drgb.data(), 0, dL_drgb.n_bytes(), stream));
-		printf("=== BACKWARD: Extracting RGB gradients ===\n");
+		
 		linear_kernel(extract_rgb<T>, 0, stream,
 			batch_size*3, dL_drgb.m(), dL_doutput.m(), dL_doutput.data(), dL_drgb.data()
 		);
-		printf("=== BACKWARD: RGB gradients extracted ===\n");
+		
 
-		printf("=== BACKWARD: Creating RGB network output view ===\n");
+		
 		const GPUMatrixDynamic<T> rgb_network_output{(T*)output.data(), m_rgb_network->padded_output_width(), batch_size, output.layout()};
-		printf("=== BACKWARD: Creating RGB network input gradient buffer ===\n");
+		
 		GPUMatrixDynamic<T> dL_drgb_network_input{m_rgb_network_input_width, batch_size, stream, m_dir_encoding->preferred_output_layout()};
-		printf("=== BACKWARD: Starting RGB network backward ===\n");
+		
 		m_rgb_network->backward(stream, *forward.rgb_network_ctx, forward.rgb_network_input, rgb_network_output, dL_drgb, &dL_drgb_network_input, use_inference_params, param_gradients_mode);
-		printf("=== BACKWARD: RGB network backward completed ===\n");
+		
 
 		// Backprop through dir encoding if it is trainable or if we need input gradients
 		if (m_dir_encoding->n_params() > 0 || dL_dinput) {
-			printf("=== BACKWARD: Processing direction encoding gradients ===\n");
+		
 			GPUMatrixDynamic<T> dL_ddir_encoding_output;
 					if (m_method == "surface") {
 			// CRITICAL FIX: Use the same direction encoding width as forward pass
@@ -820,10 +701,10 @@ public:
 		
 
 		if (m_method == "surface") {
-			printf("=== BACKWARD: NeuS2 PHASE 2 - Gradient flow preservation through analytical normals ===\n");
+			
 			
 			// NeuS2 Phase 2: Extract gradients w.r.t. normals from RGB loss
-			printf("=== BACKWARD: Adding density gradients from surface features ===\n");
+			
 			uint32_t rgb_stride = dL_drgb_network_input.layout() == RM ? dL_drgb_network_input.rows() : dL_drgb_network_input.stride();
 			uint32_t density_stride = dL_ddensity_network_output.layout() == RM ? dL_ddensity_network_output.rows() : dL_ddensity_network_output.stride();
 			
@@ -846,10 +727,10 @@ public:
 			);
 
 			// NeuS2 Phase 2: Use analytical normals for Phi gradients (proper gradient flow)
-			printf("=== BACKWARD: Computing Phi gradients with ANALYTICAL normals (NeuS2 style) ===\n");
+			
 			
 			if (forward.normals.data() && forward.normals.n() == batch_size) {
-				printf("=== BACKWARD: Using analytical normals for proper gradient flow ===\n");
+				
 			uint32_t fwd_density_stride = forward.density_network_output.layout() == RM ? forward.density_network_output.rows() : forward.density_network_output.stride();
 			linear_kernel(surface_features_backward_to_phi_kernel, 0, stream,
 				batch_size,
@@ -862,21 +743,21 @@ public:
 				rgb_stride,
 				(float*)dL_drgb_network_input.data()
 			);
-				printf("=== BACKWARD: Phi gradients computed with analytical normals ===\n");
+				
 				
 				// NeuS2 Phase 2: Compute gradients w.r.t. normals from surface features
-				printf("=== BACKWARD: Computing gradients w.r.t. normals from surface features ===\n");
+				
 				// TODO: Implement backward_backward_input for second-order derivatives
 				// This would compute how changes in normals affect the surface features
 				// For now, we rely on the standard gradient flow through Phi features
 				
 			} else {
-				printf("=== BACKWARD: WARNING - Cannot compute analytical normal gradients, normals buffer issue ===\n");
+				
 			}
 
 		} else {
 			// Baseline method: add gradient from channel 3 of dL_doutput to channel 0 of density
-			printf("=== BACKWARD: Adding density gradient (baseline) ===\n");
+			
 			linear_kernel(add_density_gradient<T>, 0, stream,
 				batch_size,
 				dL_doutput.m(),
