@@ -414,6 +414,228 @@ The **key insight** is that slices provided the proof that **gradient flow** was
 
 ---
 
+## **ANALYTICAL NORMALS IMPLEMENTATION GUIDE - Based on NeuS2**
+
+### **Overview: NeuS2's Two-Phase Analytical Normal Approach**
+
+NeuS2 demonstrates the correct way to implement analytical normals with full gradient flow preservation. The key insight is using **second-order derivatives** to maintain the computational graph while computing exact analytical normals.
+
+### **Phase 1: Forward Pass - Compute Analytical Gradients**
+
+#### **Step 1: Set up gradient seed for SDF channel**
+```cpp
+// Create gradient seed: dL/dSDF = [1.0, 0.0, 0.0, ..., 0.0] (only SDF channel = 1)
+tcnn::GPUMatrixDynamic<T> dSDF_dSDF{m_density_network->padded_output_width(), batch_size, stream, density_output.layout()};
+dSDF_dSDF.memset_async(stream, 0);
+tcnn::linear_kernel(set_constant_value_view<T>, 0, stream,
+    batch_size, T(1.0f), dSDF_dSDF.view());
+```
+
+#### **Step 2: Backward through density network (GradientMode::Ignore)**
+```cpp
+// Compute ∂SDF/∂encoded_positions
+tcnn::GPUMatrixDynamic<T> dSDF_dPosEncoding{m_pos_encoding->padded_output_width(), batch_size, stream, m_pos_encoding->preferred_output_layout()};
+
+m_density_network->backward(
+    stream, 
+    *forward->density_network_ctx,           // Context from forward pass
+    forward->density_network_input,          // Input: encoded positions
+    forward->density_network_output,         // Output: 48D density (SDF + Φ)
+    dSDF_dSDF,                              // Gradient seed: [1,0,0,...] 
+    &dSDF_dPosEncoding,                     // Output: ∂SDF/∂encoded_positions
+    use_inference_params, 
+    tcnn::EGradientMode::Ignore             // Don't affect parameter gradients!
+);
+```
+
+#### **Step 3: Backward through position encoding (GradientMode::Ignore)**
+```cpp
+// Compute ∂SDF/∂xyz (analytical normals)
+tcnn::GPUMatrixDynamic<float> dSDF_dPos{m_pos_encoding->input_width(), batch_size, stream, input.layout()};
+
+m_pos_encoding->backward(
+    stream,
+    *forward->pos_encoding_ctx,             // Context from forward pass  
+    input.slice_rows(0, m_pos_encoding->input_width()), // Input: xyz positions
+    forward->density_network_input,         // Output: encoded positions
+    dSDF_dPosEncoding,                      // Gradient: ∂SDF/∂encoded_positions
+    &dSDF_dPos,                            // Output: ∂SDF/∂xyz (analytical normals!)
+    use_inference_params,
+    tcnn::EGradientMode::Ignore             // Don't affect parameter gradients!
+);
+```
+
+#### **Step 4: Store analytical gradients for use in backward pass**
+```cpp
+// Store in forward context for backward pass
+forward->dSDF_dPos = dSDF_dPos.slice_rows(0, 3); // Only need xyz components
+```
+
+#### **Step 5: Normalize gradients to get unit normals**
+```cpp
+// Normalize ∂SDF/∂xyz to get unit normals: n = -∇SDF / ||∇SDF||
+tcnn::linear_kernel(normalize_analytical_gradients_kernel<T>, 0, stream,
+    batch_size,
+    forward->dSDF_dPos.data(),              // Input: ∂SDF/∂xyz
+    normals.data()                          // Output: unit normals
+);
+```
+
+#### **Normalization Kernel Implementation**
+```cpp
+template <typename T>
+__global__ void normalize_analytical_gradients_kernel(
+    const uint32_t n_elements,
+    const float* __restrict__ dSDF_dPos,    // 3D analytical gradients
+    T* __restrict__ normals                 // Output: normalized normals
+) {
+    const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i >= n_elements) return;
+    
+    // Get gradient vector for sample i
+    float grad_x = dSDF_dPos[i * 3 + 0];
+    float grad_y = dSDF_dPos[i * 3 + 1];  
+    float grad_z = dSDF_dPos[i * 3 + 2];
+    
+    // Compute magnitude
+    float magnitude = sqrtf(grad_x * grad_x + grad_y * grad_y + grad_z * grad_z);
+    
+    // Normalize and negate (normals point outward from surface)
+    // Add epsilon to prevent division by zero
+    float inv_mag = magnitude > 1e-8f ? -1.0f / magnitude : 0.0f;
+    
+    normals[i * 3 + 0] = T(grad_x * inv_mag);
+    normals[i * 3 + 1] = T(grad_y * inv_mag);
+    normals[i * 3 + 2] = T(grad_z * inv_mag);
+}
+```
+
+### **Phase 2: Backward Pass - Preserve Gradient Flow Through Normals**
+
+The critical innovation in NeuS2 is using **second-order derivatives** to maintain gradient flow from RGB loss back through the analytical normal computation.
+
+#### **Step 1: Extract gradients w.r.t. normals from RGB network**
+```cpp
+// Extract dL/dnormals from RGB network input gradients
+tcnn::GPUMatrixDynamic<float> dL_dnormals{3, batch_size, stream, input.layout()};
+tcnn::linear_kernel(extract_normal_gradients_kernel<T>, 0, stream,
+    batch_size,
+    dL_drgb_network_input.data(),           // Source: RGB gradients include normal grads
+    dL_dnormals.data()                      // Target: isolated normal gradients
+);
+```
+
+#### **Step 2: Use second-order derivatives to chain gradients properly**
+```cpp
+// This is the key: second-order backward pass through position encoding
+// Computes ∂²SDF/∂xyz² and chains ∂L/∂normals → ∂L/∂xyz
+tcnn::GPUMatrixDynamic<T> dL_dpos_from_normals{m_pos_encoding->input_width(), batch_size, stream, input.layout()};
+
+// **CRITICAL**: Use backward_backward_input for second-order derivatives
+m_pos_encoding->backward_backward_input(
+    stream,
+    *forward.pos_encoding_ctx,              // Context from forward pass
+    input.slice_rows(0, m_pos_encoding->input_width()), // Original xyz input
+    dL_dnormals,                           // ∂L/∂(∂SDF/∂xyz) - gradient w.r.t. normals
+    forward.dSDF_dPos,                     // ∂SDF/∂xyz from forward pass
+    &pos_encoding_second_order,            // Output: ∂²SDF/∂encoding²  
+    &dL_dpos_from_normals,                 // Output: ∂L/∂xyz via normal gradients
+    use_inference_params,
+    tcnn::EGradientMode::Accumulate        // Accumulate into existing gradients
+);
+```
+
+#### **Step 3: Similarly for density network second-order derivatives**
+```cpp
+// Second-order backward through density network
+tcnn::GPUMatrixDynamic<T> dL_ddensity_from_normals{m_density_network->padded_output_width(), batch_size, stream, forward.density_network_output.layout()};
+
+m_density_network->backward_backward_input(
+    stream,
+    *forward.density_network_ctx,
+    forward.density_network_input,
+    dL_dnormals_encoded,                   // Chain rule from pos encoding
+    forward.dSDF_dPosEncoding,             // ∂SDF/∂encoded from forward pass
+    &density_second_order,                 // Output: ∂²SDF/∂density_input²
+    &dL_ddensity_from_normals,            // Output: ∂L/∂density via normals
+    use_inference_params,
+    tcnn::EGradientMode::Accumulate
+);
+```
+
+### **Key Requirements for Implementation**
+
+#### **1. Context Management**
+- **Forward contexts must be preserved** for backward pass
+- Both position encoding and density network contexts needed
+- Use `prepare_input_gradients=true` in forward calls
+
+#### **2. Memory Layout Consistency** 
+- **All matrices must use compatible layouts** (RM/CM/AoS)
+- **Verify stride calculations** before kernel calls
+- **Add bounds checking** in all custom kernels
+
+#### **3. Gradient Mode Discipline**
+- **Phase 1 (analytical computation)**: `EGradientMode::Ignore`
+- **Phase 2 (training backward)**: `EGradientMode::Accumulate`
+- **Never mix modes** in the same computation
+
+#### **4. Second-Order Derivative Support**
+- **Verify TCNN version supports** `backward_backward_input`
+- **If not available**, implement finite differences as fallback
+- **Test numerical stability** of second-order computations
+
+### **Implementation Checklist**
+
+#### **Forward Pass**
+- [ ] Create gradient seed with only SDF channel = 1.0
+- [ ] Backward through density network (GradientMode::Ignore)  
+- [ ] Backward through position encoding (GradientMode::Ignore)
+- [ ] Store dSDF_dPos in forward context
+- [ ] Normalize gradients to unit normals
+- [ ] Use normals in surface feature computation
+
+#### **Backward Pass**
+- [ ] Extract normal gradients from RGB network input
+- [ ] Use backward_backward_input for position encoding
+- [ ] Use backward_backward_input for density network  
+- [ ] Chain gradients properly through second-order derivatives
+- [ ] Accumulate all gradient contributions
+
+#### **Error Prevention**
+- [ ] Add bounds checking in all kernels
+- [ ] Verify matrix dimensions match before operations
+- [ ] Use epsilon in normalization to prevent division by zero
+- [ ] Validate gradient magnitudes for numerical stability
+- [ ] Test with simple cases (unit normals) first
+
+### **Testing Strategy**
+
+#### **Phase 1: Unit Normals Baseline**
+Start with fixed unit normals to verify surface feature pipeline works correctly.
+
+#### **Phase 2: Analytical Normals (No Gradient Flow)**
+Implement analytical normal computation but don't add backward pass yet. Compare visual results.
+
+#### **Phase 3: Full Gradient Flow**
+Add second-order derivative backward pass. Monitor gradient magnitudes and training stability.
+
+#### **Phase 4: Validation**
+Compare against ground truth normals and verify training convergence.
+
+### **Common Pitfalls to Avoid**
+
+1. **Memory Layout Mismatches** - Verify RM/CM compatibility
+2. **Stride Calculation Errors** - Use TCNN's built-in functions when possible  
+3. **Context Reuse** - Don't reuse forward contexts for analytical computation
+4. **Gradient Mode Mixing** - Keep analytical and training phases separate
+5. **Division by Zero** - Add epsilon in normalization kernels
+6. **Second-Order Instability** - Monitor gradient magnitudes carefully
+
+This approach provides **exact analytical normals** while **preserving full gradient flow** for end-to-end training, as demonstrated by NeuS2's successful implementation.
+
+---
+
 ## Current Implementation Status & Debugging Summary
 
 ### **CRITICAL FINDINGS - December 2024**
