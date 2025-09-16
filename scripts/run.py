@@ -367,7 +367,7 @@ if __name__ == "__main__":
 		testbed.load_training_data(test_transforms_path)
 		# The output_dir path should remain based on the original scene for consistency
 
-		with tqdm(range(0, testbed.nerf.training.dataset.n_images, 25), unit="images", desc=f"Rendering test images for {args.method} in {args.name}") as t:
+		with tqdm(range(0, testbed.nerf.training.dataset.n_images, 1), unit="images", desc=f"Rendering test images for {args.method} in {args.name}") as t:
 			for i in t:
 				resolution = testbed.nerf.training.dataset.metadata[i].resolution
 

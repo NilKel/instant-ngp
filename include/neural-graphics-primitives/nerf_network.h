@@ -188,6 +188,41 @@ __global__ void copy_normal_gradients_to_pos_kernel(
 	dL_dpos[i * 3 + 2] = dL_dnormals[i * 3 + 2];
 }
 
+// Helper kernel to compute gradients w.r.t. raw gradients via chain rule through normalization
+template <typename T>
+__global__ void chain_rule_through_normalization_kernel(
+	const uint32_t n_elements,
+	const float* __restrict__ dL_dnormals,     // Gradients w.r.t. normals [3×N]
+	const float* __restrict__ raw_gradients,   // Raw ∇SDF from forward pass [3×N]
+	float* __restrict__ dL_draw_gradients      // Output: gradients w.r.t. raw gradients [3×N]
+) {
+	const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
+	if (i >= n_elements) return;
+	
+	// Get gradients for sample i
+	const float* dL_dn = dL_dnormals + i * 3;      // [3]
+	const float* grad = raw_gradients + i * 3;     // [3] (∇SDF)
+	float* dL_dg = dL_draw_gradients + i * 3;      // [3] (output)
+	
+	// Compute gradient magnitude
+	float grad_mag_sq = grad[0] * grad[0] + grad[1] * grad[1] + grad[2] * grad[2];
+	float grad_mag = sqrtf(grad_mag_sq + 1e-12f);  // Add epsilon for stability
+	float inv_grad_mag = 1.0f / grad_mag;
+	float inv_grad_mag3 = inv_grad_mag * inv_grad_mag * inv_grad_mag;
+	
+	// Chain rule for normalization: normals = -∇SDF / ||∇SDF||
+	// d(normals)/d(∇SDF) = -1/||∇SDF|| * I + (∇SDF ⊗ ∇SDF) / ||∇SDF||³
+	// where I is identity matrix and ⊗ is outer product
+	
+	// Compute dot product: dL_dnormals · ∇SDF
+	float dot_product = dL_dn[0] * grad[0] + dL_dn[1] * grad[1] + dL_dn[2] * grad[2];
+	
+	// Apply chain rule
+	dL_dg[0] = -dL_dn[0] * inv_grad_mag + grad[0] * dot_product * inv_grad_mag3;
+	dL_dg[1] = -dL_dn[1] * inv_grad_mag + grad[1] * dot_product * inv_grad_mag3;
+	dL_dg[2] = -dL_dn[2] * inv_grad_mag + grad[2] * dot_product * inv_grad_mag3;
+}
+
 // Helper kernel to accumulate second-order gradients (focusing on SDF channel)
 template <typename T>
 __global__ void accumulate_second_order_gradients_kernel(
@@ -382,7 +417,8 @@ __global__ void surface_features_slice_backward_kernel(
 	const float* __restrict__ analytical_normals,  // Analytical normals from forward pass
 	const uint32_t density_stride,
 	const T* __restrict__ density_output,  // 48D density output (needed for ReLU condition)
-	T* __restrict__ dL_ddensity_output     // Target: gradients w.r.t. 48D density output
+	T* __restrict__ dL_ddensity_output,    // Target: gradients w.r.t. 48D density output
+	float* __restrict__ dL_dnormals        // Target: gradients w.r.t. normals
 ) {
 	const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
 	if (i >= n_elements) return;
@@ -397,12 +433,17 @@ __global__ void surface_features_slice_backward_kernel(
 	
 	// Get analytical normal for this sample
 	const float* normal = analytical_normals + i * 3;
+	float* dL_dnormals_base = dL_dnormals + i * 3;
+	
+	// Initialize normal gradients
+	dL_dnormals_base[0] = 0.0f;
+	dL_dnormals_base[1] = 0.0f;
+	dL_dnormals_base[2] = 0.0f;
 	
 	// Scaling factor to match forward pass
 	const T surface_scale = T(3.0f);
 	
-	// Channels 1-45: Backpropagate gradients from surface features to Phi features
-	// NOTE: No gradient flow to normals since we're treating them as constants
+	// Channels 1-45: Backpropagate gradients from surface features to Phi features AND normals
 	for (uint32_t k = 0; k < 15; ++k) {
 		const T dL_dsurface_feature = dL_drgb_slice[i * slice_stride + (1 + k) * (slice_stride == 1 ? n_elements : 1)];
 		
@@ -422,10 +463,16 @@ __global__ void surface_features_slice_backward_kernel(
 		}
 		// If dot_product >= 0, then ReLU(-dot_product) = 0, so gradient is 0
 		
-		// dL/dphi_k = dL_ddot_product * analytical_normal (normals treated as constants)
+		// Backward through dot product: phi_k · normal
+		// dL/dphi_k = dL_ddot_product * normal
 		const T dL_dphi_x = dL_ddot_product * T(normal[0]);
 		const T dL_dphi_y = dL_ddot_product * T(normal[1]);
 		const T dL_dphi_z = dL_ddot_product * T(normal[2]);
+		
+		// dL/dnormal = dL_ddot_product * phi_k
+		dL_dnormals_base[0] += (float)dL_ddot_product * (float)phi_k[0];
+		dL_dnormals_base[1] += (float)dL_ddot_product * (float)phi_k[1];
+		dL_dnormals_base[2] += (float)dL_ddot_product * (float)phi_k[2];
 		
 		// Accumulate gradients to 3D Phi vector k at channels [1+3k, 2+3k, 3+3k]
 		dL_ddensity_output[i * density_stride + (1 + k * 3 + 0) * (density_stride == 1 ? n_elements : 1)] += dL_dphi_x;
@@ -955,16 +1002,28 @@ public:
 
 		if (m_method == "surface") {
 			// Backward pass: gradients from RGB slice back to 48D density output using ANALYTICAL NORMALS
-			// NOTE: Using analytical normals from forward pass (treated as constants, no gradient flow through normals)
+			// NOTE: Now WITH gradient flow through normals back to density network parameters
 			auto dL_dsurface_slice = dL_drgb_network_input.slice_rows(0, 16);
+			
+			// Compute gradients w.r.t. normals from surface features
+			GPUMatrixDynamic<float> dL_dnormals{3, batch_size, stream, forward.analytical_normals.layout()};
+			CUDA_CHECK_THROW(cudaMemsetAsync(dL_dnormals.data(), 0, dL_dnormals.n_bytes(), stream));
+			
 			linear_kernel(surface_features_slice_backward_kernel<T>, 0, stream,
 				batch_size,
 				dL_dsurface_slice.layout() == RM ? 1 : dL_dsurface_slice.stride(),
 				dL_dsurface_slice.data(),
-				forward.analytical_normals.data(),  // Pass analytical normals (treated as constants)
+				forward.analytical_normals.data(),  // Pass analytical normals
 				dL_ddensity_network_output.layout() == RM ? 1 : dL_ddensity_network_output.stride(),
 				forward.density_network_output.data(),  // Pass density output for ReLU condition
-				dL_ddensity_network_output.data()
+				dL_ddensity_network_output.data(),
+				dL_dnormals.data()  // Collect gradients w.r.t. normals
+			);
+			
+			// Backpropagate gradients through analytical normals to density network parameters
+			accumulate_analytical_normal_gradients(
+				stream, batch_size, input, forward, dL_dnormals,
+				dL_ddensity_network_output, use_inference_params, param_gradients_mode
 			);
 		}
 		
@@ -1070,6 +1129,12 @@ public:
 			use_inference_params,
 			GradientMode::Ignore  // Don't affect parameter gradients
 		);
+		
+		// Store raw gradients for backward pass
+		GPUMatrixDynamic<float> raw_grads = dSDF_dpos.slice_rows(0, 3);
+		forward->raw_gradients = GPUMatrixDynamic<float>{3, batch_size, stream, raw_grads.layout()};
+		CUDA_CHECK_THROW(cudaMemcpyAsync(forward->raw_gradients.data(), raw_grads.data(), 
+			forward->raw_gradients.n_bytes(), cudaMemcpyDeviceToDevice, stream));
 		
 		// Normalize gradients to get unit normals: n = -∇SDF / ||∇SDF||
 		GPUMatrixDynamic<float> normals{3, batch_size, stream, CM};
@@ -1282,7 +1347,7 @@ public:
 		return dSDF_dpos.slice_rows(0, 3);
 	}
 
-	// Second-order gradient accumulation (NeuS2-inspired pattern with workaround for backward_backward_input)
+	// Second-order gradient accumulation with chain rule through normalization
 	void accumulate_analytical_normal_gradients(
 		cudaStream_t stream,
 		uint32_t batch_size,
@@ -1293,20 +1358,28 @@ public:
 		bool use_inference_params,
 		GradientMode param_gradients_mode
 	) {
-		// WORKAROUND: Since backward_backward_input may not be available,
-		// we implement a simplified second-order gradient flow by:
-		// 1. Creating temporary contexts for second-order computation
-		// 2. Using finite differences to approximate second-order derivatives
-		// 3. Accumulating gradients properly
+		// Chain rule through normalization: dL/d(∇SDF) = dL/dnormals · d(normals)/d(∇SDF)
+		// For normalization: normals = -∇SDF / ||∇SDF||
+		// We need to compute: dL/d(∇SDF) via the chain rule through normalization
 		
-		// Step 1: Create temporary gradient buffer for normal gradients
+		// Step 1: Apply chain rule through normalization
+		// Compute dL/d(raw_gradients) = dL/dnormals · d(normals)/d(raw_gradients)
+		GPUMatrixDynamic<float> dL_draw_gradients{3, batch_size, stream, forward.raw_gradients.layout()};
+		linear_kernel(chain_rule_through_normalization_kernel<float>, 0, stream,
+			batch_size,
+			dL_dnormals.data(),
+			forward.raw_gradients.data(),
+			dL_draw_gradients.data()
+		);
+		
+		// Step 2: Create position gradient buffer for backpropagation
 		GPUMatrixDynamic<float> dL_dpos_from_normals{m_pos_encoding->input_width(), batch_size, stream, input.layout()};
 		CUDA_CHECK_THROW(cudaMemsetAsync(dL_dpos_from_normals.data(), 0, dL_dpos_from_normals.n_bytes(), stream));
 		
-		// Copy normal gradients to position gradient buffer (first 3 components)
+		// Copy gradients w.r.t. raw gradients to position gradient buffer (first 3 components)
 		linear_kernel(copy_normal_gradients_to_pos_kernel<float>, 0, stream,
 			batch_size,
-			dL_dnormals.data(),
+			dL_draw_gradients.data(),
 			dL_dpos_from_normals.data()
 		);
 		
@@ -1531,6 +1604,7 @@ private:
 
 		// Analytical normals (∂SDF/∂xyz) - stored in forward context for backward pass
 		GPUMatrixDynamic<float> dSDF_dPos;
+		GPUMatrixDynamic<float> raw_gradients;     // Raw ∇SDF before normalization
 		GPUMatrixDynamic<float> analytical_normals;
 	};
 };
