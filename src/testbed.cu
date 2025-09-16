@@ -4179,7 +4179,10 @@ Testbed::NetworkDims Testbed::network_dims() const {
 void Testbed::reset_network(bool clear_density_grid) {
 	m_sdf.iou_decay = 0;
 
+	// FORCE DETERMINISTIC SEED FOR DEBUGGING VIEWDIR DIFFERENCES
+	m_seed = 42;  // Fixed seed for reproducible results
 	m_rng = default_rng_t{m_seed};
+	printf("DEBUG: Reset RNG with FIXED seed = %u, method = %s\n", m_seed, m_method.c_str());
 
 	// Start with a low rendering resolution and gradually ramp up
 	m_render_ms.set(10000);

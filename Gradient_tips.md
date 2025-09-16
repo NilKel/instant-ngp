@@ -323,13 +323,13 @@ The key insight is to **properly accumulate gradients** without the bugs we had 
 // CRITICAL: Proper gradient accumulation in backward pass
 if (m_method == "surface") {
     // **ESSENTIAL**: Add gradient from RGB input[0] back to density output[0]
-    linear_kernel(add_density_gradient_from_rgb<T>, 0, stream,
-        batch_size,
-        dL_drgb_network_input.layout() == RM ? 1 : dL_drgb_network_input.stride(),
-        dL_drgb_network_input.data(),        // Source: RGB network gradients (channel 0 = density)
-        dL_ddensity_network_output.layout() == RM ? 1 : dL_ddensity_network_output.stride(),
-        dL_ddensity_network_output.data()    // Target: density network output[0]
-    );
+    // linear_kernel(add_density_gradient_from_rgb<T>, 0, stream,
+    //     batch_size,
+    //     dL_drgb_network_input.layout() == RM ? 1 : dL_drgb_network_input.stride(),
+    //     dL_drgb_network_input.data(),        // Source: RGB network gradients (channel 0 = density)
+    //     dL_ddensity_network_output.layout() == RM ? 1 : dL_ddensity_network_output.stride(),
+    //     dL_ddensity_network_output.data()    // Target: density network output[0]
+    // );
     
     // **ESSENTIAL**: Add gradient from alpha blending (same as baseline)
     linear_kernel(add_density_gradient<T>, 0, stream,
