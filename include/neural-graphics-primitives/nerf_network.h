@@ -328,9 +328,98 @@ __global__ void surface_features_with_unit_normals_backward_kernel(
 	}
 }
 
-// NEW: Kernel to compute surface features directly into RGB slice
+// NEW: Kernel to compute surface features directly into RGB slice WITH ANALYTICAL NORMALS
 template <typename T>
 __global__ void compute_surface_features_to_slice_kernel(
+	const uint32_t n_elements,
+	const uint32_t density_stride,
+	const T* __restrict__ density_output,  // 48D: 1D density + 45D Phi
+	const float* __restrict__ analytical_normals,  // 3D analytical normals per sample
+	const uint32_t slice_stride,
+	T* __restrict__ rgb_slice             // Target: 16D RGB slice [0:15]
+) {
+	const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
+	if (i >= n_elements) return;
+	
+	// Handle both AoS and SoA layouts properly
+	// AoS: density_stride = 48, each sample has all 48 channels contiguous
+	// SoA: density_stride = 1, each channel has all samples contiguous
+	
+	// Channel 0: Copy density directly
+	const T density_val = density_output[i * density_stride + 0 * (density_stride == 1 ? n_elements : 1)];
+	rgb_slice[i * slice_stride + 0 * (slice_stride == 1 ? n_elements : 1)] = density_val;
+	
+	// Get analytical normal for this sample
+	const float* normal = analytical_normals + i * 3;
+	
+	// Scaling factor to match baseline magnitude
+	const T surface_scale = T(3.0f);
+	
+	// Channels 1-15: Compute dot products of 45D Phi features with analytical normal
+	for (uint32_t k = 0; k < 15; ++k) {
+		// Extract 3D Phi vector k from channels [1+3k, 2+3k, 3+3k]
+		T phi_x = density_output[i * density_stride + (1 + k * 3 + 0) * (density_stride == 1 ? n_elements : 1)];
+		T phi_y = density_output[i * density_stride + (1 + k * 3 + 1) * (density_stride == 1 ? n_elements : 1)];
+		T phi_z = density_output[i * density_stride + (1 + k * 3 + 2) * (density_stride == 1 ? n_elements : 1)];
+		
+		// Dot product: phi_k · analytical_normal
+		T dot_product = phi_x * T(normal[0]) + phi_y * T(normal[1]) + phi_z * T(normal[2]);
+		
+		// Store in RGB slice channels 1-15
+		rgb_slice[i * slice_stride + (1 + k) * (slice_stride == 1 ? n_elements : 1)] = dot_product * surface_scale;
+	}
+}
+
+// NEW: Backward kernel for slice-based surface features WITH ANALYTICAL NORMALS
+template <typename T>
+__global__ void surface_features_slice_backward_kernel(
+	const uint32_t n_elements,
+	const uint32_t slice_stride,
+	const T* __restrict__ dL_drgb_slice,   // Gradients w.r.t. RGB slice [0:15]
+	const float* __restrict__ analytical_normals,  // Analytical normals from forward pass
+	const uint32_t density_stride,
+	T* __restrict__ dL_ddensity_output     // Target: gradients w.r.t. 48D density output
+) {
+	const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
+	if (i >= n_elements) return;
+	
+	// Handle both AoS and SoA layouts properly
+	// AoS: stride = width, each sample has all channels contiguous
+	// SoA: stride = 1, each channel has all samples contiguous
+	
+	// Channel 0: density gradient (direct copy)
+	const T dL_ddensity = dL_drgb_slice[i * slice_stride + 0 * (slice_stride == 1 ? n_elements : 1)];
+	dL_ddensity_output[i * density_stride + 0 * (density_stride == 1 ? n_elements : 1)] += dL_ddensity;
+	
+	// Get analytical normal for this sample
+	const float* normal = analytical_normals + i * 3;
+	
+	// Scaling factor to match forward pass
+	const T surface_scale = T(3.0f);
+	
+	// Channels 1-45: Backpropagate gradients from surface features to Phi features
+	// NOTE: No gradient flow to normals since we're treating them as constants
+	for (uint32_t k = 0; k < 15; ++k) {
+		const T dL_dsurface_feature = dL_drgb_slice[i * slice_stride + (1 + k) * (slice_stride == 1 ? n_elements : 1)];
+		
+		// Backward through scaling and dot product
+		const T dL_ddot_product = dL_dsurface_feature * surface_scale;
+		
+		// dL/dphi_k = dL_ddot_product * analytical_normal (normals treated as constants)
+		const T dL_dphi_x = dL_ddot_product * T(normal[0]);
+		const T dL_dphi_y = dL_ddot_product * T(normal[1]);
+		const T dL_dphi_z = dL_ddot_product * T(normal[2]);
+		
+		// Accumulate gradients to 3D Phi vector k at channels [1+3k, 2+3k, 3+3k]
+		dL_ddensity_output[i * density_stride + (1 + k * 3 + 0) * (density_stride == 1 ? n_elements : 1)] += dL_dphi_x;
+		dL_ddensity_output[i * density_stride + (1 + k * 3 + 1) * (density_stride == 1 ? n_elements : 1)] += dL_dphi_y;
+		dL_ddensity_output[i * density_stride + (1 + k * 3 + 2) * (density_stride == 1 ? n_elements : 1)] += dL_dphi_z;
+	}
+}
+
+// ORIGINAL: Kernel to compute surface features directly into RGB slice WITH UNIT NORMALS (kept as fallback)
+template <typename T>
+__global__ void compute_surface_features_to_slice_unit_normals_kernel(
 	const uint32_t n_elements,
 	const uint32_t density_stride,
 	const T* __restrict__ density_output,  // 48D: 1D density + 45D Phi
@@ -367,9 +456,9 @@ __global__ void compute_surface_features_to_slice_kernel(
 	}
 }
 
-// NEW: Backward kernel for slice-based surface features
+// ORIGINAL: Backward kernel for slice-based surface features WITH UNIT NORMALS (kept as fallback)
 template <typename T>
-__global__ void surface_features_slice_backward_kernel(
+__global__ void surface_features_slice_unit_normals_backward_kernel(
 	const uint32_t n_elements,
 	const uint32_t slice_stride,
 	const T* __restrict__ dL_drgb_slice,   // Gradients w.r.t. RGB slice [0:15]
@@ -590,23 +679,19 @@ public:
 
 		// Set up direction encoding
 		if (m_method == "surface") {
-			// Surface mode: Use baseline-style density copy + surface features for channels 1-15
+			// Surface mode: Compute analytical normals and use them for surface features
 			
-			// Copy density using baseline approach: density_output[0] → rgb_input[0]
-			linear_kernel(extract_density<T>, 0, stream,
-				batch_size,
-				density_network_output.layout() == AoS ? density_network_output.stride() : 1,
-				rgb_network_input.layout() == AoS ? rgb_network_input.stride() : 1,
-				density_network_output.data(),
-				rgb_network_input.data()
+			// Compute normalized analytical normals for inference
+			GPUMatrixDynamic<float> analytical_normals = compute_analytical_normals_inference_unnormalized(
+				stream, batch_size, input, density_network_input, density_network_output, use_inference_params
 			);
 			
-			
-			// Compute surface features for channels 1-15 only
-			linear_kernel(compute_surface_features_channels_1_to_15_kernel<T>, 0, stream,
+			// Compute surface features directly using normalized analytical normals (all 16 channels in one kernel)
+			linear_kernel(compute_surface_features_to_slice_kernel<T>, 0, stream,
 				batch_size,
 				density_network_output.layout() == AoS ? density_network_output.stride() : 1,
 				density_network_output.data(),
+				analytical_normals.data(),  // Pass normalized analytical normals
 				rgb_network_input.layout() == AoS ? rgb_network_input.stride() : 1,
 				rgb_network_input.data()
 			);
@@ -696,12 +781,18 @@ public:
 			// CRITICAL: Enable gradient computation for analytical normals
 			forward->density_network_ctx = m_density_network->forward(stream, forward->density_network_input, &forward->density_network_output, use_inference_params, true);
 			
-			// Compute surface features directly into RGB slice (density + features in one kernel)
+			// Compute normalized analytical normals using NeuS2 pattern (no gradient flow to parameters)
+			forward->analytical_normals = compute_analytical_normals_forward_unnormalized(
+				stream, batch_size, input, forward, use_inference_params
+			);
+			
+			// Compute surface features directly into RGB slice using normalized analytical normals
 			auto surface_features_slice = forward->rgb_network_input.slice_rows(0, 16);
 			linear_kernel(compute_surface_features_to_slice_kernel<T>, 0, stream,
 				batch_size,
 				forward->density_network_output.layout() == AoS ? forward->density_network_output.stride() : 1,
 				forward->density_network_output.data(),
+				forward->analytical_normals.data(),  // Pass normalized analytical normals
 				surface_features_slice.layout() == AoS ? surface_features_slice.stride() : 1,
 				surface_features_slice.data()
 			);
@@ -829,12 +920,14 @@ public:
 		}
 
 		if (m_method == "surface") {
-			// Backward pass: gradients from RGB slice back to 48D density output
+			// Backward pass: gradients from RGB slice back to 48D density output using ANALYTICAL NORMALS
+			// NOTE: Using analytical normals from forward pass (treated as constants, no gradient flow through normals)
 			auto dL_dsurface_slice = dL_drgb_network_input.slice_rows(0, 16);
 			linear_kernel(surface_features_slice_backward_kernel<T>, 0, stream,
 				batch_size,
 				dL_dsurface_slice.layout() == RM ? 1 : dL_dsurface_slice.stride(),
 				dL_dsurface_slice.data(),
+				forward.analytical_normals.data(),  // Pass analytical normals (treated as constants)
 				dL_ddensity_network_output.layout() == RM ? 1 : dL_ddensity_network_output.stride(),
 				dL_ddensity_network_output.data()
 			);
@@ -896,7 +989,67 @@ public:
 		}
 	}
 
-	// Helper function to compute analytical normals during forward pass (NeuS2 pattern)
+	// Helper function to compute analytical normals during forward pass (NeuS2 pattern) - UNNORMALIZED
+	GPUMatrixDynamic<float> compute_analytical_normals_forward_unnormalized(
+		cudaStream_t stream,
+		uint32_t batch_size,
+		const GPUMatrixDynamic<float>& input,
+		std::unique_ptr<ForwardContext>& forward,
+		bool use_inference_params
+	) {
+		// Step 1: Create gradient seed for SDF channel (channel 0 = 1.0, others = 0.0)
+		GPUMatrixDynamic<T> dL_dsdf_seed{m_density_network->padded_output_width(), batch_size, stream, forward->density_network_output.layout()};
+		CUDA_CHECK_THROW(cudaMemsetAsync(dL_dsdf_seed.data(), 0, dL_dsdf_seed.n_bytes(), stream));
+		
+		// Set first channel to 1.0 for all batch elements (NeuS2 pattern)
+		linear_kernel(set_constant_value_view_kernel<T>, 0, stream,
+			batch_size, T(1.0f),
+			dL_dsdf_seed.layout() == AoS ? dL_dsdf_seed.stride() : 1,
+			dL_dsdf_seed.data()
+		);
+		
+		// Step 2: Backward through density network with GradientMode::Ignore
+		GPUMatrixDynamic<T> dL_ddensity_input{m_pos_encoding->padded_output_width(), batch_size, stream, m_pos_encoding->preferred_output_layout()};
+		
+		m_density_network->backward(
+			stream, 
+			*forward->density_network_ctx,
+			forward->density_network_input,
+			forward->density_network_output,
+			dL_dsdf_seed,
+			&dL_ddensity_input,
+			use_inference_params, 
+			GradientMode::Ignore  // Don't affect parameter gradients
+		);
+		
+		// Step 3: Backward through position encoding with GradientMode::Ignore
+		GPUMatrixDynamic<float> dSDF_dpos{m_pos_encoding->input_width(), batch_size, stream, input.layout()};
+		
+		m_pos_encoding->backward(
+			stream,
+			*forward->pos_encoding_ctx,
+			input.slice_rows(0, m_pos_encoding->input_width()),
+			forward->density_network_input,
+			dL_ddensity_input,
+			&dSDF_dpos,
+			use_inference_params,
+			GradientMode::Ignore  // Don't affect parameter gradients
+		);
+		
+		// Normalize gradients to get unit normals: n = -∇SDF / ||∇SDF||
+		GPUMatrixDynamic<float> normals{3, batch_size, stream, CM};
+		linear_kernel(normalize_analytical_gradients_kernel<float>, 0, stream,
+			batch_size,
+			dSDF_dpos.data(),
+			normals.data()
+		);
+		return normals;
+		
+		// COMMENTED: Unnormalized version
+		// return dSDF_dpos.slice_rows(0, 3);
+	}
+
+	// Helper function to compute analytical normals during forward pass (NeuS2 pattern) - NORMALIZED
 	GPUMatrixDynamic<float> compute_analytical_normals_forward(
 		cudaStream_t stream,
 		uint32_t batch_size,
@@ -954,7 +1107,82 @@ public:
 		return normals;
 	}
 
-	// Helper function for inference-only analytical normals
+	// Helper function for inference-only analytical normals - UNNORMALIZED
+	GPUMatrixDynamic<float> compute_analytical_normals_inference_unnormalized(
+		cudaStream_t stream,
+		uint32_t batch_size,
+		const GPUMatrixDynamic<float>& input,
+		const GPUMatrixDynamic<T>& density_network_input,
+		const GPUMatrixDynamic<T>& density_network_output,
+		bool use_inference_params
+	) {
+		// Create temporary contexts for analytical computation
+		auto temp_pos_ctx = m_pos_encoding->forward(
+			stream,
+			input.slice_rows(0, m_pos_encoding->input_width()),
+			const_cast<GPUMatrixDynamic<T>*>(&density_network_input),
+			use_inference_params,
+			true  // prepare_input_gradients
+		);
+		
+		auto temp_density_ctx = m_density_network->forward(
+			stream,
+			density_network_input,
+			const_cast<GPUMatrixDynamic<T>*>(&density_network_output),
+			use_inference_params,
+			true  // prepare_input_gradients
+		);
+		
+		// Compute gradients using same pattern as forward
+		GPUMatrixDynamic<T> dL_dsdf_seed{m_density_network->padded_output_width(), batch_size, stream, density_network_output.layout()};
+		CUDA_CHECK_THROW(cudaMemsetAsync(dL_dsdf_seed.data(), 0, dL_dsdf_seed.n_bytes(), stream));
+		
+		linear_kernel(set_constant_value_view_kernel<T>, 0, stream,
+			batch_size, T(1.0f),
+			dL_dsdf_seed.layout() == AoS ? dL_dsdf_seed.stride() : 1,
+			dL_dsdf_seed.data()
+		);
+		
+		GPUMatrixDynamic<T> dL_ddensity_input{m_pos_encoding->padded_output_width(), batch_size, stream, m_pos_encoding->preferred_output_layout()};
+		
+		m_density_network->backward(
+			stream, 
+			*temp_density_ctx,
+			density_network_input,
+			density_network_output,
+			dL_dsdf_seed,
+			&dL_ddensity_input,
+			use_inference_params, 
+			GradientMode::Ignore
+		);
+		
+		GPUMatrixDynamic<float> dSDF_dpos{m_pos_encoding->input_width(), batch_size, stream, input.layout()};
+		
+		m_pos_encoding->backward(
+			stream,
+			*temp_pos_ctx,
+			input.slice_rows(0, m_pos_encoding->input_width()),
+			density_network_input,
+			dL_ddensity_input,
+			&dSDF_dpos,
+			use_inference_params,
+			GradientMode::Ignore
+		);
+		
+		// Normalize gradients to get unit normals: n = -∇SDF / ||∇SDF||
+		GPUMatrixDynamic<float> normals{3, batch_size, stream, CM};
+		linear_kernel(normalize_analytical_gradients_kernel<float>, 0, stream,
+			batch_size,
+			dSDF_dpos.data(),
+			normals.data()
+		);
+		return normals;
+		
+		// COMMENTED: Unnormalized version
+		// return dSDF_dpos.slice_rows(0, 3);
+	}
+
+	// Helper function for inference-only analytical normals - NORMALIZED
 	GPUMatrixDynamic<float> compute_analytical_normals_inference(
 		cudaStream_t stream,
 		uint32_t batch_size,
@@ -1268,6 +1496,7 @@ private:
 
 		// Analytical normals (∂SDF/∂xyz) - stored in forward context for backward pass
 		GPUMatrixDynamic<float> dSDF_dPos;
+		GPUMatrixDynamic<float> analytical_normals;
 	};
 };
 
