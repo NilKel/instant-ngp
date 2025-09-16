@@ -355,7 +355,7 @@ __global__ void compute_surface_features_to_slice_kernel(
 	// Scaling factor to match baseline magnitude
 	const T surface_scale = T(3.0f);
 	
-	// Channels 1-15: Compute dot products of 45D Phi features with analytical normal
+	// Channels 1-15: Compute ReLU(-phi_k · analytical_normal)
 	for (uint32_t k = 0; k < 15; ++k) {
 		// Extract 3D Phi vector k from channels [1+3k, 2+3k, 3+3k]
 		T phi_x = density_output[i * density_stride + (1 + k * 3 + 0) * (density_stride == 1 ? n_elements : 1)];
@@ -365,8 +365,11 @@ __global__ void compute_surface_features_to_slice_kernel(
 		// Dot product: phi_k · analytical_normal
 		T dot_product = phi_x * T(normal[0]) + phi_y * T(normal[1]) + phi_z * T(normal[2]);
 		
+		// Surface feature: ReLU(-dot_product) = max(0, -dot_product)
+		T surface_feature = fmaxf(T(0.0f), -dot_product);
+		
 		// Store in RGB slice channels 1-15
-		rgb_slice[i * slice_stride + (1 + k) * (slice_stride == 1 ? n_elements : 1)] = dot_product * surface_scale;
+		rgb_slice[i * slice_stride + (1 + k) * (slice_stride == 1 ? n_elements : 1)] = surface_feature * surface_scale;
 	}
 }
 
@@ -378,6 +381,7 @@ __global__ void surface_features_slice_backward_kernel(
 	const T* __restrict__ dL_drgb_slice,   // Gradients w.r.t. RGB slice [0:15]
 	const float* __restrict__ analytical_normals,  // Analytical normals from forward pass
 	const uint32_t density_stride,
+	const T* __restrict__ density_output,  // 48D density output (needed for ReLU condition)
 	T* __restrict__ dL_ddensity_output     // Target: gradients w.r.t. 48D density output
 ) {
 	const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
@@ -402,8 +406,21 @@ __global__ void surface_features_slice_backward_kernel(
 	for (uint32_t k = 0; k < 15; ++k) {
 		const T dL_dsurface_feature = dL_drgb_slice[i * slice_stride + (1 + k) * (slice_stride == 1 ? n_elements : 1)];
 		
-		// Backward through scaling and dot product
-		const T dL_ddot_product = dL_dsurface_feature * surface_scale;
+		// Backward through scaling
+		const T dL_dsurface_feature_unscaled = dL_dsurface_feature * surface_scale;
+		
+		// Recompute dot product from forward pass to check ReLU condition
+		const T* density_base = density_output + i * density_stride;
+		const T* phi_k = density_base + 1 + k * 3;
+		T dot_product = phi_k[0] * T(normal[0]) + phi_k[1] * T(normal[1]) + phi_k[2] * T(normal[2]);
+		
+		// Backward through ReLU: gradient flows only if -dot_product > 0 (i.e., dot_product < 0)
+		T dL_ddot_product = T(0.0f);
+		if (dot_product < T(0.0f)) {
+			// ReLU derivative: d/dx ReLU(-x) = -1 when -x > 0 (i.e., x < 0)
+			dL_ddot_product = -dL_dsurface_feature_unscaled;
+		}
+		// If dot_product >= 0, then ReLU(-dot_product) = 0, so gradient is 0
 		
 		// dL/dphi_k = dL_ddot_product * analytical_normal (normals treated as constants)
 		const T dL_dphi_x = dL_ddot_product * T(normal[0]);
@@ -441,7 +458,7 @@ __global__ void compute_surface_features_to_slice_unit_normals_kernel(
 	const T inv_sqrt3 = T(0.57735026919f);  // 1/√3
 	const T surface_scale = T(3.0f);  // Scaling factor
 	
-	// Channels 1-15: Compute dot products of 45D Phi features with unit normal
+	// Channels 1-15: Compute ReLU(-phi_k · unit_normal)
 	for (uint32_t k = 0; k < 15; ++k) {
 		// Extract 3D Phi vector k from channels [1+3k, 2+3k, 3+3k]
 		T phi_x = density_output[i * density_stride + (1 + k * 3 + 0) * (density_stride == 1 ? n_elements : 1)];
@@ -451,8 +468,11 @@ __global__ void compute_surface_features_to_slice_unit_normals_kernel(
 		// Dot product: phi_k · [1/√3, 1/√3, 1/√3]
 		T dot_product = phi_x * inv_sqrt3 + phi_y * inv_sqrt3 + phi_z * inv_sqrt3;
 		
+		// Surface feature: ReLU(-dot_product) = max(0, -dot_product)
+		T surface_feature = fmaxf(T(0.0f), -dot_product);
+		
 		// Store in RGB slice channels 1-15
-		rgb_slice[i * slice_stride + (1 + k) * (slice_stride == 1 ? n_elements : 1)] = dot_product * surface_scale;
+		rgb_slice[i * slice_stride + (1 + k) * (slice_stride == 1 ? n_elements : 1)] = surface_feature * surface_scale;
 	}
 }
 
@@ -463,6 +483,7 @@ __global__ void surface_features_slice_unit_normals_backward_kernel(
 	const uint32_t slice_stride,
 	const T* __restrict__ dL_drgb_slice,   // Gradients w.r.t. RGB slice [0:15]
 	const uint32_t density_stride,
+	const T* __restrict__ density_output,  // 48D density output (needed for ReLU condition)
 	T* __restrict__ dL_ddensity_output     // Target: gradients w.r.t. 48D density output
 ) {
 	const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
@@ -484,8 +505,21 @@ __global__ void surface_features_slice_unit_normals_backward_kernel(
 	for (uint32_t k = 0; k < 15; ++k) {
 		const T dL_dsurface_feature = dL_drgb_slice[i * slice_stride + (1 + k) * (slice_stride == 1 ? n_elements : 1)];
 		
-		// Backward through scaling and dot product
-		const T dL_ddot_product = dL_dsurface_feature * surface_scale;
+		// Backward through scaling
+		const T dL_dsurface_feature_unscaled = dL_dsurface_feature * surface_scale;
+		
+		// Recompute dot product from forward pass to check ReLU condition
+		const T* density_base = density_output + i * density_stride;
+		const T* phi_k = density_base + 1 + k * 3;
+		T dot_product = phi_k[0] * inv_sqrt3 + phi_k[1] * inv_sqrt3 + phi_k[2] * inv_sqrt3;
+		
+		// Backward through ReLU: gradient flows only if -dot_product > 0 (i.e., dot_product < 0)
+		T dL_ddot_product = T(0.0f);
+		if (dot_product < T(0.0f)) {
+			// ReLU derivative: d/dx ReLU(-x) = -1 when -x > 0 (i.e., x < 0)
+			dL_ddot_product = -dL_dsurface_feature_unscaled;
+		}
+		// If dot_product >= 0, then ReLU(-dot_product) = 0, so gradient is 0
 		
 		// dL/dphi_k = dL_ddot_product * [1/√3, 1/√3, 1/√3]
 		const T dL_dphi_component = dL_ddot_product * inv_sqrt3;
@@ -929,6 +963,7 @@ public:
 				dL_dsurface_slice.data(),
 				forward.analytical_normals.data(),  // Pass analytical normals (treated as constants)
 				dL_ddensity_network_output.layout() == RM ? 1 : dL_ddensity_network_output.stride(),
+				forward.density_network_output.data(),  // Pass density output for ReLU condition
 				dL_ddensity_network_output.data()
 			);
 		}
