@@ -340,11 +340,13 @@ __global__ void compute_surface_features_to_slice_kernel(
 	const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
 	if (i >= n_elements) return;
 	
-	const T* density_base = density_output + i * density_stride;
-	T* rgb_base = rgb_slice + i * slice_stride;
+	// Handle both AoS and SoA layouts properly
+	// AoS: density_stride = 48, each sample has all 48 channels contiguous
+	// SoA: density_stride = 1, each channel has all samples contiguous
 	
 	// Channel 0: Copy density directly
-	rgb_base[0] = density_base[0];
+	const T density_val = density_output[i * density_stride + 0 * (density_stride == 1 ? n_elements : 1)];
+	rgb_slice[i * slice_stride + 0 * (slice_stride == 1 ? n_elements : 1)] = density_val;
 	
 	// Isotropic unit normal [1/√3, 1/√3, 1/√3]
 	const T inv_sqrt3 = T(0.57735026919f);  // 1/√3
@@ -352,13 +354,16 @@ __global__ void compute_surface_features_to_slice_kernel(
 	
 	// Channels 1-15: Compute dot products of 45D Phi features with unit normal
 	for (uint32_t k = 0; k < 15; ++k) {
-		const T* phi_k = density_base + 1 + k * 3; // Phi_k at channels [1+3k, 2+3k, 3+3k]
+		// Extract 3D Phi vector k from channels [1+3k, 2+3k, 3+3k]
+		T phi_x = density_output[i * density_stride + (1 + k * 3 + 0) * (density_stride == 1 ? n_elements : 1)];
+		T phi_y = density_output[i * density_stride + (1 + k * 3 + 1) * (density_stride == 1 ? n_elements : 1)];
+		T phi_z = density_output[i * density_stride + (1 + k * 3 + 2) * (density_stride == 1 ? n_elements : 1)];
 		
 		// Dot product: phi_k · [1/√3, 1/√3, 1/√3]
-		T dot_product = phi_k[0] * inv_sqrt3 + phi_k[1] * inv_sqrt3 + phi_k[2] * inv_sqrt3;
+		T dot_product = phi_x * inv_sqrt3 + phi_y * inv_sqrt3 + phi_z * inv_sqrt3;
 		
 		// Store in RGB slice channels 1-15
-		rgb_base[1 + k] = dot_product * surface_scale;
+		rgb_slice[i * slice_stride + (1 + k) * (slice_stride == 1 ? n_elements : 1)] = dot_product * surface_scale;
 	}
 }
 
@@ -374,11 +379,13 @@ __global__ void surface_features_slice_backward_kernel(
 	const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
 	if (i >= n_elements) return;
 	
-	const T* dL_dslice_base = dL_drgb_slice + i * slice_stride;
-	T* dL_ddensity_base = dL_ddensity_output + i * density_stride;
+	// Handle both AoS and SoA layouts properly
+	// AoS: stride = width, each sample has all channels contiguous
+	// SoA: stride = 1, each channel has all samples contiguous
 	
 	// Channel 0: density gradient (direct copy)
-	dL_ddensity_base[0] += dL_dslice_base[0];
+	const T dL_ddensity = dL_drgb_slice[i * slice_stride + 0 * (slice_stride == 1 ? n_elements : 1)];
+	dL_ddensity_output[i * density_stride + 0 * (density_stride == 1 ? n_elements : 1)] += dL_ddensity;
 	
 	// Isotropic unit normal and scaling factor
 	const T inv_sqrt3 = T(0.57735026919f);  // 1/√3
@@ -386,16 +393,18 @@ __global__ void surface_features_slice_backward_kernel(
 	
 	// Channels 1-45: Backpropagate gradients from surface features to Phi features
 	for (uint32_t k = 0; k < 15; ++k) {
-		T dL_dsurface_feature = dL_dslice_base[1 + k]; // Gradient w.r.t. surface feature k
+		const T dL_dsurface_feature = dL_drgb_slice[i * slice_stride + (1 + k) * (slice_stride == 1 ? n_elements : 1)];
 		
 		// Backward through scaling and dot product
-		T dL_ddot_product = dL_dsurface_feature * surface_scale;
+		const T dL_ddot_product = dL_dsurface_feature * surface_scale;
 		
 		// dL/dphi_k = dL_ddot_product * [1/√3, 1/√3, 1/√3]
-		T* dL_dphi_k = dL_ddensity_base + 1 + k * 3;
-		dL_dphi_k[0] += dL_ddot_product * inv_sqrt3;
-		dL_dphi_k[1] += dL_ddot_product * inv_sqrt3;
-		dL_dphi_k[2] += dL_ddot_product * inv_sqrt3;
+		const T dL_dphi_component = dL_ddot_product * inv_sqrt3;
+		
+		// Accumulate gradients to 3D Phi vector k at channels [1+3k, 2+3k, 3+3k]
+		dL_ddensity_output[i * density_stride + (1 + k * 3 + 0) * (density_stride == 1 ? n_elements : 1)] += dL_dphi_component;
+		dL_ddensity_output[i * density_stride + (1 + k * 3 + 1) * (density_stride == 1 ? n_elements : 1)] += dL_dphi_component;
+		dL_ddensity_output[i * density_stride + (1 + k * 3 + 2) * (density_stride == 1 ? n_elements : 1)] += dL_dphi_component;
 	}
 }
 
@@ -553,12 +562,16 @@ public:
 		uint32_t batch_size = input.n();
 
 		GPUMatrixDynamic<T> density_network_input{m_pos_encoding->padded_output_width(), batch_size, stream, m_pos_encoding->preferred_output_layout()};
-		GPUMatrixDynamic<T> rgb_network_input{m_rgb_network_input_width, batch_size, stream, m_dir_encoding->preferred_output_layout()};
+		
+		// CRITICAL: For surface mode, force AoS layout to match Frequency encoding behavior
+		MatrixLayout surface_layout = (m_method == "surface") ? AoS : m_dir_encoding->preferred_output_layout();
+		GPUMatrixDynamic<T> rgb_network_input{m_rgb_network_input_width, batch_size, stream, surface_layout};
 
 		GPUMatrixDynamic<T> density_network_output;
 		if (m_method == "surface") {
-			// CRITICAL: Use same layout as RGB buffer since we copy between them
-			density_network_output = GPUMatrixDynamic<T>{m_density_network->padded_output_width(), batch_size, stream, m_dir_encoding->preferred_output_layout()};
+			// CRITICAL: For surface mode, use AoS layout for density buffer to ensure copy compatibility
+			// This forces SphericalHarmonics to behave like Frequency encoding
+			density_network_output = GPUMatrixDynamic<T>{m_density_network->padded_output_width(), batch_size, stream, AoS};
 		} else {
 			density_network_output = rgb_network_input.slice_rows(0, m_density_network->padded_output_width());
 		}
@@ -656,7 +669,10 @@ public:
 		auto forward = std::make_unique<ForwardContext>();
 
 		forward->density_network_input = GPUMatrixDynamic<T>{m_pos_encoding->padded_output_width(), batch_size, stream, m_pos_encoding->preferred_output_layout()};
-		forward->rgb_network_input = GPUMatrixDynamic<T>{m_rgb_network_input_width, batch_size, stream, m_dir_encoding->preferred_output_layout()};
+		
+		// CRITICAL: For surface mode, force AoS layout to match Frequency encoding behavior
+		MatrixLayout surface_layout = (m_method == "surface") ? AoS : m_dir_encoding->preferred_output_layout();
+		forward->rgb_network_input = GPUMatrixDynamic<T>{m_rgb_network_input_width, batch_size, stream, surface_layout};
 
 		forward->pos_encoding_ctx = m_pos_encoding->forward(
 			stream,
@@ -669,8 +685,9 @@ public:
 		GPUMatrixDynamic<T> dir_out;
 		if (m_method == "surface") {
 			// Surface mode: Use baseline-style slicing for density, custom kernel for surface features
-			// CRITICAL: Use same layout as RGB buffer since we copy between them
-			forward->density_network_output = GPUMatrixDynamic<T>{m_density_network->padded_output_width(), batch_size, stream, m_dir_encoding->preferred_output_layout()};
+			// CRITICAL: For surface mode, use AoS layout for density buffer to ensure copy compatibility
+			// This forces SphericalHarmonics to behave like Frequency encoding
+			forward->density_network_output = GPUMatrixDynamic<T>{m_density_network->padded_output_width(), batch_size, stream, AoS};
 			
 			// uint32_t available_dir_space = m_rgb_network_input_width - 16;
 			// uint32_t dir_encoding_width = std::min(m_dir_encoding->padded_output_width(), available_dir_space);
@@ -747,7 +764,9 @@ public:
 		
 		const GPUMatrixDynamic<T> rgb_network_output{(T*)output.data(), m_rgb_network->padded_output_width(), batch_size, output.layout()};
 		
-		GPUMatrixDynamic<T> dL_drgb_network_input{m_rgb_network_input_width, batch_size, stream, m_dir_encoding->preferred_output_layout()};
+		// CRITICAL: For surface mode, force AoS layout to match Frequency encoding behavior
+		MatrixLayout surface_layout = (m_method == "surface") ? AoS : m_dir_encoding->preferred_output_layout();
+		GPUMatrixDynamic<T> dL_drgb_network_input{m_rgb_network_input_width, batch_size, stream, surface_layout};
 		
 		m_rgb_network->backward(stream, *forward.rgb_network_ctx, forward.rgb_network_input, rgb_network_output, dL_drgb, &dL_drgb_network_input, use_inference_params, param_gradients_mode);
 		
@@ -801,8 +820,9 @@ public:
 		// Map gradients from surface features back to density outputs
 		GPUMatrixDynamic<T> dL_ddensity_network_output;
 		if (m_method == "surface") {
-			// CRITICAL: Use same layout as RGB buffer since we copy between them
-			dL_ddensity_network_output = GPUMatrixDynamic<T>{m_density_network->padded_output_width(), batch_size, stream, m_dir_encoding->preferred_output_layout()};
+			// CRITICAL: For surface mode, use AoS layout for density gradient buffer to ensure copy compatibility
+			// This forces SphericalHarmonics to behave like Frequency encoding
+			dL_ddensity_network_output = GPUMatrixDynamic<T>{m_density_network->padded_output_width(), batch_size, stream, AoS};
 			CUDA_CHECK_THROW(cudaMemsetAsync(dL_ddensity_network_output.data(), 0, dL_ddensity_network_output.n_bytes(), stream));
 		} else {
 			dL_ddensity_network_output = dL_drgb_network_input.slice_rows(0, m_density_network->padded_output_width());
