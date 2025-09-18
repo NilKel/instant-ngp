@@ -78,6 +78,9 @@ def parse_args():
 	parser.add_argument("--sharpen", default=0, help="Set amount of sharpening applied to NeRF training images. Range 0.0 to 1.0.")
 	# New: backprop through analytic normals toggle
 	parser.add_argument("--bnormals", action="store_true", help="Backpropagate through analytic normals used for surface features.")
+	# New: Eikonal loss options
+	parser.add_argument("--eikonal", action="store_true", help="Enable Eikonal loss regularization to enforce ||∇SDF|| ≈ 1.")
+	parser.add_argument("--eik_lambda", type=float, default=0.01, help="Weight for Eikonal loss regularization. Default: 0.01")
 
 	return parser.parse_args()
 
@@ -98,6 +101,13 @@ if __name__ == "__main__":
 	# Export flag for C++ side to pick up
 	if args.bnormals:
 		os.environ["NGP_BNORMALS"] = "1"
+	
+	# Export Eikonal loss settings for C++ side to pick up
+	if args.eikonal:
+		os.environ["NGP_EIKONAL"] = "1"
+		os.environ["NGP_EIKONAL_WEIGHT"] = str(args.eik_lambda)
+	else:
+		os.environ["NGP_EIKONAL"] = "0"
 
 	testbed = ngp.Testbed()
 	testbed.root_dir = ROOT_DIR
@@ -367,7 +377,7 @@ if __name__ == "__main__":
 		testbed.load_training_data(test_transforms_path)
 		# The output_dir path should remain based on the original scene for consistency
 
-		with tqdm(range(0, testbed.nerf.training.dataset.n_images, 1), unit="images", desc=f"Rendering test images for {args.method} in {args.name}") as t:
+		with tqdm(range(0, testbed.nerf.training.dataset.n_images, 25), unit="images", desc=f"Rendering test images for {args.method} in {args.name}") as t:
 			for i in t:
 				resolution = testbed.nerf.training.dataset.metadata[i].resolution
 

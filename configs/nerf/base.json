@@ -39,7 +39,7 @@
 		"nested": [
 			{
 				"n_dims_to_encode": 3,
-				"otype": "Frequency",
+				"otype": "SphericalHarmonics",
 				"degree": 4
 			},
 			{

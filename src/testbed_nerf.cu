@@ -1776,6 +1776,25 @@ uint32_t Testbed::NerfTracer::trace(
 				try { network->set_backprop_normals(true); } catch (...) {}
 			}
 		}
+		
+		// Apply Eikonal loss settings if exported by Python runner
+		{
+			const char* eikonal_flag = std::getenv("NGP_EIKONAL");
+			const char* eikonal_weight = std::getenv("NGP_EIKONAL_WEIGHT");
+			if (eikonal_flag) {
+				try {
+					bool use_eikonal = (std::string(eikonal_flag) == "1");
+					network->set_use_eikonal_loss(use_eikonal);
+					
+					if (eikonal_weight && use_eikonal) {
+						float weight = std::stof(eikonal_weight);
+						network->set_eikonal_weight(weight);
+					}
+				} catch (...) {
+					// ignore if not supported
+				}
+			}
+		}
 		network->inference_mixed_precision(stream, positions_matrix, rgbsigma_matrix);
 
 		if (render_mode == ERenderMode::Normals) {

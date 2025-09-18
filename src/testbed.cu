@@ -360,6 +360,26 @@ void Testbed::reload_network_from_file(const fs::path& path) {
 			}
 		}
 	}
+
+	// Apply Eikonal loss settings if exported by Python runner
+	{
+		const char* eikonal_flag = std::getenv("NGP_EIKONAL");
+		const char* eikonal_weight = std::getenv("NGP_EIKONAL_WEIGHT");
+		if (eikonal_flag && m_nerf_network) {
+			try {
+				bool use_eikonal = (std::string(eikonal_flag) == "1");
+				m_nerf_network->set_use_eikonal_loss(use_eikonal);
+				
+				if (eikonal_weight && use_eikonal) {
+					float weight = std::stof(eikonal_weight);
+					m_nerf_network->set_eikonal_weight(weight);
+					tlog::info() << "Eikonal loss enabled with weight: " << weight;
+				}
+			} catch (...) {
+				// ignore if not supported
+			}
+		}
+	}
 }
 
 void Testbed::reload_network_from_json(const json& json, const std::string& config_base_path) {
