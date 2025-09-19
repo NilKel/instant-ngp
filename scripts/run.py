@@ -81,6 +81,9 @@ def parse_args():
 	# New: Eikonal loss options
 	parser.add_argument("--eikonal", action="store_true", help="Enable Eikonal loss regularization to enforce ||∇SDF|| ≈ 1.")
 	parser.add_argument("--eik_lambda", type=float, default=0.01, help="Weight for Eikonal loss regularization. Default: 0.01")
+	
+	# New: Normal visualization output
+	parser.add_argument("--visnormals", action="store_true", help="Save normal visualization images alongside rendered images. Only works with surface methods.")
 
 	return parser.parse_args()
 
@@ -392,6 +395,21 @@ if __name__ == "__main__":
 				image = testbed.render(resolution[0], resolution[1], spp, True)
 				write_image(os.path.join(output_dir, f"rendered_image_{i:04d}.png"), np.clip(image * 2**testbed.exposure, 0.0, 1.0), quality=100)
 
+				# Render normal visualization if requested
+				if args.visnormals and args.method in ["surface", "surface_normal", "surface_reflect"]:
+					# Save current render mode
+					original_render_mode = testbed.render_mode
+					# Switch to normal visualization mode
+					testbed.render_mode = ngp.RenderMode.Normals
+					# Render normals
+					normal_image = testbed.render(resolution[0], resolution[1], spp, True)
+					# Normals are already in [0,1] range (mapped from [-1,1]), so no exposure adjustment needed
+					write_image(os.path.join(output_dir, f"normals_{i:04d}.png"), np.clip(normal_image, 0.0, 1.0), quality=100)
+					# Restore original render mode
+					testbed.render_mode = original_render_mode
+				elif args.visnormals:
+					print(f"Warning: --visnormals flag only works with surface methods (surface, surface_normal, surface_reflect). Current method: {args.method}")
+
 				A = np.clip(linear_to_srgb(image[...,:3]), 0.0, 1.0)
 				R = np.clip(linear_to_srgb(ref_image[...,:3]), 0.0, 1.0)
 				mse = float(compute_error("MSE", A, R))
@@ -451,6 +469,16 @@ if __name__ == "__main__":
 			image = testbed.render(args.width or int(ref_transforms["w"]), args.height or int(ref_transforms["h"]), args.screenshot_spp, True)
 			os.makedirs(os.path.dirname(outname), exist_ok=True)
 			write_image(outname, image)
+			
+			# Render normal visualization if requested
+			if args.visnormals and args.method in ["surface", "surface_normal", "surface_reflect"]:
+				original_render_mode = testbed.render_mode
+				testbed.render_mode = ngp.RenderMode.Normals
+				normal_image = testbed.render(args.width or int(ref_transforms["w"]), args.height or int(ref_transforms["h"]), args.screenshot_spp, True)
+				normal_outname = outname.replace(".png", "_normals.png")
+				write_image(normal_outname, normal_image)
+				testbed.render_mode = original_render_mode
+				print(f"rendered normal visualization {normal_outname}")
 	elif args.screenshot_dir:
 		outname = os.path.join(args.screenshot_dir, args.scene + "_" + network_stem)
 		print(f"Rendering {outname}.png")
@@ -458,6 +486,15 @@ if __name__ == "__main__":
 		if os.path.dirname(outname) != "":
 			os.makedirs(os.path.dirname(outname), exist_ok=True)
 		write_image(outname + ".png", image)
+		
+		# Render normal visualization if requested
+		if args.visnormals and args.method in ["surface", "surface_normal", "surface_reflect"]:
+			original_render_mode = testbed.render_mode
+			testbed.render_mode = ngp.RenderMode.Normals
+			normal_image = testbed.render(args.width or 1920, args.height or 1080, args.screenshot_spp, True)
+			write_image(outname + "_normals.png", normal_image)
+			testbed.render_mode = original_render_mode
+			print(f"Rendered normal visualization {outname}_normals.png")
 
 	if args.video_camera_path:
 		testbed.load_camera_path(args.video_camera_path)

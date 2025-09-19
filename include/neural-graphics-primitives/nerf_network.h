@@ -877,55 +877,71 @@ __global__ void calculate_reflection_vector_kernel(
 	reflection_vectors[r_z_idx] = r_z * inv_r_mag;
 }
 
-// NEW: Backward kernel for reflection vector computation
+// NEW: Backward kernel for reflection vector computation (handles variable-width view input)
 template <typename T>
 __global__ void reflection_vector_backward_kernel(
 	const uint32_t n_elements,
-	const float* __restrict__ view_dirs,           // 3D view direction per sample
+	const float* __restrict__ view_dirs,           // View direction input (may have >3 components)
 	const float* __restrict__ normals,             // 3D analytical normal per sample
 	const float* __restrict__ dL_dreflection,      // Gradients w.r.t. reflection vectors [3×N]
-	float* __restrict__ dL_dview_dirs,             // Output: gradients w.r.t. view directions [3×N]
-	float* __restrict__ dL_dnormals               // Output: gradients w.r.t. normals [3×N]
+	const uint32_t view_width,                     // Width of view direction input
+	const uint32_t view_stride,                    // Stride for view directions
+	const uint32_t normal_stride,                  // Stride for normals (always 3)
+	const uint32_t reflect_stride,                 // Stride for reflection gradients (always 3)
+	float* __restrict__ dL_dnormals                // Output: gradients w.r.t. normals [3×N]
 ) {
 	const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
 	if (i >= n_elements) return;
 	
-	// Negated view directions (as used in forward pass)
-	const float v_x = -view_dirs[i * 3 + 0];
-	const float v_y = -view_dirs[i * 3 + 1];
-	const float v_z = -view_dirs[i * 3 + 2];
+	// Layout-aware indexing for view directions (only use first 3 components)
+	uint32_t v_x_idx, v_y_idx, v_z_idx;
+	if (view_stride == view_width) {
+		// AoS layout: each sample has all components contiguous
+		v_x_idx = i * view_width + 0;
+		v_y_idx = i * view_width + 1;
+		v_z_idx = i * view_width + 2;
+	} else {
+		// SoA layout: each component has all samples contiguous
+		v_x_idx = 0 * n_elements + i;
+		v_y_idx = 1 * n_elements + i;
+		v_z_idx = 2 * n_elements + i;
+	}
 	
-	const float n_x = normals[i * 3 + 0];
-	const float n_y = normals[i * 3 + 1];
-	const float n_z = normals[i * 3 + 2];
+	// Normal indexing (always 3D)
+	const uint32_t n_x_idx = (normal_stride == 3) ? (i * 3 + 0) : (0 * n_elements + i);
+	const uint32_t n_y_idx = (normal_stride == 3) ? (i * 3 + 1) : (1 * n_elements + i);
+	const uint32_t n_z_idx = (normal_stride == 3) ? (i * 3 + 2) : (2 * n_elements + i);
+	
+	// Reflection gradient indexing (always 3D)
+	const uint32_t r_x_idx = (reflect_stride == 3) ? (i * 3 + 0) : (0 * n_elements + i);
+	const uint32_t r_y_idx = (reflect_stride == 3) ? (i * 3 + 1) : (1 * n_elements + i);
+	const uint32_t r_z_idx = (reflect_stride == 3) ? (i * 3 + 2) : (2 * n_elements + i);
+	
+	// Negated view directions (as used in forward pass)
+	const float v_x = -view_dirs[v_x_idx];
+	const float v_y = -view_dirs[v_y_idx];
+	const float v_z = -view_dirs[v_z_idx];
+	
+	const float n_x = normals[n_x_idx];
+	const float n_y = normals[n_y_idx];
+	const float n_z = normals[n_z_idx];
 	
 	// Gradients w.r.t. reflection vector
-	const float dL_dR_x = dL_dreflection[i * 3 + 0];
-	const float dL_dR_y = dL_dreflection[i * 3 + 1];
-	const float dL_dR_z = dL_dreflection[i * 3 + 2];
+	const float dL_dR_x = dL_dreflection[r_x_idx];
+	const float dL_dR_y = dL_dreflection[r_y_idx];
+	const float dL_dR_z = dL_dreflection[r_z_idx];
 	
 	// Dot product: v · n
 	const float dot_vn = v_x * n_x + v_y * n_y + v_z * n_z;
 	
 	// Backward through reflection formula: R = v - 2 * (v · n) * n
-	// dR/dv = I - 2 * (n ⊗ n + (v · n) * 0)  = I - 2 * (n ⊗ n)
-	// dR/dn = -2 * (v ⊗ I + (v · n) * I) = -2 * v - 2 * (v · n) * I
-	
-	// Gradients w.r.t. negated view directions (v = -view_dirs)
-	float dL_dv_x = dL_dR_x - 2.0f * (dL_dR_x * n_x * n_x + dL_dR_y * n_y * n_x + dL_dR_z * n_z * n_x);
-	float dL_dv_y = dL_dR_y - 2.0f * (dL_dR_x * n_x * n_y + dL_dR_y * n_y * n_y + dL_dR_z * n_z * n_y);
-	float dL_dv_z = dL_dR_z - 2.0f * (dL_dR_x * n_x * n_z + dL_dR_y * n_y * n_z + dL_dR_z * n_z * n_z);
-	
-	// Convert to gradients w.r.t. original view directions (since v = -view_dirs)
-	dL_dview_dirs[i * 3 + 0] = -dL_dv_x;
-	dL_dview_dirs[i * 3 + 1] = -dL_dv_y;
-	dL_dview_dirs[i * 3 + 2] = -dL_dv_z;
+	// We only compute gradients w.r.t. normals since view directions are typically fixed
 	
 	// Gradients w.r.t. normals
 	float dL_dn_from_dot = -2.0f * (dL_dR_x * v_x + dL_dR_y * v_y + dL_dR_z * v_z);
-	dL_dnormals[i * 3 + 0] = -2.0f * dot_vn * dL_dR_x + dL_dn_from_dot * n_x;
-	dL_dnormals[i * 3 + 1] = -2.0f * dot_vn * dL_dR_y + dL_dn_from_dot * n_y;
-	dL_dnormals[i * 3 + 2] = -2.0f * dot_vn * dL_dR_z + dL_dn_from_dot * n_z;
+	dL_dnormals[n_x_idx] = -2.0f * dot_vn * dL_dR_x + dL_dn_from_dot * n_x;
+	dL_dnormals[n_y_idx] = -2.0f * dot_vn * dL_dR_y + dL_dn_from_dot * n_y;
+	dL_dnormals[n_z_idx] = -2.0f * dot_vn * dL_dR_z + dL_dn_from_dot * n_z;
 }
 
 template <typename T>
@@ -1505,15 +1521,22 @@ public:
 					GradientMode::Ignore  // Don't affect encoding parameters, just get gradients
 				);
 				
-				// Create gradient buffers for view directions and normals from reflection computation
-				GPUMatrixDynamic<float> dL_dview_dirs_from_reflection{m_dir_encoding->input_width(), batch_size, stream, view_dirs_input.layout()};
+				// Create gradient buffer for normals from reflection computation
 				GPUMatrixDynamic<float> dL_dnormals_from_reflection{3, batch_size, stream, forward.analytical_normals.layout()};
-				CUDA_CHECK_THROW(cudaMemsetAsync(dL_dview_dirs_from_reflection.data(), 0, dL_dview_dirs_from_reflection.n_bytes(), stream));
 				CUDA_CHECK_THROW(cudaMemsetAsync(dL_dnormals_from_reflection.data(), 0, dL_dnormals_from_reflection.n_bytes(), stream));
 				
-				// Backward through reflection vector computation (need to update the backward kernel signature)
-				// For now, we'll accumulate gradients only to normals to avoid view direction gradient complications
-				// TODO: Add proper view direction gradient accumulation if needed
+				// Backward through reflection vector computation using direct view direction input (no copying)
+				linear_kernel(reflection_vector_backward_kernel<T>, 0, stream,
+					batch_size,
+					view_dirs_input.data(),                      // Use view direction input directly
+					forward.analytical_normals.data(),         // Analytical normals
+					dL_dreflection_encoding_input.data(),      // Gradients w.r.t. reflection vectors
+					m_dir_encoding->input_width(),               // Width of view direction input
+					view_dirs_input.layout() == AoS ? view_dirs_input.m() : 1,  // View stride
+					forward.analytical_normals.layout() == AoS ? 3 : 1,        // Normal stride
+					dL_dreflection_encoding_input.layout() == AoS ? 3 : 1,     // Reflection gradient stride
+					dL_dnormals_from_reflection.data()         // Output: gradients w.r.t. normals
+				);
 				
 				// Accumulate gradients from reflection to main normal gradients
 				linear_kernel(add_to_buffer_kernel<float>, 0, stream,
@@ -1521,6 +1544,9 @@ public:
 					dL_dnormals_from_reflection.data(),
 					dL_dnormals.data()
 				);
+				
+				// Note: View direction gradients are not computed in backward pass to avoid complexity
+				// This is acceptable since view directions are typically fixed inputs (camera rays)
 			}
 			
 			// Backpropagate gradients through analytical normals to density network parameters
@@ -2083,6 +2109,104 @@ public:
 			{"density_network", density_network_hyperparams},
 			{"rgb_network", m_rgb_network->hyperparams()},
 		};
+	}
+
+	// NEW: Expose analytical normals for visualization
+	GPUMatrixDynamic<float> get_analytical_normals_for_visualization(
+		cudaStream_t stream,
+		const GPUMatrixDynamic<float>& input,
+		bool use_inference_params = true
+	) {
+		if (m_method != "surface" && m_method != "surface_normal" && m_method != "surface_reflect") {
+			throw std::runtime_error("Analytical normals only available for surface methods");
+		}
+		
+		uint32_t batch_size = input.n();
+		
+		// Prepare network inputs and outputs
+		GPUMatrixDynamic<T> density_network_input{m_pos_encoding->padded_output_width(), batch_size, stream, m_pos_encoding->preferred_output_layout()};
+		GPUMatrixDynamic<T> density_network_output{m_density_network->padded_output_width(), batch_size, stream, AoS};
+		
+		// Forward pass through position encoding
+		m_pos_encoding->inference_mixed_precision(
+			stream,
+			input.slice_rows(0, m_pos_encoding->input_width()),
+			density_network_input,
+			use_inference_params
+		);
+		
+		// Forward pass through density network
+		m_density_network->inference_mixed_precision(stream, density_network_input, density_network_output, use_inference_params);
+		
+		// Compute analytical normals using inference pattern
+		return compute_analytical_normals_inference_unnormalized(
+			stream, batch_size, input, density_network_input, density_network_output, use_inference_params
+		);
+	}
+
+	// Compute analytical normals for visualization purposes  
+	// This method can be used instead of the default input_gradient for superior normal quality
+	void compute_analytical_normals_for_rendering(
+		cudaStream_t stream,
+		const GPUMatrix<float>& input,
+		GPUMatrix<float>& normals_output
+	) {
+		// Only available for surface methods
+		if (m_method != "surface" && m_method != "surface_normal" && m_method != "surface_reflect") {
+			throw std::runtime_error("Analytical normals only available for surface methods");
+		}
+		
+		uint32_t batch_size = input.n();
+		
+		// Convert input to match our analytical normal computation requirements
+		GPUMatrixDynamic<float> input_dynamic{input.data(), input.m(), batch_size, stream, input.layout()};
+		
+		// Compute analytical normals using our specialized method
+		GPUMatrixDynamic<float> analytical_normals = get_analytical_normals_for_visualization(
+			stream, input_dynamic, true /* use_inference_params */
+		);
+		
+		// Copy analytical normals to output buffer
+		if (normals_output.m() >= 3 && analytical_normals.m() >= 3) {
+			// Copy only the first 3 components (x, y, z normals)
+			uint32_t copy_elements = std::min({3u, normals_output.m(), analytical_normals.m()});
+			
+			// Handle layout differences
+			if (normals_output.layout() == analytical_normals.layout()) {
+				// Same layout - direct copy
+				CUDA_CHECK_THROW(cudaMemcpy2DAsync(
+					normals_output.data(),
+					normals_output.stride() * sizeof(float),
+					analytical_normals.data(),
+					analytical_normals.stride() * sizeof(float),
+					copy_elements * sizeof(float),
+					batch_size,
+					cudaMemcpyDeviceToDevice,
+					stream
+				));
+			} else {
+				// Different layouts - use kernel
+				linear_kernel(copy_float_to_T_kernel<float>, 0, stream,
+					copy_elements * batch_size,
+					analytical_normals.data(),
+					normals_output.data()
+				);
+			}
+			
+			// Zero out remaining components if normals_output has more than 3 components
+			if (normals_output.m() > 3) {
+				CUDA_CHECK_THROW(cudaMemset2DAsync(
+					normals_output.data() + 3 * (normals_output.layout() == AoS ? 1 : batch_size),
+					normals_output.stride() * sizeof(float),
+					0,
+					(normals_output.m() - 3) * sizeof(float),
+					batch_size,
+					stream
+				));
+			}
+		}
+		
+		printf("Surface method: Computed analytical normals for visualization (batch_size=%d)\n", batch_size);
 	}
 
 private:
