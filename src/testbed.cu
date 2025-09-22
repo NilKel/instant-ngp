@@ -4306,6 +4306,13 @@ void Testbed::reset_network(bool clear_density_grid) {
 
 	size_t n_encoding_params = 0;
 	if (m_testbed_mode == ETestbedMode::Nerf) {
+		// Check for SDF mode before creating the network
+		const char* sdf_mode_env = std::getenv("NGP_SDF_MODE");
+		if (sdf_mode_env && std::string(sdf_mode_env) == "1") {
+			m_method = "sdf";
+			tlog::info() << "SDF Mode: Detected NGP_SDF_MODE=1, setting method to 'sdf'";
+		}
+		
 		printf("=== Creating NerfNetwork in reset_network ===\n");
     	printf("Method from testbed: %s\n", m_method.c_str());
 		m_nerf.training.cam_exposure.resize(m_nerf.training.dataset.n_images, AdamOptimizer<vec3>(1e-3f));
@@ -4379,6 +4386,38 @@ void Testbed::reset_network(bool clear_density_grid) {
 			}
 		}
 		m_network = m_nerf_network = primary_device().nerf_network();
+
+		// Configure NerfNetwork settings from environment variables for all devices
+		const char* normalize_normals_env = std::getenv("NGP_NORMALIZE_NORMALS");
+		const char* clamp_gradients_env = std::getenv("NGP_CLAMP_GRADIENTS");
+		const char* max_grad_mag_env = std::getenv("NGP_MAX_GRADIENT_MAG");
+		
+		for (auto& device : m_devices) {
+			if (device.nerf_network()) {
+				// Configure normal normalization setting
+				if (normalize_normals_env) {
+					bool normalize = std::string(normalize_normals_env) == "1";
+					device.nerf_network()->set_normalize_normals(normalize);
+					if (device.is_primary()) {
+						tlog::info() << "Normal normalization: " << (normalize ? "enabled" : "disabled");
+					}
+				}
+				
+				// Configure gradient clamping setting
+				if (clamp_gradients_env && std::string(clamp_gradients_env) == "1") {
+					device.nerf_network()->set_clamp_gradients(true);
+					
+					// Configure maximum gradient magnitude
+					if (max_grad_mag_env) {
+						float max_mag = std::stof(std::string(max_grad_mag_env));
+						device.nerf_network()->set_max_gradient_magnitude(max_mag);
+						if (device.is_primary()) {
+							tlog::info() << "Gradient clamping enabled with max magnitude: " << max_mag;
+						}
+					}
+				}
+			}
+		}
 
 		m_encoding = m_nerf_network->pos_encoding();
 		n_encoding_params = m_encoding->n_params() + m_nerf_network->dir_encoding()->n_params();

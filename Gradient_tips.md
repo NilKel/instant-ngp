@@ -254,6 +254,26 @@ This implementation provides a solid foundation for advanced neural surface reco
 
 The `surface_normal` mode has been **fully implemented and debugged** with **encoded normal vectors** included in the RGB network input alongside surface features and view directions. The implementation treats normal encoding **identically to view direction encoding**, achieving robust training without NaN issues.
 
+### **🆕 NEW: UNIFIED NORMAL PROCESSING WITH `--normalized` FLAG**
+
+**Major Update**: The analytical normal computation has been unified with configurable normalization:
+
+- **`--normalized true`** (default): Uses normalized unit normals (backward compatible)
+- **`--normalized false`**: Uses raw analytical gradients with optional magnitude clamping
+- **Gradient clamping**: Available for training stability when using raw gradients
+
+**Usage Examples**:
+```bash
+# Default: normalized normals (backward compatible)
+python scripts/run.py --scene scene.json --method surface --normalized true
+
+# Raw gradients mode (no normalization)
+python scripts/run.py --scene scene.json --method surface --normalized false
+
+# Raw gradients with stability clamping (if training becomes unstable)
+# Uncomment clamp_gradient_magnitude_kernel call in nerf_network.h
+```
+
 #### **Final Architecture Achieved**
 ```
 Input (3D) → pos_encoding → density_network → 48D [1D SDF + 45D Φ]
@@ -760,6 +780,92 @@ python scripts/run.py --scene scene.json --method surface_reflect --eikonal --ei
 - **`surface_reflect`**: Best for reflective/specular materials with explicit reflection physics
 
 **The surface reconstruction pipeline is now complete and production-ready across all three modes.**
+
+---
+
+## **🔧 IMPLEMENTATION DETAILS: UNIFIED NORMAL PROCESSING**
+
+### **New Unified Architecture**
+
+The analytical normal computation has been completely refactored to provide flexible normal processing through a single unified kernel:
+
+#### **Key Components**
+
+1. **`process_analytical_gradients_kernel`**: Unified CUDA kernel that handles both normalized and raw gradient processing
+2. **`compute_analytical_normals_forward_unified`**: Main function for forward pass normal computation
+3. **`compute_analytical_normals_inference_unified`**: Main function for inference normal computation
+4. **Configuration flags**: `m_normalize_normals`, `m_clamp_gradients`, `m_max_gradient_magnitude`
+
+#### **Kernel Implementation**
+```cpp
+template <typename T>
+__global__ void process_analytical_gradients_kernel(
+    const uint32_t n_elements,
+    const T* __restrict__ dSDF_dPos,    // 3D+ analytical gradients
+    T* __restrict__ normals,            // Output: processed normals
+    const bool normalize = true,        // Whether to normalize to unit vectors
+    const bool clamp_magnitude = false, // Whether to clamp gradient magnitude
+    const float max_magnitude = 1.0f   // Maximum allowed gradient magnitude
+);
+```
+
+#### **Backward Compatibility**
+
+- **All existing function names preserved** as legacy wrappers
+- **Default behavior unchanged**: `m_normalize_normals = true` by default
+- **Seamless integration**: No changes required to existing surface mode code
+
+#### **Configuration API**
+```cpp
+// C++ API for configuration
+network->set_normalize_normals(false);    // Disable normalization
+network->set_clamp_gradients(true);       // Enable gradient clamping
+network->set_max_gradient_magnitude(1.0f); // Set clamp threshold
+```
+
+#### **Command Line Integration**
+To integrate with the command line interface, add to your argument parser:
+```bash
+--normalized true/false    # Enable/disable normal normalization (default: true)
+--clamp-gradients         # Enable gradient magnitude clamping
+--max-gradient-mag 1.0    # Set maximum gradient magnitude
+```
+
+#### **Training Stability Guidelines**
+
+**When to use normalized normals (`--normalized true`)**:
+- Default choice for most scenarios
+- Better numerical stability
+- Consistent with traditional surface reconstruction methods
+- Recommended for production use
+
+**When to use raw gradients (`--normalized false`)**:
+- When you want gradients to encode magnitude information
+- For research into gradient-magnitude-dependent features
+- When experimenting with alternative surface formulations
+- If you observe over-smoothing with normalized normals
+
+**Gradient clamping recommendations**:
+```cpp
+// In nerf_network.h, uncomment this line if training becomes unstable:
+// linear_kernel(clamp_gradient_magnitude_kernel<float>, 0, stream,
+//     batch_size, normals.data(), 1.0f);  // Clamp max magnitude to 1.0
+```
+
+#### **Performance Impact**
+
+- **No performance penalty**: Unified kernel is as fast as previous specialized kernels
+- **Memory usage unchanged**: Same buffer allocations and layouts
+- **Backward compatibility**: Zero overhead for existing normalized mode
+
+#### **Implementation Benefits**
+
+1. **Cleaner codebase**: Single kernel replaces multiple specialized functions
+2. **Flexible experimentation**: Easy switching between normalization modes
+3. **Future-proof**: Easy to add new gradient processing options
+4. **Maintainable**: Centralized logic for all normal processing
+
+This unified approach provides maximum flexibility while maintaining backward compatibility and performance.
 
 ---
 

@@ -34,12 +34,60 @@ __global__ void extract_density(
 	const uint32_t density_stride,
 	const uint32_t rgbd_stride,
 	const T* __restrict__ density,
-	T* __restrict__ rgbd
+	T* __restrict__ rgbd,
+	bool sdf_mode = false,
+	float sdf_s_parameter = 30.0f
 ) {
 	const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
 	if (i >= n_elements) return;
 
-	rgbd[i * rgbd_stride] = density[i * density_stride];
+	T density_val = density[i * density_stride];
+	
+	if (sdf_mode) {
+		// SDF mode: convert SDF (channel 0) to density using NeuS2 formula
+		const float sdf = float(density_val);
+		const float exp_val = expf(-sdf_s_parameter * sdf);
+		const float one_plus_exp = 1.0f + exp_val;
+		density_val = T(sdf_s_parameter * exp_val / (one_plus_exp * one_plus_exp));
+	}
+	
+	rgbd[i * rgbd_stride] = density_val;
+}
+
+// SDF backward kernel to handle gradients flowing back through SDF-to-density conversion
+template <typename T>
+__global__ void extract_density_backward(
+	const uint32_t n_elements,
+	const uint32_t density_stride,
+	const uint32_t rgbd_stride,
+	const T* __restrict__ dL_drgbd,     // Gradients w.r.t. density output
+	T* __restrict__ dL_ddensity,        // Gradients w.r.t. SDF input
+	const T* __restrict__ sdf_values,   // Original SDF values for derivative
+	bool sdf_mode = false,
+	float sdf_s_parameter = 30.0f
+) {
+	const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
+	if (i >= n_elements) return;
+
+	T dL_density_val = dL_drgbd[i * rgbd_stride];
+	
+	if (sdf_mode) {
+		// Chain rule: ∂L/∂sdf = ∂L/∂density * ∂density/∂sdf
+		const float sdf = float(sdf_values[i * density_stride]);
+		
+		// Clamp SDF to prevent numerical issues
+		const float sdf_clamped = fmaxf(fminf(sdf, 10.0f), -10.0f);
+		const float exp_val = expf(-sdf_s_parameter * sdf_clamped);
+		const float one_plus_exp = 1.0f + exp_val;
+		
+		// Derivative of NeuS2 formula: ∂density/∂sdf
+		float ddensity_dsdf = sdf_s_parameter * exp_val * (1.0f - exp_val) / 
+			(one_plus_exp * one_plus_exp * one_plus_exp + 1e-8f);
+		
+		dL_density_val = dL_density_val * T(ddensity_dsdf);
+	}
+	
+	dL_ddensity[i * density_stride] = dL_density_val;
 }
 
 // NeuS2-style set_constant_value_view for analytical normal computation
@@ -145,12 +193,15 @@ __global__ void surface_features_backward_kernel(
 	}
 }
 
-// Normalization kernel for analytical gradients -> unit normals
+// Unified kernel for processing analytical gradients -> normals (normalized or raw with optional clamping)
 template <typename T>
-__global__ void normalize_analytical_gradients_kernel(
+__global__ void process_analytical_gradients_kernel(
 	const uint32_t n_elements,
 	const T* __restrict__ dSDF_dPos,    // 3D+ analytical gradients
-	T* __restrict__ normals             // Output: normalized normals
+	T* __restrict__ normals,            // Output: processed normals
+	const bool normalize = true,        // Whether to normalize to unit vectors
+	const bool clamp_magnitude = false, // Whether to clamp gradient magnitude
+	const float max_magnitude = 1.0f   // Maximum allowed gradient magnitude (if clamping)
 ) {
 	const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
 	if (i >= n_elements) return;
@@ -163,18 +214,36 @@ __global__ void normalize_analytical_gradients_kernel(
 	// Compute magnitude
 	T magnitude = sqrtf(grad_x * grad_x + grad_y * grad_y + grad_z * grad_z);
 	
-	// Normalize and negate (normals point outward from surface)
-	// Add larger epsilon to prevent division by zero and numerical instability
-	T inv_mag = magnitude > T(1e-6f) ? T(-1.0f) / magnitude : T(0.0f);
-	
-	// Additional safety: clamp the result to prevent extreme values
-	T norm_x = fmaxf(-1.0f, fminf(1.0f, grad_x * inv_mag));
-	T norm_y = fmaxf(-1.0f, fminf(1.0f, grad_y * inv_mag));
-	T norm_z = fmaxf(-1.0f, fminf(1.0f, grad_z * inv_mag));
-	
-	normals[i * 3 + 0] = norm_x;
-	normals[i * 3 + 1] = norm_y;
-	normals[i * 3 + 2] = norm_z;
+	if (normalize) {
+		// Normalize and negate (normals point outward from surface)
+		// Add epsilon to prevent division by zero and numerical instability
+		T inv_mag = magnitude > T(1e-6f) ? T(-1.0f) / magnitude : T(0.0f);
+		
+		// Additional safety: clamp the result to prevent extreme values
+		T norm_x = fmaxf(-1.0f, fminf(1.0f, grad_x * inv_mag));
+		T norm_y = fmaxf(-1.0f, fminf(1.0f, grad_y * inv_mag));
+		T norm_z = fmaxf(-1.0f, fminf(1.0f, grad_z * inv_mag));
+		
+		normals[i * 3 + 0] = norm_x;
+		normals[i * 3 + 1] = norm_y;
+		normals[i * 3 + 2] = norm_z;
+	} else {
+		// Raw gradients mode: negate and optionally clamp magnitude
+		grad_x = -grad_x;
+		grad_y = -grad_y;
+		grad_z = -grad_z;
+		
+		if (clamp_magnitude && magnitude > max_magnitude) {
+			T scale_factor = max_magnitude / (magnitude + 1e-8f);
+			grad_x *= scale_factor;
+			grad_y *= scale_factor;
+			grad_z *= scale_factor;
+		}
+		
+		normals[i * 3 + 0] = grad_x;
+		normals[i * 3 + 1] = grad_y;
+		normals[i * 3 + 2] = grad_z;
+	}
 }
 
 // Helper kernel to copy normal gradients to position gradient buffer
@@ -975,6 +1044,10 @@ public:
 				// 48D: 1D density + 45D Φ features (15 x 3D vectors) - test if 45D can learn with fixed normals
 				local_density_network_config["n_output_dims"] = 48;
 				printf("%s mode: Set density network output dims to 48 (1D density + 45D Phi)\n", m_method.c_str());
+			} else if (m_method == "sdf") {
+				// SDF mode: 1D SDF in channel 0, rest can be features for color
+				local_density_network_config["n_output_dims"] = 16;
+				printf("SDF mode: Set density network output dims to 16 (1D SDF + 15D features)\n");
 			} else {
 				local_density_network_config["n_output_dims"] = 16;
 				printf("Baseline mode: Set density network output dims to 16\n");
@@ -1039,6 +1112,9 @@ public:
 	void set_use_analytical_normals(bool v) { m_use_analytical_normals = v; }
 	void set_use_eikonal_loss(bool v) { m_use_eikonal_loss = v; }
 	void set_eikonal_weight(float weight) { m_eikonal_weight = weight; }
+	void set_normalize_normals(bool v) { m_normalize_normals = v; }
+	void set_clamp_gradients(bool v) { m_clamp_gradients = v; }
+	void set_max_gradient_magnitude(float mag) { m_max_gradient_magnitude = mag; }
 
 	void inference_mixed_precision_impl(cudaStream_t stream, const GPUMatrixDynamic<float>& input, GPUMatrixDynamic<T>& output, bool use_inference_params = true) override {
 		uint32_t batch_size = input.n();
@@ -1057,6 +1133,9 @@ public:
 		if (m_method == "surface" || m_method == "surface_normal" || m_method == "surface_reflect") {
 			// CRITICAL: For surface modes, use AoS layout for density buffer to ensure copy compatibility
 			// This forces SphericalHarmonics to behave like Frequency encoding
+			density_network_output = GPUMatrixDynamic<T>{m_density_network->padded_output_width(), batch_size, stream, AoS};
+		} else if (m_method == "sdf") {
+			// SDF mode also needs separate buffer for proper gradient handling
 			density_network_output = GPUMatrixDynamic<T>{m_density_network->padded_output_width(), batch_size, stream, AoS};
 		} else {
 			density_network_output = rgb_network_input.slice_rows(0, m_density_network->padded_output_width());
@@ -1078,17 +1157,17 @@ public:
 		if (m_method == "surface" || m_method == "surface_normal" || m_method == "surface_reflect") {
 			// Surface modes: Compute analytical normals and use them for surface features
 			
-			// Compute normalized analytical normals for inference
-			GPUMatrixDynamic<float> analytical_normals = compute_analytical_normals_inference_unnormalized(
+			// Compute analytical normals (normalized/raw based on settings) for inference
+			GPUMatrixDynamic<float> analytical_normals = compute_analytical_normals_inference_unified(
 				stream, batch_size, input, density_network_input, density_network_output, use_inference_params
 			);
 			
-			// Compute surface features directly using normalized analytical normals (all 16 channels in one kernel)
+			// Compute surface features directly using analytical normals (all 16 channels in one kernel)
 			linear_kernel(compute_surface_features_to_slice_kernel<T>, 0, stream,
 				batch_size,
 				density_network_output.layout() == AoS ? density_network_output.stride() : 1,
 				density_network_output.data(),
-				analytical_normals.data(),  // Pass normalized analytical normals
+				analytical_normals.data(),  // Pass analytical normals
 				rgb_network_input.layout() == AoS ? rgb_network_input.stride() : 1,
 				rgb_network_input.data()
 			);
@@ -1182,7 +1261,9 @@ public:
 			density_network_output.layout() == AoS ? density_network_output.stride() : 1,
 			output.layout() == AoS ? padded_output_width() : 1,
 			density_network_output.data(),
-			output.data() + 3 * (output.layout() == AoS ? 1 : batch_size)
+			output.data() + 3 * (output.layout() == AoS ? 1 : batch_size),
+			m_method == "sdf",
+			m_sdf_s_parameter
 		);
 	}
 
@@ -1224,12 +1305,12 @@ public:
 			// CRITICAL: Enable gradient computation for analytical normals
 			forward->density_network_ctx = m_density_network->forward(stream, forward->density_network_input, &forward->density_network_output, use_inference_params, true);
 			
-			// Compute normalized analytical normals using NeuS2 pattern (no gradient flow to parameters)
-			forward->analytical_normals = compute_analytical_normals_forward_unnormalized(
+			// Compute analytical normals (normalized/raw based on settings) using NeuS2 pattern (no gradient flow to parameters)
+			forward->analytical_normals = compute_analytical_normals_forward_unified(
 				stream, batch_size, input, forward, use_inference_params
 			);
 			
-			// Compute surface features directly into RGB slice using normalized analytical normals
+			// Compute surface features directly into RGB slice using analytical normals
 			auto surface_features_slice = forward->rgb_network_input.slice_rows(0, 16);
 			
 			// For both surface and surface_normal modes, compute surface features  
@@ -1243,6 +1324,11 @@ public:
 			);
 			
 			
+		} else if (m_method == "sdf") {
+			// SDF mode also needs separate buffer for proper gradient handling
+			forward->density_network_output = GPUMatrixDynamic<T>{m_density_network->padded_output_width(), batch_size, stream, AoS};
+			dir_out = forward->rgb_network_input.slice_rows(m_density_network->padded_output_width(), m_dir_encoding->padded_output_width());
+			forward->density_network_ctx = m_density_network->forward(stream, forward->density_network_input, &forward->density_network_output, use_inference_params, prepare_input_gradients);
 		} else {
 			forward->density_network_output = forward->rgb_network_input.slice_rows(0, m_density_network->padded_output_width());
 			dir_out = forward->rgb_network_input.slice_rows(m_density_network->padded_output_width(), m_dir_encoding->padded_output_width());
@@ -1335,7 +1421,9 @@ public:
 				forward->density_network_output.layout() == AoS ? forward->density_network_output.stride() : 1,
 				output->layout() == AoS ? padded_output_width() : 1,
 				forward->density_network_output.data(), 
-				output->data() + 3 * (output->layout() == AoS ? 1 : batch_size)
+				output->data() + 3 * (output->layout() == AoS ? 1 : batch_size),
+				m_method == "sdf",
+				m_sdf_s_parameter
 			);
 		}
 
@@ -1417,8 +1505,30 @@ public:
 			// This forces SphericalHarmonics to behave like Frequency encoding
 			dL_ddensity_network_output = GPUMatrixDynamic<T>{m_density_network->padded_output_width(), batch_size, stream, AoS};
 			CUDA_CHECK_THROW(cudaMemsetAsync(dL_ddensity_network_output.data(), 0, dL_ddensity_network_output.n_bytes(), stream));
+		} else if (m_method == "sdf") {
+			// SDF mode also needs separate buffer for gradient correction
+			dL_ddensity_network_output = GPUMatrixDynamic<T>{m_density_network->padded_output_width(), batch_size, stream, AoS};
+			CUDA_CHECK_THROW(cudaMemsetAsync(dL_ddensity_network_output.data(), 0, dL_ddensity_network_output.n_bytes(), stream));
 		} else {
 			dL_ddensity_network_output = dL_drgb_network_input.slice_rows(0, m_density_network->padded_output_width());
+		}
+
+		// NEW: Handle SDF mode gradient correction FIRST
+		if (m_method == "sdf") {
+			// Get gradients w.r.t. density from the output (channel 3)
+			auto dL_ddensity_from_output = dL_doutput.slice_rows(3, 1);
+			
+			// Apply SDF backward transformation to correct these gradients
+			linear_kernel(extract_density_backward<T>, 0, stream,
+				batch_size,
+				forward.density_network_output.layout() == AoS ? forward.density_network_output.stride() : 1,
+				dL_ddensity_from_output.layout() == AoS ? padded_output_width() : 1,
+				dL_ddensity_from_output.data(),
+				dL_ddensity_network_output.data(), // Channel 0 gets the corrected gradient
+				forward.density_network_output.data(), // Original SDF values
+				true,  // sdf_mode
+				m_sdf_s_parameter
+			);
 		}
 
 		if (m_method == "surface" || m_method == "surface_normal" || m_method == "surface_reflect") {
@@ -1612,7 +1722,74 @@ public:
 		}
 	}
 
-	// Helper function to compute analytical normals during forward pass (NeuS2 pattern) - UNNORMALIZED
+	// Helper function to compute analytical normals during forward pass (NeuS2 pattern) - UNIFIED
+	GPUMatrixDynamic<float> compute_analytical_normals_forward_unified(
+		cudaStream_t stream,
+		uint32_t batch_size,
+		const GPUMatrixDynamic<float>& input,
+		std::unique_ptr<ForwardContext>& forward,
+		bool use_inference_params
+	) {
+		// Step 1: Create gradient seed for SDF channel (channel 0 = 1.0, others = 0.0)
+		GPUMatrixDynamic<T> dL_dsdf_seed{m_density_network->padded_output_width(), batch_size, stream, forward->density_network_output.layout()};
+		CUDA_CHECK_THROW(cudaMemsetAsync(dL_dsdf_seed.data(), 0, dL_dsdf_seed.n_bytes(), stream));
+		
+		// Set first channel to 1.0 for all batch elements (NeuS2 pattern)
+		linear_kernel(set_constant_value_view_kernel<T>, 0, stream,
+			batch_size, T(1.0f),
+			dL_dsdf_seed.layout() == AoS ? dL_dsdf_seed.stride() : 1,
+			dL_dsdf_seed.data()
+		);
+		
+		// Step 2: Backward through density network with GradientMode::Ignore
+		GPUMatrixDynamic<T> dL_ddensity_input{m_pos_encoding->padded_output_width(), batch_size, stream, m_pos_encoding->preferred_output_layout()};
+		
+		m_density_network->backward(
+			stream, 
+			*forward->density_network_ctx,
+			forward->density_network_input,
+			forward->density_network_output,
+			dL_dsdf_seed,
+			&dL_ddensity_input,
+			use_inference_params, 
+			GradientMode::Ignore  // Don't affect parameter gradients
+		);
+		
+		// Step 3: Backward through position encoding with GradientMode::Ignore
+		GPUMatrixDynamic<float> dSDF_dpos{m_pos_encoding->input_width(), batch_size, stream, AoS};  // Use AoS for consistency
+		
+		m_pos_encoding->backward(
+			stream,
+			*forward->pos_encoding_ctx,
+			input.slice_rows(0, m_pos_encoding->input_width()),
+			forward->density_network_input,
+			dL_ddensity_input,
+			&dSDF_dpos,
+			use_inference_params,
+			GradientMode::Ignore  // Don't affect parameter gradients
+		);
+		
+		// Store raw gradients for backward pass (including Eikonal loss)
+		GPUMatrixDynamic<float> raw_grads = dSDF_dpos.slice_rows(0, 3);
+		forward->raw_gradients = GPUMatrixDynamic<float>{3, batch_size, stream, raw_grads.layout()};
+		CUDA_CHECK_THROW(cudaMemcpyAsync(forward->raw_gradients.data(), raw_grads.data(), 
+			forward->raw_gradients.n_bytes(), cudaMemcpyDeviceToDevice, stream));
+		
+		// Process gradients according to user settings (normalized or raw with optional clamping)
+		GPUMatrixDynamic<float> normals{3, batch_size, stream, AoS};
+		linear_kernel(process_analytical_gradients_kernel<float>, 0, stream,
+			batch_size,
+			dSDF_dpos.data(),
+			normals.data(),
+			m_normalize_normals,      // Whether to normalize to unit vectors
+			m_clamp_gradients,        // Whether to clamp gradient magnitude
+			m_max_gradient_magnitude  // Maximum allowed gradient magnitude
+		);
+		
+		return normals;
+	}
+
+	// Legacy function for backward compatibility - redirects to unified function
 	GPUMatrixDynamic<float> compute_analytical_normals_forward_unnormalized(
 		cudaStream_t stream,
 		uint32_t batch_size,
@@ -1620,123 +1797,86 @@ public:
 		std::unique_ptr<ForwardContext>& forward,
 		bool use_inference_params
 	) {
-		// Step 1: Create gradient seed for SDF channel (channel 0 = 1.0, others = 0.0)
-		GPUMatrixDynamic<T> dL_dsdf_seed{m_density_network->padded_output_width(), batch_size, stream, forward->density_network_output.layout()};
-		CUDA_CHECK_THROW(cudaMemsetAsync(dL_dsdf_seed.data(), 0, dL_dsdf_seed.n_bytes(), stream));
-		
-		// Set first channel to 1.0 for all batch elements (NeuS2 pattern)
-		linear_kernel(set_constant_value_view_kernel<T>, 0, stream,
-			batch_size, T(1.0f),
-			dL_dsdf_seed.layout() == AoS ? dL_dsdf_seed.stride() : 1,
-			dL_dsdf_seed.data()
-		);
-		
-		// Step 2: Backward through density network with GradientMode::Ignore
-		GPUMatrixDynamic<T> dL_ddensity_input{m_pos_encoding->padded_output_width(), batch_size, stream, m_pos_encoding->preferred_output_layout()};
-		
-		m_density_network->backward(
-			stream, 
-			*forward->density_network_ctx,
-			forward->density_network_input,
-			forward->density_network_output,
-			dL_dsdf_seed,
-			&dL_ddensity_input,
-			use_inference_params, 
-			GradientMode::Ignore  // Don't affect parameter gradients
-		);
-		
-		// Step 3: Backward through position encoding with GradientMode::Ignore
-		GPUMatrixDynamic<float> dSDF_dpos{m_pos_encoding->input_width(), batch_size, stream, AoS};  // FIXED: Use AoS for consistency
-		
-		m_pos_encoding->backward(
-			stream,
-			*forward->pos_encoding_ctx,
-			input.slice_rows(0, m_pos_encoding->input_width()),
-			forward->density_network_input,
-			dL_ddensity_input,
-			&dSDF_dpos,
-			use_inference_params,
-			GradientMode::Ignore  // Don't affect parameter gradients
-		);
-		
-		// Store raw gradients for backward pass
-		GPUMatrixDynamic<float> raw_grads = dSDF_dpos.slice_rows(0, 3);
-		forward->raw_gradients = GPUMatrixDynamic<float>{3, batch_size, stream, raw_grads.layout()};
-		CUDA_CHECK_THROW(cudaMemcpyAsync(forward->raw_gradients.data(), raw_grads.data(), 
-			forward->raw_gradients.n_bytes(), cudaMemcpyDeviceToDevice, stream));
-		
-		// Normalize gradients to get unit normals: n = -∇SDF / ||∇SDF||
-		GPUMatrixDynamic<float> normals{3, batch_size, stream, AoS};  // FIXED: Use AoS layout to match surface buffers
-		linear_kernel(normalize_analytical_gradients_kernel<float>, 0, stream,
-			batch_size,
-			dSDF_dpos.data(),
-			normals.data()
-		);
-		return normals;
-		
-		// COMMENTED: Unnormalized version
-		// return dSDF_dpos.slice_rows(0, 3);
+		return compute_analytical_normals_forward_unified(stream, batch_size, input, forward, use_inference_params);
 	}
 
-	// Helper function to compute analytical normals during forward pass (NeuS2 pattern) - NORMALIZED
-	GPUMatrixDynamic<float> compute_analytical_normals_forward(
+	// Helper function for inference-only analytical normals - UNIFIED
+	GPUMatrixDynamic<float> compute_analytical_normals_inference_unified(
 		cudaStream_t stream,
 		uint32_t batch_size,
 		const GPUMatrixDynamic<float>& input,
-		std::unique_ptr<ForwardContext>& forward,
+		const GPUMatrixDynamic<T>& density_network_input,
+		const GPUMatrixDynamic<T>& density_network_output,
 		bool use_inference_params
 	) {
-		// Step 1: Create gradient seed for SDF channel (channel 0 = 1.0, others = 0.0)
-		GPUMatrixDynamic<T> dL_dsdf_seed{m_density_network->padded_output_width(), batch_size, stream, forward->density_network_output.layout()};
+		// Create temporary contexts for analytical computation
+		auto temp_pos_ctx = m_pos_encoding->forward(
+			stream,
+			input.slice_rows(0, m_pos_encoding->input_width()),
+			const_cast<GPUMatrixDynamic<T>*>(&density_network_input),
+			use_inference_params,
+			true  // prepare_input_gradients
+		);
+		
+		auto temp_density_ctx = m_density_network->forward(
+			stream,
+			density_network_input,
+			const_cast<GPUMatrixDynamic<T>*>(&density_network_output),
+			use_inference_params,
+			true  // prepare_input_gradients
+		);
+		
+		// Compute gradients using same pattern as forward
+		GPUMatrixDynamic<T> dL_dsdf_seed{m_density_network->padded_output_width(), batch_size, stream, density_network_output.layout()};
 		CUDA_CHECK_THROW(cudaMemsetAsync(dL_dsdf_seed.data(), 0, dL_dsdf_seed.n_bytes(), stream));
 		
-		// Set first channel to 1.0 for all batch elements (NeuS2 pattern)
 		linear_kernel(set_constant_value_view_kernel<T>, 0, stream,
 			batch_size, T(1.0f),
 			dL_dsdf_seed.layout() == AoS ? dL_dsdf_seed.stride() : 1,
 			dL_dsdf_seed.data()
 		);
 		
-		// Step 2: Backward through density network with GradientMode::Ignore
 		GPUMatrixDynamic<T> dL_ddensity_input{m_pos_encoding->padded_output_width(), batch_size, stream, m_pos_encoding->preferred_output_layout()};
 		
 		m_density_network->backward(
 			stream, 
-			*forward->density_network_ctx,
-			forward->density_network_input,
-			forward->density_network_output,
+			*temp_density_ctx,
+			density_network_input,
+			density_network_output,
 			dL_dsdf_seed,
 			&dL_ddensity_input,
 			use_inference_params, 
-			GradientMode::Ignore  // Don't affect parameter gradients
+			GradientMode::Ignore
 		);
 		
-		// Step 3: Backward through position encoding with GradientMode::Ignore
-		GPUMatrixDynamic<float> dSDF_dpos{m_pos_encoding->input_width(), batch_size, stream, AoS};  // FIXED: Use AoS for consistency
+		GPUMatrixDynamic<float> dSDF_dpos{m_pos_encoding->input_width(), batch_size, stream, AoS};  // Use AoS for consistency
 		
 		m_pos_encoding->backward(
 			stream,
-			*forward->pos_encoding_ctx,
+			*temp_pos_ctx,
 			input.slice_rows(0, m_pos_encoding->input_width()),
-			forward->density_network_input,
+			density_network_input,
 			dL_ddensity_input,
 			&dSDF_dpos,
 			use_inference_params,
-			GradientMode::Ignore  // Don't affect parameter gradients
+			GradientMode::Ignore
 		);
 		
-		// Normalize gradients to get unit normals: n = -∇SDF / ||∇SDF||
-		GPUMatrixDynamic<float> normals{3, batch_size, stream, AoS};  // FIXED: Use AoS layout to match surface buffers
-		linear_kernel(normalize_analytical_gradients_kernel<float>, 0, stream,
+		// Process gradients according to user settings (normalized or raw with optional clamping)
+		GPUMatrixDynamic<float> normals{3, batch_size, stream, AoS};
+		linear_kernel(process_analytical_gradients_kernel<float>, 0, stream,
 			batch_size,
 			dSDF_dpos.data(),
-			normals.data()
+			normals.data(),
+			m_normalize_normals,      // Whether to normalize to unit vectors
+			m_clamp_gradients,        // Whether to clamp gradient magnitude
+			m_max_gradient_magnitude  // Maximum allowed gradient magnitude
 		);
 		
 		return normals;
 	}
 
-	// Helper function for inference-only analytical normals - UNNORMALIZED
+	// Legacy function for backward compatibility
 	GPUMatrixDynamic<float> compute_analytical_normals_inference_unnormalized(
 		cudaStream_t stream,
 		uint32_t batch_size,
@@ -1745,73 +1885,10 @@ public:
 		const GPUMatrixDynamic<T>& density_network_output,
 		bool use_inference_params
 	) {
-		// Create temporary contexts for analytical computation
-		auto temp_pos_ctx = m_pos_encoding->forward(
-			stream,
-			input.slice_rows(0, m_pos_encoding->input_width()),
-			const_cast<GPUMatrixDynamic<T>*>(&density_network_input),
-			use_inference_params,
-			true  // prepare_input_gradients
-		);
-		
-		auto temp_density_ctx = m_density_network->forward(
-			stream,
-			density_network_input,
-			const_cast<GPUMatrixDynamic<T>*>(&density_network_output),
-			use_inference_params,
-			true  // prepare_input_gradients
-		);
-		
-		// Compute gradients using same pattern as forward
-		GPUMatrixDynamic<T> dL_dsdf_seed{m_density_network->padded_output_width(), batch_size, stream, density_network_output.layout()};
-		CUDA_CHECK_THROW(cudaMemsetAsync(dL_dsdf_seed.data(), 0, dL_dsdf_seed.n_bytes(), stream));
-		
-		linear_kernel(set_constant_value_view_kernel<T>, 0, stream,
-			batch_size, T(1.0f),
-			dL_dsdf_seed.layout() == AoS ? dL_dsdf_seed.stride() : 1,
-			dL_dsdf_seed.data()
-		);
-		
-		GPUMatrixDynamic<T> dL_ddensity_input{m_pos_encoding->padded_output_width(), batch_size, stream, m_pos_encoding->preferred_output_layout()};
-		
-		m_density_network->backward(
-			stream, 
-			*temp_density_ctx,
-			density_network_input,
-			density_network_output,
-			dL_dsdf_seed,
-			&dL_ddensity_input,
-			use_inference_params, 
-			GradientMode::Ignore
-		);
-		
-		GPUMatrixDynamic<float> dSDF_dpos{m_pos_encoding->input_width(), batch_size, stream, AoS};  // FIXED: Use AoS for consistency
-		
-		m_pos_encoding->backward(
-			stream,
-			*temp_pos_ctx,
-			input.slice_rows(0, m_pos_encoding->input_width()),
-			density_network_input,
-			dL_ddensity_input,
-			&dSDF_dpos,
-			use_inference_params,
-			GradientMode::Ignore
-		);
-		
-		// Normalize gradients to get unit normals: n = -∇SDF / ||∇SDF||
-		GPUMatrixDynamic<float> normals{3, batch_size, stream, AoS};  // FIXED: Use AoS layout to match surface buffers
-		linear_kernel(normalize_analytical_gradients_kernel<float>, 0, stream,
-			batch_size,
-			dSDF_dpos.data(),
-			normals.data()
-		);
-		return normals;
-		
-		// COMMENTED: Unnormalized version
-		// return dSDF_dpos.slice_rows(0, 3);
+		return compute_analytical_normals_inference_unified(stream, batch_size, input, density_network_input, density_network_output, use_inference_params);
 	}
 
-	// Helper function for inference-only analytical normals - NORMALIZED
+	// Legacy function for backward compatibility
 	GPUMatrixDynamic<float> compute_analytical_normals_inference(
 		cudaStream_t stream,
 		uint32_t batch_size,
@@ -1820,60 +1897,7 @@ public:
 		const GPUMatrixDynamic<T>& density_network_output,
 		bool use_inference_params
 	) {
-		// Create temporary contexts for analytical computation
-		auto temp_pos_ctx = m_pos_encoding->forward(
-			stream,
-			input.slice_rows(0, m_pos_encoding->input_width()),
-			const_cast<GPUMatrixDynamic<T>*>(&density_network_input),
-			use_inference_params,
-			true  // prepare_input_gradients
-		);
-		
-		auto temp_density_ctx = m_density_network->forward(
-			stream,
-			density_network_input,
-			const_cast<GPUMatrixDynamic<T>*>(&density_network_output),
-			use_inference_params,
-			true  // prepare_input_gradients
-		);
-		
-		// Compute gradients using same pattern as forward
-		GPUMatrixDynamic<T> dL_dsdf_seed{m_density_network->padded_output_width(), batch_size, stream, density_network_output.layout()};
-		CUDA_CHECK_THROW(cudaMemsetAsync(dL_dsdf_seed.data(), 0, dL_dsdf_seed.n_bytes(), stream));
-		
-		linear_kernel(set_constant_value_view_kernel<T>, 0, stream,
-			batch_size, T(1.0f),
-			dL_dsdf_seed.layout() == AoS ? dL_dsdf_seed.stride() : 1,
-			dL_dsdf_seed.data()
-		);
-		
-		GPUMatrixDynamic<T> dL_ddensity_input{m_pos_encoding->padded_output_width(), batch_size, stream, m_pos_encoding->preferred_output_layout()};
-		
-		m_density_network->backward(
-			stream, 
-			*temp_density_ctx,
-			density_network_input,
-			density_network_output,
-			dL_dsdf_seed,
-			&dL_ddensity_input,
-			use_inference_params, 
-			GradientMode::Ignore
-		);
-		
-		GPUMatrixDynamic<float> dSDF_dpos{m_pos_encoding->input_width(), batch_size, stream, AoS};  // FIXED: Use AoS for consistency
-		
-		m_pos_encoding->backward(
-			stream,
-			*temp_pos_ctx,
-			input.slice_rows(0, m_pos_encoding->input_width()),
-			density_network_input,
-			dL_ddensity_input,
-			&dSDF_dpos,
-			use_inference_params,
-			GradientMode::Ignore
-		);
-		
-		return dSDF_dpos.slice_rows(0, 3);
+		return compute_analytical_normals_inference_unified(stream, batch_size, input, density_network_input, density_network_output, use_inference_params);
 	}
 
 	// Second-order gradient accumulation with chain rule through normalization
@@ -2139,7 +2163,7 @@ public:
 		m_density_network->inference_mixed_precision(stream, density_network_input, density_network_output, use_inference_params);
 		
 		// Compute analytical normals using inference pattern
-		return compute_analytical_normals_inference_unnormalized(
+		return compute_analytical_normals_inference_unified(
 			stream, batch_size, input, density_network_input, density_network_output, use_inference_params
 		);
 	}
@@ -2226,6 +2250,10 @@ private:
 	bool m_use_analytical_normals = true;
 	bool m_use_eikonal_loss = false;
 	float m_eikonal_weight = 0.01f;
+	float m_sdf_s_parameter = 30.0f;
+	bool m_normalize_normals = true;  // Default: use normalized normals (backward compatible)
+	bool m_clamp_gradients = false;   // Default: no gradient clamping
+	float m_max_gradient_magnitude = 1.0f;  // Default clamp magnitude
 
 	std::string m_method;
 

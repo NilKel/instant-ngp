@@ -85,6 +85,14 @@ def parse_args():
 	# New: Normal visualization output
 	parser.add_argument("--visnormals", action="store_true", help="Save normal visualization images alongside rendered images. Only works with surface methods.")
 
+	# New: SDF mode flag
+	parser.add_argument("--sdf", action="store_true", help="Enable NeuS2-style SDF rendering where network output[0] is treated as SDF and density is derived from it.")
+
+	# New: Normal normalization control
+	parser.add_argument("--normalized", type=str, default="true", choices=["true", "false"], help="Whether to normalize analytical normals to unit vectors. Default: true (backward compatible)")
+	parser.add_argument("--clamp-gradients", action="store_true", dest="clamp_gradients", help="Enable gradient magnitude clamping for training stability when using raw gradients")
+	parser.add_argument("--max-gradient-mag", type=float, default=1.0, dest="max_gradient_mag", help="Maximum gradient magnitude when clamping is enabled. Default: 1.0")
+
 	return parser.parse_args()
 
 def get_scene(scene):
@@ -111,6 +119,24 @@ if __name__ == "__main__":
 		os.environ["NGP_EIKONAL_WEIGHT"] = str(args.eik_lambda)
 	else:
 		os.environ["NGP_EIKONAL"] = "0"
+
+	# Export SDF mode flag for C++ side to pick up
+	if args.sdf:
+		os.environ["NGP_SDF_MODE"] = "1"
+	else:
+		os.environ["NGP_SDF_MODE"] = "0"
+
+	# Export normal normalization settings for C++ side to pick up
+	if args.normalized.lower() == "true":
+		os.environ["NGP_NORMALIZE_NORMALS"] = "1"
+	else:
+		os.environ["NGP_NORMALIZE_NORMALS"] = "0"
+	
+	if args.clamp_gradients:
+		os.environ["NGP_CLAMP_GRADIENTS"] = "1"
+		os.environ["NGP_MAX_GRADIENT_MAG"] = str(args.max_gradient_mag)
+	else:
+		os.environ["NGP_CLAMP_GRADIENTS"] = "0"
 
 	testbed = ngp.Testbed()
 	testbed.root_dir = ROOT_DIR
