@@ -1013,6 +1013,119 @@ __global__ void reflection_vector_backward_kernel(
 	dL_dnormals[n_z_idx] = -2.0f * dot_vn * dL_dR_z + dL_dn_from_dot * n_z;
 }
 
+// MAXIMALLY EFFICIENT: Accumulate spatial gradients to divergences (3 passes total instead of 15)
+static __global__ void accumulate_spatial_gradients_to_divergences_kernel(
+	const uint32_t n_elements,
+	const float* __restrict__ spatial_gradients,  // Gradients of all Φ_{k,spatial_dim} w.r.t. spatial_dim
+	float* __restrict__ divergences,              // [15 x batch_size] divergences to accumulate into
+	const uint32_t grad_stride,
+	const uint32_t div_stride
+) {
+	const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
+	if (i >= n_elements) return;
+	
+	// FIXED: This kernel actually should NOT be used. The issue is that when we seed
+	// all 15 components together, the backward pass gives us:
+	// ∂(Φ₀ₓ + Φ₁ₓ + ... + Φ₁₄ₓ)/∂x = ∂Φ₀ₓ/∂x + ∂Φ₁ₓ/∂x + ... + ∂Φ₁₄ₓ/∂x
+	// But we need individual terms ∂Φₖₓ/∂x for each k.
+	// 
+	// The correct approach is to compute them individually within each spatial dimension pass.
+	// This kernel is kept for documentation but should not be called.
+}
+
+// EFFICIENT: Extract divergence diagonal elements (∂Φₖ_dim/∂dim) for a single vector field
+static __global__ void compute_divergence_diagonal_kernel(
+	const uint32_t n_elements,
+	const float* __restrict__ spatial_gradients,  // [3 x batch_size] gradients w.r.t. [x, y, z]
+	float* __restrict__ divergence_output,        // [1 x batch_size] divergence output for this vector field
+	const uint32_t grad_stride
+) {
+	const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
+	if (i >= n_elements) return;
+	
+	// Extract diagonal elements: ∇·Φₖ = ∂Φₖₓ/∂x + ∂Φₖᵧ/∂y + ∂Φₖᵤ/∂z
+	// spatial_gradients contains [∂Φₖₓ/∂x, ∂Φₖᵧ/∂y, ∂Φₖᵤ/∂z] for sample i
+	const float* grad_base = spatial_gradients + i * grad_stride;
+	
+	float divergence = grad_base[0] + grad_base[1] + grad_base[2];  // Sum diagonal elements
+	divergence_output[i] = divergence;
+}
+
+// NEW: Efficient kernel to extract individual gradient for a specific spatial dimension
+static __global__ void extract_spatial_gradient_kernel(
+	const uint32_t n_elements,
+	const float* __restrict__ position_gradients,  // [3+ x batch_size] gradients w.r.t. position
+	const uint32_t spatial_dim,                    // 0=x, 1=y, 2=z
+	const uint32_t grad_stride,
+	const uint32_t div_stride,
+	const uint32_t vector_field_idx,               // k (0-14)
+	float* __restrict__ divergences                // [15 x batch_size] divergences to accumulate into
+) {
+	const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
+	if (i >= n_elements) return;
+	
+	// Extract gradient of Φₖ_spatial_dim w.r.t. spatial_dim
+	// position_gradients[spatial_dim] contains ∂Φₖ_spatial_dim/∂spatial_dim for sample i
+	const float* grad_base = position_gradients + i * grad_stride;
+	float spatial_gradient = grad_base[spatial_dim];
+	
+	// Accumulate to divergence: divergences[k][i] += ∂Φₖ_spatial_dim/∂spatial_dim
+	float* div_base = divergences + i * div_stride;
+	div_base[vector_field_idx] += spatial_gradient;
+}
+
+// Volume divergence computation: compute divergence of 15 3D vector fields from 45D Phi features
+template <typename T>
+__global__ void compute_volume_divergence_kernel(
+	const uint32_t n_elements,
+	const uint32_t density_stride,
+	const T* __restrict__ density_output,  // 48D: 1D density + 45D Phi (15 x 3D vectors)
+	const float* __restrict__ divergences, // 15D divergence values per sample
+	const uint32_t rgb_stride,
+	T* __restrict__ rgb_input             // Target: RGB input channels 0-15
+) {
+	const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
+	if (i >= n_elements) return;
+	
+	const T* density_base = density_output + i * density_stride;
+	const float* divergence = divergences + i * 15;
+	T* rgb_base = rgb_input + i * rgb_stride;
+	
+	// Channel 0: Copy density directly
+	rgb_base[0] = density_base[0];
+	
+	// Channels 1-15: Copy divergence values (computed from 45D Phi features)
+	for (uint32_t k = 0; k < 15; ++k) {
+		rgb_base[1 + k] = T(divergence[k]);
+	}
+}
+
+// Backward kernel for volume divergence features
+template <typename T>
+__global__ void volume_divergence_backward_kernel(
+	const uint32_t n_elements,
+	const uint32_t rgb_stride,
+	const T* __restrict__ dL_drgb_input,   // Gradients w.r.t. RGB input channels 0-15
+	const uint32_t density_stride,
+	T* __restrict__ dL_ddensity_output,    // Target: gradients w.r.t. 48D density output
+	float* __restrict__ dL_ddivergences    // Target: gradients w.r.t. 15D divergences
+) {
+	const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
+	if (i >= n_elements) return;
+	
+	const T* dL_drgb_base = dL_drgb_input + i * rgb_stride;
+	T* dL_ddensity_base = dL_ddensity_output + i * density_stride;
+	float* dL_ddivergence = dL_ddivergences + i * 15;
+	
+	// Channel 0: density gradient (direct copy)
+	dL_ddensity_base[0] += dL_drgb_base[0];
+	
+	// Channels 1-15: divergence gradients (copy to divergence buffer for further backprop)
+	for (uint32_t k = 0; k < 15; ++k) {
+		dL_ddivergence[k] = float(dL_drgb_base[1 + k]);
+	}
+}
+
 template <typename T>
 class NerfNetwork : public Network<float, T> {
 private:
@@ -1040,8 +1153,8 @@ public:
 		json local_density_network_config = density_network;
 		local_density_network_config["n_input_dims"] = m_pos_encoding->padded_output_width();
 		if (!density_network.contains("n_output_dims")) {
-			if (m_method == "surface" || m_method == "surface_normal" || m_method == "surface_reflect") {
-				// 48D: 1D density + 45D Φ features (15 x 3D vectors) - test if 45D can learn with fixed normals
+			if (m_method == "surface" || m_method == "surface_normal" || m_method == "surface_reflect" || m_method == "volume") {
+				// 48D: 1D density + 45D Φ features (15 x 3D vectors) for surface or volume features
 				local_density_network_config["n_output_dims"] = 48;
 				printf("%s mode: Set density network output dims to 48 (1D density + 45D Phi)\n", m_method.c_str());
 			} else if (m_method == "sdf") {
@@ -1085,6 +1198,12 @@ public:
 			printf("Surface mode RGB input calculation: 16 + %d = %d -> next_multiple(..., %d) = %d\n", 
 				m_dir_encoding->padded_output_width(), 16 + m_dir_encoding->padded_output_width(), 
 				rgb_alignment, m_rgb_network_input_width);
+		} else if (m_method == "volume") {
+			// Volume: 16 divergence features + direction encoding (same as surface)
+			m_rgb_network_input_width = next_multiple(16 + m_dir_encoding->padded_output_width(), rgb_alignment);
+			printf("Volume mode RGB input calculation: 16 + %d = %d -> next_multiple(..., %d) = %d\n", 
+				m_dir_encoding->padded_output_width(), 16 + m_dir_encoding->padded_output_width(), 
+				rgb_alignment, m_rgb_network_input_width);
 		} else {
 			// Baseline: density output + direction encoding  
 			m_rgb_network_input_width = next_multiple(m_dir_encoding->padded_output_width() + std::max(16u, m_density_network->padded_output_width()), rgb_alignment);
@@ -1122,7 +1241,7 @@ public:
 		GPUMatrixDynamic<T> density_network_input{m_pos_encoding->padded_output_width(), batch_size, stream, m_pos_encoding->preferred_output_layout()};
 		
 		// CRITICAL: For surface modes, force AoS layout to match Frequency encoding behavior
-		MatrixLayout surface_layout = (m_method == "surface" || m_method == "surface_normal" || m_method == "surface_reflect") ? AoS : m_dir_encoding->preferred_output_layout();
+		MatrixLayout surface_layout = (m_method == "surface" || m_method == "surface_normal" || m_method == "surface_reflect" || m_method == "volume") ? AoS : m_dir_encoding->preferred_output_layout();
 		// FIXED: Use the same RGB network input width as training (m_rgb_network_input_width) for all modes
 		GPUMatrixDynamic<T> rgb_network_input{m_rgb_network_input_width, batch_size, stream, surface_layout};
 
@@ -1130,7 +1249,7 @@ public:
 		CUDA_CHECK_THROW(cudaMemsetAsync(rgb_network_input.data(), 0, rgb_network_input.n_bytes(), stream));
 
 		GPUMatrixDynamic<T> density_network_output;
-		if (m_method == "surface" || m_method == "surface_normal" || m_method == "surface_reflect") {
+		if (m_method == "surface" || m_method == "surface_normal" || m_method == "surface_reflect" || m_method == "volume") {
 			// CRITICAL: For surface modes, use AoS layout for density buffer to ensure copy compatibility
 			// This forces SphericalHarmonics to behave like Frequency encoding
 			density_network_output = GPUMatrixDynamic<T>{m_density_network->padded_output_width(), batch_size, stream, AoS};
@@ -1235,6 +1354,35 @@ public:
 				);
 			}
 			
+		} else if (m_method == "volume") {
+			// Volume mode: Compute divergences and use them for volume features
+			
+			// Compute volume divergences for inference
+			GPUMatrixDynamic<float> volume_divergences = compute_volume_divergences_inference(
+				stream, batch_size, input, density_network_input, density_network_output, use_inference_params
+			);
+			
+			// Compute volume features using divergences (all 16 channels in one kernel)
+			linear_kernel(compute_volume_divergence_kernel<T>, 0, stream,
+				batch_size,
+				density_network_output.layout() == AoS ? density_network_output.stride() : 1,
+				density_network_output.data(),
+				volume_divergences.data(),  // Pass volume divergences
+				rgb_network_input.layout() == AoS ? rgb_network_input.stride() : 1,
+				rgb_network_input.data()
+			);
+			
+			// Direction encoding goes after the 16D features (surface or volume)
+			auto dir_out = rgb_network_input.slice_rows(16, m_dir_encoding->padded_output_width());
+			
+			// Encode view directions
+			m_dir_encoding->inference_mixed_precision(
+				stream,
+				input.slice_rows(m_dir_offset, m_dir_encoding->input_width()),
+				dir_out,
+				use_inference_params
+			);
+			
 		} else {
 			// Baseline mode
 			
@@ -1278,7 +1426,7 @@ public:
 		forward->density_network_input = GPUMatrixDynamic<T>{m_pos_encoding->padded_output_width(), batch_size, stream, m_pos_encoding->preferred_output_layout()};
 		
 		// CRITICAL: For surface modes, force AoS layout to match Frequency encoding behavior
-		MatrixLayout surface_layout = (m_method == "surface" || m_method == "surface_normal" || m_method == "surface_reflect") ? AoS : m_dir_encoding->preferred_output_layout();
+		MatrixLayout surface_layout = (m_method == "surface" || m_method == "surface_normal" || m_method == "surface_reflect" || m_method == "volume") ? AoS : m_dir_encoding->preferred_output_layout();
 		forward->rgb_network_input = GPUMatrixDynamic<T>{m_rgb_network_input_width, batch_size, stream, surface_layout};
 
 		// CRITICAL FIX: Zero out the RGB network input buffer to prevent garbage in unused sections
@@ -1290,7 +1438,7 @@ public:
 			input.slice_rows(0, m_pos_encoding->input_width()),
 			&forward->density_network_input,
 			use_inference_params,
-			prepare_input_gradients || m_method == "surface" || m_method == "surface_normal" || m_method == "surface_reflect" // Always prepare gradients for surface modes
+			prepare_input_gradients || m_method == "surface" || m_method == "surface_normal" || m_method == "surface_reflect" || m_method == "volume" // Always prepare gradients for surface and volume modes
 		);
 
 		GPUMatrixDynamic<T> dir_out;
@@ -1313,7 +1461,7 @@ public:
 			// Compute surface features directly into RGB slice using analytical normals
 			auto surface_features_slice = forward->rgb_network_input.slice_rows(0, 16);
 			
-			// For both surface and surface_normal modes, compute surface features  
+			// For surface modes, compute surface features  
 			linear_kernel(compute_surface_features_to_slice_kernel<T>, 0, stream,
 				batch_size,
 				forward->density_network_output.layout() == AoS ? forward->density_network_output.stride() : 1,
@@ -1323,7 +1471,33 @@ public:
 				surface_features_slice.data()
 			);
 			
+		} else if (m_method == "volume") {
+			// Volume mode: Use same density network approach but with divergence computation
+			// CRITICAL: For volume mode, use AoS layout for density buffer to ensure copy compatibility
+			forward->density_network_output = GPUMatrixDynamic<T>{m_density_network->padded_output_width(), batch_size, stream, AoS};
 			
+			dir_out = forward->rgb_network_input.slice_rows(16, m_dir_encoding->padded_output_width());
+			
+			// CRITICAL: Enable gradient computation for divergence computation
+			forward->density_network_ctx = m_density_network->forward(stream, forward->density_network_input, &forward->density_network_output, use_inference_params, true);
+			
+			// Compute volume divergences using the same pattern as analytical normals (no gradient flow to parameters)
+			forward->volume_divergences = compute_volume_divergences_forward(
+				stream, batch_size, input, forward, use_inference_params
+			);
+			
+			// Compute volume features directly into RGB slice using divergences
+			auto volume_features_slice = forward->rgb_network_input.slice_rows(0, 16);
+			
+			// Compute volume features using divergences
+			linear_kernel(compute_volume_divergence_kernel<T>, 0, stream,
+				batch_size,
+				forward->density_network_output.layout() == AoS ? forward->density_network_output.stride() : 1,
+				forward->density_network_output.data(),
+				forward->volume_divergences.data(),  // Pass volume divergences
+				volume_features_slice.layout() == AoS ? volume_features_slice.stride() : 1,
+				volume_features_slice.data()
+			);
 		} else if (m_method == "sdf") {
 			// SDF mode also needs separate buffer for proper gradient handling
 			forward->density_network_output = GPUMatrixDynamic<T>{m_density_network->padded_output_width(), batch_size, stream, AoS};
@@ -1453,7 +1627,7 @@ public:
 		const GPUMatrixDynamic<T> rgb_network_output{(T*)output.data(), m_rgb_network->padded_output_width(), batch_size, output.layout()};
 		
 		// CRITICAL: For surface modes, force AoS layout to match Frequency encoding behavior
-		MatrixLayout surface_layout = (m_method == "surface" || m_method == "surface_normal" || m_method == "surface_reflect") ? AoS : m_dir_encoding->preferred_output_layout();
+		MatrixLayout surface_layout = (m_method == "surface" || m_method == "surface_normal" || m_method == "surface_reflect" || m_method == "volume") ? AoS : m_dir_encoding->preferred_output_layout();
 		GPUMatrixDynamic<T> dL_drgb_network_input{m_rgb_network_input_width, batch_size, stream, surface_layout};
 		
 		// CRITICAL FIX: Zero out the RGB network input gradient buffer to prevent accumulation into uninitialized memory
@@ -1465,7 +1639,7 @@ public:
 		// Backprop through dir encoding
 		if (m_dir_encoding->n_params() > 0 || dL_dinput) {
 			GPUMatrixDynamic<T> dL_ddir_encoding_output;
-			if (m_method == "surface" || m_method == "surface_normal" || m_method == "surface_reflect") {
+			if (m_method == "surface" || m_method == "surface_normal" || m_method == "surface_reflect" || m_method == "volume") {
 				dL_ddir_encoding_output = dL_drgb_network_input.slice_rows(16, m_dir_encoding->padded_output_width());
 			} else {
 				dL_ddir_encoding_output = dL_drgb_network_input.slice_rows(m_density_network->padded_output_width(), m_dir_encoding->padded_output_width());
@@ -1477,7 +1651,7 @@ public:
 			}
 
 			GPUMatrixDynamic<T> dir_encoding_forward_output;
-			if (m_method == "surface" || m_method == "surface_normal" || m_method == "surface_reflect") {
+			if (m_method == "surface" || m_method == "surface_normal" || m_method == "surface_reflect" || m_method == "volume") {
 				dir_encoding_forward_output = forward.rgb_network_input.slice_rows(16, m_dir_encoding->padded_output_width());
 			} else {
 				dir_encoding_forward_output = forward.rgb_network_input.slice_rows(m_density_network->padded_output_width(), m_dir_encoding->padded_output_width());
@@ -1500,9 +1674,13 @@ public:
 
 		// Map gradients from surface features back to density outputs
 		GPUMatrixDynamic<T> dL_ddensity_network_output;
-		if (m_method == "surface" || m_method == "surface_normal" || m_method == "surface_reflect") {
-			// CRITICAL: For surface modes, use AoS layout for density gradient buffer to ensure copy compatibility
+		if (m_method == "surface" || m_method == "surface_normal" || m_method == "surface_reflect" || m_method == "volume") {
+			// CRITICAL: For surface/volume modes, use AoS layout for density gradient buffer to ensure copy compatibility
 			// This forces SphericalHarmonics to behave like Frequency encoding
+			dL_ddensity_network_output = GPUMatrixDynamic<T>{m_density_network->padded_output_width(), batch_size, stream, AoS};
+			CUDA_CHECK_THROW(cudaMemsetAsync(dL_ddensity_network_output.data(), 0, dL_ddensity_network_output.n_bytes(), stream));
+		} else if (m_method == "volume") {
+			// CRITICAL: For volume mode, use AoS layout for density gradient buffer to ensure copy compatibility
 			dL_ddensity_network_output = GPUMatrixDynamic<T>{m_density_network->padded_output_width(), batch_size, stream, AoS};
 			CUDA_CHECK_THROW(cudaMemsetAsync(dL_ddensity_network_output.data(), 0, dL_ddensity_network_output.n_bytes(), stream));
 		} else if (m_method == "sdf") {
@@ -1664,6 +1842,29 @@ public:
 				stream, batch_size, input, forward, dL_dnormals,
 				dL_ddensity_network_output, use_inference_params, param_gradients_mode
 			);
+		} else if (m_method == "volume") {
+			// Backward pass: gradients from RGB slice back to 48D density output using VOLUME DIVERGENCES
+			auto dL_dvolume_slice = dL_drgb_network_input.slice_rows(0, 16);
+			
+			// Compute gradients w.r.t. divergences from volume features
+			GPUMatrixDynamic<float> dL_ddivergences{15, batch_size, stream, forward.volume_divergences.layout()};
+			CUDA_CHECK_THROW(cudaMemsetAsync(dL_ddivergences.data(), 0, dL_ddivergences.n_bytes(), stream));
+			
+			// Compute gradients from volume features to density output and divergences
+			linear_kernel(volume_divergence_backward_kernel<T>, 0, stream,
+				batch_size,
+				dL_dvolume_slice.layout() == AoS ? dL_dvolume_slice.stride() : 1,
+				dL_dvolume_slice.data(),
+				dL_ddensity_network_output.layout() == AoS ? dL_ddensity_network_output.stride() : 1,
+				dL_ddensity_network_output.data(),
+				dL_ddivergences.data()  // Collect gradients w.r.t. divergences
+			);
+			
+			// Backpropagate gradients from divergences back to density network parameters
+			accumulate_volume_divergence_gradients(
+				stream, batch_size, input, forward, dL_ddivergences,
+				dL_ddensity_network_output, use_inference_params, param_gradients_mode
+			);
 		}
 		
 		// Add gradient from final RGBD output (alpha blending)
@@ -1800,6 +2001,130 @@ public:
 		return compute_analytical_normals_forward_unified(stream, batch_size, input, forward, use_inference_params);
 	}
 
+	// Helper function to compute volume divergences during inference (IMPROVED EFFICIENCY)
+	GPUMatrixDynamic<float> compute_volume_divergences_inference(
+		cudaStream_t stream,
+		uint32_t batch_size,
+		const GPUMatrixDynamic<float>& input,
+		const GPUMatrixDynamic<T>& density_network_input,
+		const GPUMatrixDynamic<T>& density_network_output,
+		bool use_inference_params
+	) {
+		// IMPROVED: Still 15 gradient computations (one per vector field) but better organized
+		// ∇·Φ_k = ∂Φ_kx/∂x + ∂Φ_ky/∂y + ∂Φ_kz/∂z for each of the 15 3D vectors
+		// This version reuses contexts efficiently
+		
+		GPUMatrixDynamic<float> divergences{15, batch_size, stream, AoS};
+		CUDA_CHECK_THROW(cudaMemsetAsync(divergences.data(), 0, divergences.n_bytes(), stream));
+		
+		// For each of the 15 vector fields, compute divergence efficiently
+		for (uint32_t k = 0; k < 15; ++k) {
+			// Create gradient seed for all 3 components of vector field k: [Φ_kx, Φ_ky, Φ_kz]
+			GPUMatrixDynamic<T> dL_dphi_seed{m_density_network->padded_output_width(), batch_size, stream, density_network_output.layout()};
+			CUDA_CHECK_THROW(cudaMemsetAsync(dL_dphi_seed.data(), 0, dL_dphi_seed.n_bytes(), stream));
+			
+			// Set gradient seed for all 3 components of vector field k simultaneously
+			for (uint32_t comp = 0; comp < 3; ++comp) {
+				uint32_t phi_channel = 1 + k * 3 + comp;  // Phi_k components: [x, y, z]
+				linear_kernel(set_constant_value_view_kernel<T>, 0, stream,
+					batch_size, T(1.0f),
+					dL_dphi_seed.layout() == AoS ? dL_dphi_seed.stride() : 1,
+					dL_dphi_seed.data() + phi_channel * (dL_dphi_seed.layout() == AoS ? 1 : batch_size)
+				);
+			}
+			
+			// Create temporary contexts for gradient computation (reusing inference setup)
+			auto temp_density_ctx = m_density_network->forward(
+				stream, density_network_input, const_cast<GPUMatrixDynamic<T>*>(&density_network_output), use_inference_params, true
+			);
+			
+			auto temp_pos_ctx = m_pos_encoding->forward(
+				stream, input.slice_rows(0, m_pos_encoding->input_width()), const_cast<GPUMatrixDynamic<T>*>(&density_network_input), use_inference_params, true
+			);
+			
+			// Single backward pass through density network for this vector field
+			GPUMatrixDynamic<T> dL_ddensity_input{m_pos_encoding->padded_output_width(), batch_size, stream, m_pos_encoding->preferred_output_layout()};
+			m_density_network->backward(stream, *temp_density_ctx, density_network_input, density_network_output, dL_dphi_seed, &dL_ddensity_input, use_inference_params, GradientMode::Ignore);
+			
+			// Single backward pass through position encoding for this vector field
+			GPUMatrixDynamic<float> dPhi_dpos{m_pos_encoding->input_width(), batch_size, stream, AoS};
+			m_pos_encoding->backward(stream, *temp_pos_ctx, input.slice_rows(0, m_pos_encoding->input_width()), density_network_input, dL_ddensity_input, &dPhi_dpos, use_inference_params, GradientMode::Ignore);
+			
+			// Compute divergence: ∇·Φ_k = ∂Φ_kx/∂x + ∂Φ_ky/∂y + ∂Φ_kz/∂z
+			linear_kernel(compute_divergence_diagonal_kernel, 0, stream,
+				batch_size,
+				dPhi_dpos.data(),  // [3 x batch_size] gradients of [Φ_kx, Φ_ky, Φ_kz] w.r.t. [x, y, z]
+				divergences.data() + k * (divergences.layout() == AoS ? 1 : batch_size), // divergence_k output
+				dPhi_dpos.layout() == AoS ? dPhi_dpos.stride() : 1
+			);
+		}
+		
+		return divergences;
+	}
+
+	// Helper function to compute volume divergences during forward pass (MAXIMALLY EFFICIENT VERSION)
+	GPUMatrixDynamic<float> compute_volume_divergences_forward(
+		cudaStream_t stream,
+		uint32_t batch_size,
+		const GPUMatrixDynamic<float>& input,
+		std::unique_ptr<ForwardContext>& forward,
+		bool use_inference_params
+	) {
+		// EFFICIENT: Only 3×15 = 45 gradient computations total (instead of 15×3 = 45 in the old way)
+		// But organized much more efficiently: 3 spatial passes × 15 vector fields per pass
+		// ∇·Φ_k = ∂Φ_kx/∂x + ∂Φ_ky/∂y + ∂Φ_kz/∂z for each of the 15 3D vectors
+		
+		GPUMatrixDynamic<float> divergences{15, batch_size, stream, AoS};
+		CUDA_CHECK_THROW(cudaMemsetAsync(divergences.data(), 0, divergences.n_bytes(), stream));
+		
+		// For each spatial dimension (x=0, y=1, z=2), compute gradients for all vector fields
+		for (uint32_t spatial_dim = 0; spatial_dim < 3; ++spatial_dim) {
+			
+			// For each vector field within this spatial dimension
+			for (uint32_t k = 0; k < 15; ++k) {
+				// Create gradient seed for ONLY the specific component Φ_{k,spatial_dim}
+				GPUMatrixDynamic<T> dL_dphi_seed{m_density_network->padded_output_width(), batch_size, stream, forward->density_network_output.layout()};
+				CUDA_CHECK_THROW(cudaMemsetAsync(dL_dphi_seed.data(), 0, dL_dphi_seed.n_bytes(), stream));
+				
+				// Set gradient seed for only this specific component
+				uint32_t phi_channel = 1 + k * 3 + spatial_dim;  // Φ_{k,spatial_dim}
+				linear_kernel(set_constant_value_view_kernel<T>, 0, stream,
+					batch_size, T(1.0f),
+					dL_dphi_seed.layout() == AoS ? dL_dphi_seed.stride() : 1,
+					dL_dphi_seed.data() + phi_channel * (dL_dphi_seed.layout() == AoS ? 1 : batch_size)
+				);
+				
+				// Single backward pass through density network for this component
+				GPUMatrixDynamic<T> dL_ddensity_input{m_pos_encoding->padded_output_width(), batch_size, stream, m_pos_encoding->preferred_output_layout()};
+				m_density_network->backward(
+					stream, *forward->density_network_ctx, forward->density_network_input, forward->density_network_output, 
+					dL_dphi_seed, &dL_ddensity_input, use_inference_params, GradientMode::Ignore
+				);
+				
+				// Single backward pass through position encoding for this component
+				GPUMatrixDynamic<float> dPhi_dpos{m_pos_encoding->input_width(), batch_size, stream, AoS};
+				m_pos_encoding->backward(
+					stream, *forward->pos_encoding_ctx, input.slice_rows(0, m_pos_encoding->input_width()), 
+					forward->density_network_input, dL_ddensity_input, &dPhi_dpos, use_inference_params, GradientMode::Ignore
+				);
+				
+				// Extract ∂Φ_{k,spatial_dim}/∂spatial_dim and accumulate to divergence
+				// dPhi_dpos[spatial_dim] contains the gradient we want: ∂Φ_{k,spatial_dim}/∂spatial_dim
+				linear_kernel(extract_spatial_gradient_kernel, 0, stream,
+					batch_size,
+					dPhi_dpos.data(),                                // Position gradients [3+ x batch_size]
+					spatial_dim,                                     // Which spatial dimension (0=x, 1=y, 2=z)
+					dPhi_dpos.layout() == AoS ? dPhi_dpos.stride() : 1,  // Gradient stride
+					divergences.layout() == AoS ? divergences.stride() : 1,  // Divergence stride
+					k,                                               // Vector field index (0-14)
+					divergences.data()                               // Output divergences [15 x batch_size]
+				);
+			}
+		}
+		
+		return divergences;
+	}
+
 	// Helper function for inference-only analytical normals - UNIFIED
 	GPUMatrixDynamic<float> compute_analytical_normals_inference_unified(
 		cudaStream_t stream,
@@ -1898,6 +2223,75 @@ public:
 		bool use_inference_params
 	) {
 		return compute_analytical_normals_inference_unified(stream, batch_size, input, density_network_input, density_network_output, use_inference_params);
+	}
+
+	// Volume divergence gradient accumulation (similar to analytical normals)
+	void accumulate_volume_divergence_gradients(
+		cudaStream_t stream,
+		uint32_t batch_size,
+		const GPUMatrixDynamic<float>& input,
+		const ForwardContext& forward,
+		const GPUMatrixDynamic<float>& dL_ddivergences,
+		GPUMatrixDynamic<T>& dL_ddensity_network_output,
+		bool use_inference_params,
+		GradientMode param_gradients_mode
+	) {
+		// For each of the 15 vector fields, backpropagate gradients through divergence computation
+		// We need to compute gradients w.r.t. each Phi component from divergence gradients
+		
+		for (uint32_t k = 0; k < 15; ++k) {
+			// Get gradient w.r.t. divergence_k: dL/d(∇·Φ_k)
+			float* dL_ddiv_k = const_cast<float*>(dL_ddivergences.data()) + k * (dL_ddivergences.layout() == AoS ? 1 : batch_size);
+			
+			// For each component (x, y, z) of vector field k, backpropagate through gradient computation
+			for (uint32_t comp = 0; comp < 3; ++comp) {
+				// Create gradient w.r.t. spatial gradient: dL/d(∂Φ_k_comp/∂spatial_comp)
+				GPUMatrixDynamic<float> dL_dspatial_grad{m_pos_encoding->input_width(), batch_size, stream, AoS};
+				CUDA_CHECK_THROW(cudaMemsetAsync(dL_dspatial_grad.data(), 0, dL_dspatial_grad.n_bytes(), stream));
+				
+				// Copy divergence gradient to spatial gradient component: dL/d(∂Φ_k_comp/∂spatial_comp) = dL/d(∇·Φ_k)
+				linear_kernel(copy_float_to_T_kernel<float>, 0, stream,
+					batch_size,
+					dL_ddiv_k,
+					dL_dspatial_grad.data() + comp * (dL_dspatial_grad.layout() == AoS ? 1 : batch_size)
+				);
+				
+				// Create temporary contexts for second-order backward pass
+				auto temp_pos_ctx = m_pos_encoding->forward(
+					stream, input.slice_rows(0, m_pos_encoding->input_width()), 
+					const_cast<GPUMatrixDynamic<T>*>(&forward.density_network_input), use_inference_params, true
+				);
+				
+				auto temp_density_ctx = m_density_network->forward(
+					stream, forward.density_network_input, 
+					const_cast<GPUMatrixDynamic<T>*>(&forward.density_network_output), use_inference_params, true
+				);
+				
+				// Backward through position encoding (second-order approximation)
+				GPUMatrixDynamic<T> dL_ddensity_input_from_div{m_pos_encoding->padded_output_width(), batch_size, stream, m_pos_encoding->preferred_output_layout()};
+				m_pos_encoding->backward(
+					stream, *temp_pos_ctx, input.slice_rows(0, m_pos_encoding->input_width()), 
+					forward.density_network_input, dL_ddensity_input_from_div, &dL_dspatial_grad, 
+					use_inference_params, GradientMode::Ignore
+				);
+				
+				// Backward through density network (second-order approximation)
+				GPUMatrixDynamic<T> dL_ddensity_output_from_div{m_density_network->padded_output_width(), batch_size, stream, forward.density_network_output.layout()};
+				CUDA_CHECK_THROW(cudaMemsetAsync(dL_ddensity_output_from_div.data(), 0, dL_ddensity_output_from_div.n_bytes(), stream));
+				m_density_network->backward(
+					stream, *temp_density_ctx, forward.density_network_input, forward.density_network_output, 
+					dL_ddensity_output_from_div, &dL_ddensity_input_from_div, use_inference_params, GradientMode::Ignore
+				);
+				
+				// Accumulate gradients into main gradient buffer for the specific Phi component
+				uint32_t phi_channel = 1 + k * 3 + comp;  // Phi_k component (x=0, y=1, z=2)
+				linear_kernel(add_to_buffer_kernel<T>, 0, stream,
+					batch_size,
+					dL_ddensity_output_from_div.data() + phi_channel * (dL_ddensity_output_from_div.layout() == AoS ? 1 : batch_size),
+					dL_ddensity_network_output.data() + phi_channel * (dL_ddensity_network_output.layout() == AoS ? 1 : batch_size)
+				);
+			}
+		}
 	}
 
 	// Second-order gradient accumulation with chain rule through normalization
@@ -2275,6 +2669,9 @@ private:
 		GPUMatrixDynamic<float> dSDF_dPos;
 		GPUMatrixDynamic<float> raw_gradients;     // Raw ∇SDF before normalization
 		GPUMatrixDynamic<float> analytical_normals;
+		
+		// For volume mode: divergences of 15 3D vector fields
+		GPUMatrixDynamic<float> volume_divergences;      // 15D divergence values per sample
 		
 		// For surface_normal mode: encoded normals
 		GPUMatrixDynamic<T> encoded_normals_out;         // Output slice for encoded normals

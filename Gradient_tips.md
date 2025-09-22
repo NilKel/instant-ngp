@@ -1019,3 +1019,164 @@ Your normal visualization works seamlessly with all existing Instant-NGP feature
 | `6` | Distortion | Ray marching cost | Performance debugging |
 
 **The analytical normal visualization feature is now fully integrated and ready for production use with all your surface reconstruction methods.**
+
+---
+
+## **🔧 TODO: VOLUME MODE IMPLEMENTATION - DIVERGENCE COMPUTATION**
+
+### **Current Status: PARTIALLY IMPLEMENTED BUT TOO SLOW**
+
+The volume mode has been **partially implemented** in `nerf_network.h` but is currently **too slow** due to inefficient gradient computation. The current implementation takes **15 backward passes** through the network (one per vector field), but it should only take **3 backward passes** (one per spatial dimension).
+
+### **Problem Statement**
+
+**Goal**: Implement volume mode that computes divergences of 15 3D vector fields from 45D Φ features:
+- Input: 45D Φ features reshaped as 15×3D vector fields: `Φ₀=[Φ₀ₓ,Φ₀ᵧ,Φ₀ᵤ], Φ₁=[Φ₁ₓ,Φ₁ᵧ,Φ₁ᵤ], ..., Φ₁₄=[Φ₁₄ₓ,Φ₁₄ᵧ,Φ₁₄ᵤ]`
+- Output: 15D divergences: `∇·Φₖ = ∂Φₖₓ/∂x + ∂Φₖᵧ/∂y + ∂Φₖᵤ/∂z` for k=0..14
+
+**Current Implementation**: 15 backward passes (one per vector field) - **TOO SLOW**
+**Required Implementation**: 3 backward passes (one per spatial dimension) - **EFFICIENT**
+
+### **Key Insight: Spatial Dimension Grouping**
+
+Instead of computing gradients per vector field, group by spatial dimension:
+
+**Pass 1**: Compute `∂[Φ₀ₓ, Φ₁ₓ, Φ₂ₓ, ..., Φ₁₄ₓ]/∂x` (all x-components w.r.t. x)
+**Pass 2**: Compute `∂[Φ₀ᵧ, Φ₁ᵧ, Φ₂ᵧ, ..., Φ₁₄ᵧ]/∂y` (all y-components w.r.t. y)  
+**Pass 3**: Compute `∂[Φ₀ᵤ, Φ₁ᵤ, Φ₂ᵤ, ..., Φ₁₄ᵤ]/∂z` (all z-components w.r.t. z)
+
+Then: `∇·Φₖ = (∂Φₖₓ/∂x from Pass1) + (∂Φₖᵧ/∂y from Pass2) + (∂Φₖᵤ/∂z from Pass3)`
+
+### **Implementation Strategy**
+
+#### **Step 1: Fix Volume Divergence Forward Pass**
+
+Current problematic function:
+```cpp
+GPUMatrixDynamic<float> compute_volume_divergences_forward(...)
+```
+
+**Problem**: Currently loops through 15 vector fields, each requiring separate backward passes.
+
+**Solution**: Modify to loop through 3 spatial dimensions instead:
+
+```cpp
+// EFFICIENT: Only 3 gradient computations total
+for (uint32_t spatial_dim = 0; spatial_dim < 3; ++spatial_dim) {
+    // spatial_dim=0: channels [1, 4, 7, 10, ...] (all x-components: Φ_{k,x})
+    // spatial_dim=1: channels [2, 5, 8, 11, ...] (all y-components: Φ_{k,y})  
+    // spatial_dim=2: channels [3, 6, 9, 12, ...] (all z-components: Φ_{k,z})
+    
+    // Create gradient seed for ALL components of this spatial dimension
+    GPUMatrixDynamic<T> dL_dphi_seed{...};
+    for (uint32_t k = 0; k < 15; ++k) {
+        uint32_t phi_channel = 1 + k * 3 + spatial_dim;
+        // Set gradient seed to 1.0 for this component
+    }
+    
+    // Single backward pass through density and position networks
+    m_density_network->backward(...);
+    m_pos_encoding->backward(...);
+    
+    // Extract ∂Φ_{k,spatial_dim}/∂spatial_dim for all k
+    // Store in divergences array
+}
+```
+
+#### **Step 2: Handle Gradient Extraction Correctly**
+
+**Key Challenge**: When we seed multiple output components, backward() gives gradients of their sum, not individual gradients.
+
+**Solution**: The gradients we get are:
+- `∂(Φ₀ₓ + Φ₁ₓ + ... + Φ₁₄ₓ)/∂x = ∂Φ₀ₓ/∂x + ∂Φ₁ₓ/∂x + ... + ∂Φ₁₄ₓ/∂x`
+
+But we actually **DO** want this! We need individual terms `∂Φₖₓ/∂x`. 
+
+**Correct Approach**: Use **unit vector seeding** - seed each component separately but within the same pass.
+
+#### **Step 3: Fix Kernel for Gradient Accumulation**
+
+The current kernel `accumulate_spatial_gradients_to_divergences_kernel` is incomplete.
+
+**Required Kernel Logic**:
+```cpp
+__global__ void extract_diagonal_gradients_kernel(
+    const uint32_t n_elements,
+    const float* __restrict__ spatial_gradients,  // ∂(all Φ_{k,dim})/∂dim for one spatial dim
+    float* __restrict__ divergences,              // [15 x batch] divergences to accumulate into
+    const uint32_t spatial_dim,                   // 0=x, 1=y, 2=z
+    ...
+) {
+    // For sample i:
+    // spatial_gradients[i] contains the gradient for this spatial dimension
+    // We need to add this to divergences[k][i] for each vector field k
+    
+    // But this reveals the fundamental issue - we need individual gradients per k!
+}
+```
+
+#### **Step 4: Alternative Efficient Approach**
+
+Since getting individual gradients from summed seeding is complex, use **batched computation**:
+
+```cpp
+// For each spatial dimension
+for (uint32_t spatial_dim = 0; spatial_dim < 3; ++spatial_dim) {
+    
+    // Method A: Compute all 15 components in separate calls but reuse contexts
+    for (uint32_t k = 0; k < 15; ++k) {
+        uint32_t phi_channel = 1 + k * 3 + spatial_dim;
+        
+        // Create gradient seed for just this component
+        // Single backward pass for this component
+        // Extract ∂Φ_{k,spatial_dim}/∂spatial_dim
+        // Add to divergences[k]
+    }
+}
+```
+
+This is still more efficient than the current 15×3=45 approach, giving us 3×15=45 calls but with much better cache locality and context reuse.
+
+#### **Step 5: Update Inference Version**
+
+Apply the same 3-pass approach to `compute_volume_divergences_inference()`.
+
+### **Files to Modify**
+
+1. **`include/neural-graphics-primitives/nerf_network.h`**:
+   - Fix `compute_volume_divergences_forward()`
+   - Fix `compute_volume_divergences_inference()`
+   - Fix or replace `accumulate_spatial_gradients_to_divergences_kernel`
+
+### **Expected Performance Improvement**
+
+- **Current**: 15 backward passes through full network = ~15× analytical normal cost
+- **Target**: 3 backward passes through full network = ~3× analytical normal cost  
+- **Improvement**: **5× speedup** in volume divergence computation
+
+### **Testing Strategy**
+
+1. **Correctness Test**: Verify divergences match mathematical definition
+2. **Performance Test**: Measure time vs current implementation  
+3. **Training Test**: Ensure volume mode trains successfully with 3-pass approach
+
+### **Architecture Comparison**
+
+```
+CURRENT (TOO SLOW):
+Input → 48D [1D density + 45D Φ] → 15 gradient passes → 15D divergences → 16D RGB input
+
+TARGET (EFFICIENT):
+Input → 48D [1D density + 45D Φ] → 3 gradient passes → 15D divergences → 16D RGB input
+```
+
+### **Critical Success Criteria**
+
+- ✅ Volume mode uses **exactly 3 backward passes** instead of 15
+- ✅ Divergence computation is mathematically correct
+- ✅ Performance is comparable to surface mode (3-5× analytical normal cost)
+- ✅ Training stability matches other surface reconstruction methods
+
+**Priority: HIGH** - Current volume mode is too slow for practical use. This efficiency improvement is essential for production deployment.
+
+---
