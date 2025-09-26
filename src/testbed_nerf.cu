@@ -2593,9 +2593,14 @@ void Testbed::update_density_grid_nerf(
 			GPUMatrix<float> density_grid_position_matrix(
 				(float*)(density_grid_positions + i), sizeof(NerfPosition) / sizeof(float), batch_size
 			);
-			m_nerf_network->density(stream, density_grid_position_matrix, density_matrix, false);
+					printf("DEBUG: About to call density network in update_density_grid_nerf\n");
+					CUDA_CHECK_THROW(cudaStreamSynchronize(stream));
+		m_nerf_network->density(stream, density_grid_position_matrix, density_matrix, false);
+		printf("DEBUG: Density call completed, about to synchronize stream\n");
+		CUDA_CHECK_THROW(cudaStreamSynchronize(stream));
+		printf("DEBUG: Stream synchronized successfully\n");
 		}
-
+		printf("DEBUG: Finished density call\n");
 		linear_kernel(
 			splat_grid_samples_nerf_max_nearest_neighbor,
 			0,
@@ -3453,6 +3458,7 @@ void Testbed::optimise_mesh_step(uint32_t n_steps) {
 		);
 
 		// For each optimizer step, we need the density at the given pos...
+		printf("DEBUG: About to call density network in optimise_mesh_step\n");
 		m_nerf_network->density(m_stream.get(), positions_matrix, density_matrix);
 		// ...as well as the input gradient w.r.t. density, which we will store in the nerf coords.
 		m_nerf_network->input_gradient(m_stream.get(), 3, positions_matrix, positions_matrix);
@@ -3527,6 +3533,7 @@ void Testbed::compute_mesh_vertex_colors() {
 
 GPUMemory<float> Testbed::get_density_on_grid(ivec3 res3d, const BoundingBox& aabb, const mat3& render_aabb_to_local) {
 	const uint32_t n_elements = (res3d.x * res3d.y * res3d.z);
+	printf("DEBUG: About to call get_density_on_grid\n");
 	GPUMemory<float> density(n_elements);
 
 	const uint32_t batch_size = std::min(n_elements, 1u << 20);
@@ -3560,6 +3567,7 @@ GPUMemory<float> Testbed::get_density_on_grid(ivec3 res3d, const BoundingBox& aa
 
 		GPUMatrix<float> positions_matrix((float*)(positions + offset), sizeof(NerfPosition) / sizeof(float), local_batch_size);
 		if (nerf_mode) {
+			printf("DEBUG: About to call density network in get_density_on_grid\n");
 			m_nerf_network->density(m_stream.get(), positions_matrix, density_matrix);
 		} else {
 			m_network->inference_mixed_precision(m_stream.get(), positions_matrix, density_matrix);

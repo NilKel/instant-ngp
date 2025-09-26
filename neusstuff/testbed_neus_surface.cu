@@ -3545,6 +3545,7 @@ void Testbed::reset_density_grid_nerf(cudaStream_t stream) {
 
 		GPUMatrix<network_precision_t, RM> density_matrix(mlp_out, padded_output_width, n_density_grid_samples);
 		GPUMatrix<float> density_grid_position_matrix((float*)density_grid_positions, sizeof(NerfPosition)/sizeof(float), n_density_grid_samples);
+		printf("DEBUGTESTBED: About to call density network in density method\n");
 		m_nerf_network->density(stream, density_grid_position_matrix, density_matrix, false);
 
 		linear_kernel(splat_grid_samples_nerf_max_nearest_neighbor, 0, stream, n_density_grid_samples, density_grid_indices, mlp_out, density_grid_tmp, m_nerf.rgb_activation, m_nerf.density_activation);

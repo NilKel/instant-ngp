@@ -4262,6 +4262,27 @@ void Testbed::reset_network(bool clear_density_grid) {
 		encoding_config["n_pos_dims"] = dims.n_pos;
 
 		m_n_features_per_level = encoding_config.value("n_features_per_level", 2u);
+		
+		// Check for vector feature methods (baselarge, densusrface, hashpot)
+		bool is_vector_method = (m_method == "baselarge" || m_method == "densusrface" || m_method == "hashpot");
+		if (is_vector_method) {
+			// Multiply features per level by 3 for vector features (N,F,3)
+			// Ensure result is a valid value: 1, 2, 4, or 8
+			uint32_t vector_features = m_n_features_per_level * 3;
+			if (vector_features > 8) {
+				// If would exceed 8, use 8 (maximum supported)
+				m_n_features_per_level = 8;
+				tlog::info() << "Vector method (" << m_method << "): Clamped n_features_per_level to 8 (max supported)";
+			} else if (vector_features == 3 || vector_features == 5 || vector_features == 6 || vector_features == 7) {
+				// Round up to next valid value (4 or 8)
+				m_n_features_per_level = (vector_features <= 4) ? 4 : 8;
+				tlog::info() << "Vector method (" << m_method << "): Rounded n_features_per_level to " << m_n_features_per_level << " (valid value)";
+			} else {
+				m_n_features_per_level = vector_features;
+				tlog::info() << "Vector method (" << m_method << "): Set n_features_per_level to " << m_n_features_per_level;
+			}
+			encoding_config["n_features_per_level"] = m_n_features_per_level;
+		}
 
 		if (encoding_config.contains("n_features") && encoding_config["n_features"] > 0) {
 			m_n_levels = (uint32_t)encoding_config["n_features"] / m_n_features_per_level;
@@ -4307,10 +4328,11 @@ void Testbed::reset_network(bool clear_density_grid) {
 	size_t n_encoding_params = 0;
 	if (m_testbed_mode == ETestbedMode::Nerf) {
 		// Check for SDF mode before creating the network
+		bool use_sdf = false;
 		const char* sdf_mode_env = std::getenv("NGP_SDF_MODE");
 		if (sdf_mode_env && std::string(sdf_mode_env) == "1") {
-			m_method = "sdf";
-			tlog::info() << "SDF Mode: Detected NGP_SDF_MODE=1, setting method to 'sdf'";
+			use_sdf = true;
+			tlog::info() << "SDF Mode: Detected NGP_SDF_MODE=1, enabling SDF conversion for method: " << m_method;
 		}
 		
 		printf("=== Creating NerfNetwork in reset_network ===\n");
@@ -4340,7 +4362,8 @@ void Testbed::reset_network(bool clear_density_grid) {
 					dir_encoding_config,
 					network_config,
 					rgb_network_config,
-					m_method  // ADD THIS LINE
+					m_method,  // Method (surface, baseline, etc.)
+					use_sdf    // SDF flag
 				)
 			);
 		}
