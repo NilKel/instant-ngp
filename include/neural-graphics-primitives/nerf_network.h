@@ -1482,10 +1482,10 @@ public:
 			// Volume: 16 divergence features + direction encoding (same as surface)
 			m_rgb_network_input_width = next_multiple(16 + m_dir_encoding->padded_output_width(), rgb_alignment);
 		} else if (m_method == "hash_surface") {
-			// hash_surface: n_levels surface features + direction encoding (NO density in RGB input)
+			// hash_surface: n_levels surface features + 1D density + direction encoding
 			uint32_t n_levels = m_pos_encoding->padded_output_width() / 4; // 32 / 4 = 8 levels
-			uint32_t surface_features = n_levels; // 8 hash surface features (no density)
-			m_rgb_network_input_width = next_multiple(surface_features + m_dir_encoding->padded_output_width()+1, rgb_alignment);
+			uint32_t surface_features = n_levels; // 8 hash surface features
+			m_rgb_network_input_width = next_multiple(surface_features + 1 + m_dir_encoding->padded_output_width(), rgb_alignment);
 		} else {
 			// Baseline: density output + direction encoding  
 			m_rgb_network_input_width = next_multiple(m_dir_encoding->padded_output_width() + std::max(16u, m_density_network->padded_output_width()), rgb_alignment);
@@ -1742,8 +1742,19 @@ public:
 				rgb_network_input.layout() == AoS ? rgb_network_input.stride() : 1
 			);
 			
-			// Direction encoding goes after the surface features
-			auto dir_out = rgb_network_input.slice_rows(surface_features, m_dir_encoding->padded_output_width());
+			// Copy density MLP output[0] to RGB input after surface features
+			linear_kernel(extract_density<T>, 0, stream,
+				batch_size,
+				density_network_output.layout() == AoS ? density_network_output.stride() : 1,
+				rgb_network_input.layout() == AoS ? rgb_network_input.stride() : 1,
+				density_network_output.data(),
+				rgb_network_input.data() + (rgb_network_input.layout() == AoS ? surface_features : surface_features * batch_size),
+				m_use_sdf,  // SDF mode flag
+				m_variance_network ? m_variance_network->params() : nullptr  // Variance params
+			);
+			
+			// Direction encoding goes after the surface features + density
+			auto dir_out = rgb_network_input.slice_rows(surface_features + 1, m_dir_encoding->padded_output_width());
 
 			// Encode view directions
 			m_dir_encoding->inference_mixed_precision(
@@ -1929,8 +1940,19 @@ public:
 				hash_surface_features_slice.layout() == AoS ? hash_surface_features_slice.stride() : 1
 			);
 			
-			// Direction encoding goes after the surface features
-			dir_out = forward->rgb_network_input.slice_rows(surface_features, m_dir_encoding->padded_output_width());
+			// Copy density MLP output[0] to RGB input after surface features
+			linear_kernel(extract_density<T>, 0, stream,
+				batch_size,
+				forward->density_network_output.layout() == AoS ? forward->density_network_output.stride() : 1,
+				forward->rgb_network_input.layout() == AoS ? forward->rgb_network_input.stride() : 1,
+				forward->density_network_output.data(),
+				forward->rgb_network_input.data() + (forward->rgb_network_input.layout() == AoS ? surface_features : surface_features * batch_size),
+				m_use_sdf,  // SDF mode flag
+				m_variance_network ? m_variance_network->params() : nullptr  // Variance params
+			);
+			
+			// Direction encoding goes after the surface features + density
+			dir_out = forward->rgb_network_input.slice_rows(surface_features + 1, m_dir_encoding->padded_output_width());
 		} else {
 			// Baseline mode (including SDF mode - use same pattern)
 			forward->density_network_output = forward->rgb_network_input.slice_rows(0, m_density_network->padded_output_width());
@@ -2074,7 +2096,7 @@ public:
 			} else if (m_method == "hash_surface") {
 				uint32_t n_levels = m_pos_encoding->padded_output_width() / 4; // Dynamic levels calculation
 				uint32_t surface_features = n_levels; // n_levels hash surface features (no density)
-				dL_ddir_encoding_output = dL_drgb_network_input.slice_rows(surface_features, m_dir_encoding->padded_output_width());
+				dL_ddir_encoding_output = dL_drgb_network_input.slice_rows(surface_features + 1, m_dir_encoding->padded_output_width());
 			} else {
 				dL_ddir_encoding_output = dL_drgb_network_input.slice_rows(m_density_network->padded_output_width(), m_dir_encoding->padded_output_width());
 			}
@@ -2319,6 +2341,14 @@ public:
 				dL_dhash_surface_slice.layout() == AoS ? dL_dhash_surface_slice.stride() : 1,
 				dL_dhash_features.data(), // Output: gradients w.r.t. hash features (n_levels * 4)
 				dL_dnormals.data() // Output: gradients w.r.t. normals (3D)
+			);
+
+			// Extract gradient w.r.t. density from RGB input and accumulate to density MLP output
+			auto dL_ddensity_from_rgb = dL_drgb_network_input.slice_rows(surface_features, 1);
+			linear_kernel(add_to_buffer_kernel<T>, 0, stream,
+				batch_size,
+				dL_ddensity_from_rgb.data(),
+				dL_ddensity_network_output.data()
 			);
 
 
