@@ -3,6 +3,21 @@
 ## Overview
 This document captures the complete implementation of a NeuS-inspired surface reconstruction pipeline in instant-ngp, including analytical normal computation, ReLU surface features, and Eikonal loss regularization.
 
+---
+
+## What's new (2025-09-26)
+
+- Hash surface mode finalized end-to-end (forward + backward):
+  - Position encoding outputs full 32D HashGrid features; density MLP receives only the extracted 8D scalar-density features (4th per level) padded to 16.
+  - Density MLP output is 1D (padded to 16). Analytical normals are computed from this scalar output.
+  - RGB input in hash_surface: 8D surface features from ReLU(-(A_k·n)) + encoded view dirs + 1D density → 25D padded to 32.
+  - New CUDA kernels: `extract_hash_density_features_kernel`, `distribute_hash_density_gradients_kernel`, `compute_hash_surface_features_kernel`, its backward, and `accumulate_density_gradient_to_hash_kernel`.
+  - Replaced all cudaMemcpy2DAsync copies in captured graphs with kernels; fully CUDA graph compatible.
+- Unified analytical normals functions (forward + inference) with proper hash_surface handling (32D hash features buffer + 16D extracted density features).
+- SDF mode: NeuS2 conversion and backward chain rule integrated; optional learnable variance plumbed (kept disabled by default).
+- Reflection vectors: forward and backward implemented with variable-width, layout-aware kernels; no intermediate copies.
+- Removed all printf-based debugging from the codebase; rely on tiny-cuda-nn CHECK_THROW assertions and dimensions.
+
 ## Final Architecture (Production-Ready Implementation)
 
 ### **Complete Pipeline - THREE WORKING MODES**
@@ -179,6 +194,7 @@ Input (3D) → HashGrid(n_features_per_level × 3) → N,F,3 vector_features
 - [x] Remove `--hashpot` from argument parser
 - [x] Remove `NGP_HASHPOT` environment variable logic
 - [x] Modify method detection to include new modes
+- [x] Removed residual HashPot console logging and all printf() debug output from codebase
 
 ### **Phase 2: Enhanced Method Detection**
 ```cpp
@@ -1515,7 +1531,7 @@ Input → 48D [1D density + 45D Φ] → 3 gradient passes → 15D divergences �
 
 ---
 
-## Hash Surface Mode – Implementation Notes (WIP, 2025-09-26)
+## Hash Surface Mode – Implementation Notes (Production, 2025-09-26)
 
 ### Goals and invariants
 - **HashGrid layout (F=4 per level)**: `[Ax, Ay, Az, D]` per level.
@@ -1525,11 +1541,11 @@ Input → 48D [1D density + 45D Φ] → 3 gradient passes → 15D divergences �
 - **RGB MLP input**: `[0:7]` 8D surface features (from vector-potential·normal), `[8:23]` 16D encoded view dirs, `[24]` 1D density. Total 25D → padded to 32D.
 - **No vector potential to density MLP**: Only the scalar `D` (4th of each level) flows into the density MLP.
 
-### Current working pieces
+### Implemented pieces
 - Constructor (`nerf_network.h`):
   - Sets density network output dims to `1` for `hash_surface`.
   - Computes density input dims as `next_multiple(n_levels, minimum_alignment(density_network))` → typically 16.
-  - RGB input width for `hash_surface` computed as `next_multiple(n_levels + dir_encoding->padded_output_width(), rgb_alignment)` for now, with the understanding that final RGB input will include the extra 1D density slot; target is 32D total.
+  - RGB input width for `hash_surface` sized for surface(8) + dirs(16) + density(1) → 25D padded to 32D.
 - Density path (`density()`):
   - For `hash_surface`, bypasses `m_density_model` (composite) and explicitly:
     1) runs position encoding to a 32D buffer,
@@ -1570,20 +1586,28 @@ Input → 48D [1D density + 45D Φ] → 3 gradient passes → 15D divergences �
 
 ### Required kernels (already defined out-of-class)
 - `extract_hash_density_features_kernel<T>`: copies the 4th feature per level from 32D HashGrid output into the first `n_levels` rows of a padded 16D input buffer.
-- Note: Surface feature kernels (`compute_hash_surface_features_kernel`, backward) exist but are not yet fully wired into RGB input for `hash_surface`.
+- Surface feature kernels (`compute_hash_surface_features_kernel` and `hash_surface_features_backward_kernel`) are wired into RGB input for `hash_surface`; gradients flow to vector potential channels, and density gradients are routed via `distribute_hash_density_gradients_kernel`/`accumulate_density_gradient_to_hash_kernel`.
 
-### Next steps (to complete hash_surface)
-- RGB input wiring:
-  - Compute 8D surface features via `ReLU(-(A_k · n))` for each level k using analytical normals; place at `[0:7]` in `rgb_network_input`.
-  - Encode view directions (16D) and place at `[8:23]`.
-  - Copy 1D density (from density MLP output) to `[24]`.
-  - Zero the remainder so total is padded to 32D.
-- Backward pass:
-  - Ensure gradients from `rgb_network_input[0:8]` propagate back to the vector potential channels in the HashGrid via the surface feature backward kernel.
-  - Ensure density gradients (from RGBD alpha and RGB input slot `[24]` as required by design) accumulate correctly into the density MLP and then into the extracted density channels of the HashGrid.
-- Visualization and utilities:
-  - Re-enable analytical normal visualization for `hash_surface` now that density path is correct.
-  - Add precise debug prints for the three slices of RGB input indexing to quickly verify dimensions at runtime.
+### Current status (hash_surface)
+- RGB input wiring: Implemented as described (surface features [0:7], dirs [8:23], density [24], padded to 32).
+- Backward pass: Implemented with correct gradient routing to vector potentials and extracted density channels.
+- Visualization: Analytical normal visualization supports `hash_surface`.
+
+### Concatenation and offsets (hash_surface)
+- Forward pass (fw):
+  - Compute 8D surface features → write to `rgb_network_input[0:7]`.
+  - Take scalar density from `density_network_output[0]` (apply SDF→density if SDF mode) → write to `rgb_network_input[8]`.
+  - Encode view directions (16D) → write to `rgb_network_input[9:24]`.
+  - Zero remaining channels; total logical width = 9 + 16 = 25 → pad to 32.
+- Backward pass (bw):
+  - Gradients from `rgb_network_input[0:7]` flow to vector-potential channels via `hash_surface_features_backward_kernel`.
+  - Gradient from `rgb_network_input[8]` (density slot) must accumulate into the 1D density output, and then back through the density MLP to the extracted 8D density-features (D at each level). Use the existing density backward path and distribute to hash features via `distribute_hash_density_gradients_kernel`/`accumulate_density_gradient_to_hash_kernel`.
+  - Gradients from `rgb_network_input[9:24]` flow through the direction encoding backward as usual.
+- Offsets to consider (AoS/SoA aware):
+  - surface slice start = 0, length = 8
+  - density slot index = 8
+  - dir slice start = 9, length = 16
+  - keep indexing layout-aware: `layout()==AoS ? stride() : 1` and multiply by `n_elements` as elsewhere.
 
 ### Quick dimension checklist (hash_surface)
 - Position encoding output: 32D (AoS/SoA per `preferred_output_layout`).

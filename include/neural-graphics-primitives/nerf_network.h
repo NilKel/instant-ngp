@@ -1419,17 +1419,10 @@ public:
 	using json = nlohmann::json;
 
 	NerfNetwork(uint32_t n_pos_dims, uint32_t n_dir_dims, uint32_t n_extra_dims, uint32_t dir_offset, const json& pos_encoding, const json& dir_encoding, const json& density_network, const json& rgb_network, const std::string& method = "baseline", bool use_sdf = false) : m_n_pos_dims{n_pos_dims}, m_n_dir_dims{n_dir_dims}, m_dir_offset{dir_offset}, m_n_extra_dims{n_extra_dims}, m_method{method}, m_use_sdf{use_sdf} {
-		printf("=== NerfNetwork Constructor ===\n");
-		printf("Method: %s\n", m_method.c_str());
-		printf("Use SDF: %s\n", m_use_sdf ? "true" : "false");
-		printf("n_pos_dims: %d, n_dir_dims: %d\n", n_pos_dims, n_dir_dims);
 		
 		// Check for HashPot vector features mode
 		const char* hashpot_env = std::getenv("NGP_HASHPOT");
 		m_hashpot_mode = (hashpot_env && std::string(hashpot_env) == "1");
-		if (m_hashpot_mode) {
-			printf("HashPot mode: Enabled vector features mode\n");
-		}
 		
 		m_pos_encoding.reset(create_encoding<T>(n_pos_dims, pos_encoding, density_network.contains("otype") && (equals_case_insensitive(density_network["otype"], "FullyFusedMLP") || equals_case_insensitive(density_network["otype"], "MegakernelMLP")) ? 16u : 8u));
 		uint32_t rgb_alignment = minimum_alignment(rgb_network);
@@ -1438,12 +1431,6 @@ public:
 		// Variance parameter is now integrated into the density network output
 		// Channel 1 of density network will contain the learnable variance parameter
 
-		printf("pos_encoding->padded_output_width(): %d\n", m_pos_encoding->padded_output_width());
-		printf("pos_encoding->preferred_output_layout(): %d\n", (int)m_pos_encoding->preferred_output_layout());
-		printf("dir_encoding->padded_output_width(): %d\n", m_dir_encoding->padded_output_width());
-		printf("dir_encoding->preferred_output_layout(): %d\n", (int)m_dir_encoding->preferred_output_layout());
-		printf("rgb_alignment: %d\n", rgb_alignment);
-
 		json local_density_network_config = density_network;
 		
 		// HashPot mode: encoding output is 3x larger (conceptually N,F,3 vectors)
@@ -1451,8 +1438,6 @@ public:
 		uint32_t density_input_dims = m_pos_encoding->padded_output_width();
 		if (m_hashpot_mode) {
 			uint32_t encoding_output_width = m_pos_encoding->padded_output_width();
-			printf("HashPot mode: Encoding output width: %d (conceptually %d vector features x 3)\n", 
-				encoding_output_width, encoding_output_width / 3);
 		} else if (m_method == "hash_surface") {
 			// hash_surface: Density MLP takes extracted density features (n_levels)
 			// With 4 features per level and 8 levels: 32 total features, extract 8 density features
@@ -1463,10 +1448,6 @@ public:
 			uint32_t padded_density_input_dims = next_multiple(n_levels, density_alignment);
 			
 			density_input_dims = padded_density_input_dims; // Use padded dimensions
-			printf("hash_surface mode: Encoding output width: %d -> density input dims: %d -> padded to %d (alignment=%d)\n", 
-				m_pos_encoding->padded_output_width(), n_levels, density_input_dims, density_alignment);
-		} else {
-			printf("Normal mode: Encoding output width: %d (scalar features)\n", density_input_dims);
 		}
 		
 		local_density_network_config["n_input_dims"] = density_input_dims;
@@ -1474,75 +1455,40 @@ public:
 			if (m_method == "surface" || m_method == "surface_normal" || m_method == "surface_reflect" || m_method == "volume") {
 				// 48D: 1D density + 45D Φ features (15 x 3D vectors) for surface or volume features
 				local_density_network_config["n_output_dims"] = 48;
-				printf("%s mode: Set density network output dims to 48 (1D density + 45D Phi)\n", m_method.c_str());
 			} else if (m_method == "hash_surface") {
 				// hash_surface: Density MLP takes n_levels density features and outputs 1D density
 				local_density_network_config["n_output_dims"] = 1;
-				printf("hash_surface mode: Set density network output dims to 1 (density only)\n");
 			} else if (m_use_sdf) {
 				// SDF mode: 1D SDF in channel 0, rest can be features for color
 				local_density_network_config["n_output_dims"] = 16;
-				printf("SDF mode: Set density network output dims to 16 (1D SDF + 15D features)\n");
 			} else {
 				local_density_network_config["n_output_dims"] = 16;
-				printf("Baseline mode: Set density network output dims to 16\n");
 			}
 		}
 		m_density_network.reset(create_network<T>(local_density_network_config));
-
-		printf("density_network->padded_output_width(): %d\n", m_density_network->padded_output_width());
-		printf("density_network->input_width(): %d\n", m_density_network->input_width());
 
 		if (m_method == "surface_normal") {
 			// Surface_normal: 16 surface features + encoded view dirs + encoded normals
 			uint32_t total_before_padding = 16 + m_dir_encoding->padded_output_width() + m_dir_encoding->padded_output_width();
 			m_rgb_network_input_width = next_multiple(total_before_padding, rgb_alignment);
-			printf("Surface_normal mode RGB input calculation: 16 + %d + %d = %d -> next_multiple(..., %d) = %d\n", 
-				m_dir_encoding->padded_output_width(), 
-				m_dir_encoding->padded_output_width(),
-				total_before_padding, rgb_alignment, m_rgb_network_input_width);
-			printf("Surface_normal buffer layout: [0:15] surface_features, [16:%d] dir_encoding, [%d:%d] normal_encoding\n",
-				15 + m_dir_encoding->padded_output_width(), 16 + m_dir_encoding->padded_output_width(), 
-				15 + m_dir_encoding->padded_output_width() + m_dir_encoding->padded_output_width());
 		} else if (m_method == "surface_reflect") {
 			// Surface_reflect: 16 surface features + encoded view dirs + encoded reflection vectors
 			uint32_t total_before_padding = 16 + m_dir_encoding->padded_output_width() + m_dir_encoding->padded_output_width();
 			m_rgb_network_input_width = next_multiple(total_before_padding, rgb_alignment);
-			printf("Surface_reflect mode RGB input calculation: 16 + %d + %d = %d -> next_multiple(..., %d) = %d\n", 
-				m_dir_encoding->padded_output_width(), 
-				m_dir_encoding->padded_output_width(),
-				total_before_padding, rgb_alignment, m_rgb_network_input_width);
-			printf("Surface_reflect buffer layout: [0:15] surface_features, [16:%d] dir_encoding, [%d:%d] reflection_encoding\n",
-				15 + m_dir_encoding->padded_output_width(), 16 + m_dir_encoding->padded_output_width(), 
-				15 + m_dir_encoding->padded_output_width() + m_dir_encoding->padded_output_width());
 		} else if (m_method == "surface") {
 			// Surface: 16 surface features + direction encoding
 			m_rgb_network_input_width = next_multiple(16 + m_dir_encoding->padded_output_width(), rgb_alignment);
-			printf("Surface mode RGB input calculation: 16 + %d = %d -> next_multiple(..., %d) = %d\n", 
-				m_dir_encoding->padded_output_width(), 16 + m_dir_encoding->padded_output_width(), 
-				rgb_alignment, m_rgb_network_input_width);
 		} else if (m_method == "volume") {
 			// Volume: 16 divergence features + direction encoding (same as surface)
 			m_rgb_network_input_width = next_multiple(16 + m_dir_encoding->padded_output_width(), rgb_alignment);
-			printf("Volume mode RGB input calculation: 16 + %d = %d -> next_multiple(..., %d) = %d\n", 
-				m_dir_encoding->padded_output_width(), 16 + m_dir_encoding->padded_output_width(), 
-				rgb_alignment, m_rgb_network_input_width);
 		} else if (m_method == "hash_surface") {
 			// hash_surface: n_levels surface features + direction encoding (NO density in RGB input)
 			uint32_t n_levels = m_pos_encoding->padded_output_width() / 4; // 32 / 4 = 8 levels
 			uint32_t surface_features = n_levels; // 8 hash surface features (no density)
 			m_rgb_network_input_width = next_multiple(surface_features + m_dir_encoding->padded_output_width()+1, rgb_alignment);
-			printf("hash_surface mode RGB input calculation: %d + %d = %d -> next_multiple(..., %d) = %d\n", 
-				surface_features, m_dir_encoding->padded_output_width(), surface_features + m_dir_encoding->padded_output_width()+1, 
-				rgb_alignment, m_rgb_network_input_width);
 		} else {
 			// Baseline: density output + direction encoding  
 			m_rgb_network_input_width = next_multiple(m_dir_encoding->padded_output_width() + std::max(16u, m_density_network->padded_output_width()), rgb_alignment);
-			printf("Baseline mode RGB input calculation: %d + max(16, %d) = %d + %d = %d -> next_multiple(..., %d) = %d\n",
-				m_dir_encoding->padded_output_width(), m_density_network->padded_output_width(),
-				m_dir_encoding->padded_output_width(), std::max(16u, m_density_network->padded_output_width()),
-				m_dir_encoding->padded_output_width() + std::max(16u, m_density_network->padded_output_width()),
-				rgb_alignment, m_rgb_network_input_width);
 		}
 
 		json local_rgb_network_config = rgb_network;
@@ -1550,17 +1496,13 @@ public:
 		local_rgb_network_config["n_output_dims"] = 3;
 		m_rgb_network.reset(create_network<T>(local_rgb_network_config));
 
-		printf("RGB network input_width: %d, output_width: %d\n", m_rgb_network_input_width, 3);
-
 		// Initialize variance network for SDF mode
 		if (m_use_sdf) {
 			std::array<int, 1> resolution{1};
 			m_variance_network = std::make_shared<TrainableBuffer<1, 1, T>>(resolution);
-			printf("SDF mode: Created variance network successfully, n_params=%zu\n", 
-				m_variance_network->n_params());
 		}
 
-		printf("=== End NerfNetwork Constructor ===\n");
+
 		m_density_model = std::make_shared<NetworkWithInputEncoding<T>>(m_pos_encoding, m_density_network);
 	}
 
@@ -1579,7 +1521,7 @@ public:
 	void inference_mixed_precision_impl(cudaStream_t stream, const GPUMatrixDynamic<float>& input, GPUMatrixDynamic<T>& output, bool use_inference_params = true) override {
 		uint32_t batch_size = input.n();
 		GPUMatrixDynamic<T> density_network_input;
-		printf("DEBUG: *** inference_mixed_precision_impl ENTRY *** method='%s', batch_size=%d\n", m_method.c_str(), batch_size);
+
 		
 		// For hash_surface, we need separate matrices for hash features and density features
 		GPUMatrixDynamic<T> hash_features_matrix;
@@ -1634,20 +1576,14 @@ public:
 			);
 		}
 
-		printf("DEBUG: inference branch check - m_method = '%s'\n", m_method.c_str());
-		printf("DEBUG: About to call density network - checking which branch we take\n");
+
 		if (m_method == "hash_surface") {
-			printf("DEBUG: TAKING HASH_SURFACE BRANCH!\n");
+
 			// hash_surface: Extract density features from hash interpolation, then pass to density MLP
 			uint32_t n_levels = m_pos_encoding->padded_output_width() / 4; // Dynamic levels calculation
 			
-			printf("DEBUG hash_surface inference START: batch_size=%d, n_levels=%d\n", 
-				batch_size, n_levels);
-			printf("DEBUG hash_surface inference: hash_features_matrix dimensions: %d x %d\n", 
-				hash_features_matrix.m(), hash_features_matrix.n());
-			printf("DEBUG hash_surface inference: density_network_input dimensions: %d x %d\n", 
-				density_network_input.m(), density_network_input.n());
-			printf("DEBUG hash_surface inference: density_network->input_width(): %d\n", m_density_network->input_width());
+
+
 			
 			// Clear the density_network_input matrix (set to zero for padding)
 			CUDA_CHECK_THROW(cudaMemsetAsync(density_network_input.data(), 0, density_network_input.n_bytes(), stream));
@@ -1664,18 +1600,9 @@ public:
 			);
 			
 			// Pass density_network_input (8D features + padding) to density MLP
-			printf("DEBUG hash_surface inference: About to call density MLP with density_network_input: %d x %d\n", 
-				density_network_input.m(), density_network_input.n());
-			printf("DEBUG hash_surface inference: density_network expects input_width: %d\n", m_density_network->input_width());
-			printf("DEBUG hash_surface inference: density_network_output.m() = %d, density_network_output.n() = %d\n", 
-				density_network_output.m(), density_network_output.n());
 			
 			m_density_network->inference_mixed_precision(stream, density_network_input, density_network_output, use_inference_params);
 		} else {
-			printf("DEBUG: TAKING ELSE BRANCH! method='%s'\n", m_method.c_str());
-			printf("DEBUG: Taking ELSE branch with method='%s', density_network_input dimensions: %d x %d, expected: %d\n", 
-				m_method.c_str(), density_network_input.m(), density_network_input.n(), m_density_network->input_width());
-			printf("DEBUG: About to call density network in ELSE branch\n");
 			m_density_network->inference_mixed_precision(stream, density_network_input, density_network_output, use_inference_params);
 		}
 
@@ -1794,7 +1721,7 @@ public:
 			
 		} else if (m_method == "hash_surface") {
 			// hash_surface mode: Compute analytical normals from density MLP output, then compute surface features
-			printf("DEBUG: ANALYTICAL NORMALS INF\n");
+
 			// Compute analytical normals from density MLP output (1D density)
 			GPUMatrixDynamic<float> analytical_normals = compute_analytical_normals_inference_unified(
 				stream, batch_size, input, density_network_input, density_network_output, use_inference_params
@@ -1817,8 +1744,7 @@ public:
 			
 			// Direction encoding goes after the surface features
 			auto dir_out = rgb_network_input.slice_rows(surface_features, m_dir_encoding->padded_output_width());
-			printf("DEBUG: dir_out.n() = %d\n", dir_out.n());
-			printf("DEBUG: dir_out.m() = %d\n", dir_out.m());	
+
 			// Encode view directions
 			m_dir_encoding->inference_mixed_precision(
 				stream,
@@ -1865,7 +1791,6 @@ public:
 
 	std::unique_ptr<Context> forward_impl(cudaStream_t stream, const GPUMatrixDynamic<float>& input, GPUMatrixDynamic<T>* output = nullptr, bool use_inference_params = false, bool prepare_input_gradients = false) override {
 		uint32_t batch_size = input.n();
-		printf("DEBUG: forward_impl ENTRY method='%s', batch_size=%d\n", m_method.c_str(), batch_size);
 		auto forward = std::make_unique<ForwardContext>();
 		GPUMatrixDynamic<T> density_network_input;
 		if (m_method == "hash_surface") {
@@ -1956,11 +1881,7 @@ public:
 			uint32_t n_levels = m_pos_encoding->padded_output_width() / 4; // 32 / 4 = 8 levels
 			uint32_t padded_density_input_width = m_density_network->input_width(); // Use actual network input width (should be 16)
 			
-			printf("DEBUG hash_surface forward START: batch_size=%d, n_levels=%d, padded_width=%d\n", 
-				batch_size, n_levels, padded_density_input_width);
-			printf("DEBUG hash_surface forward: density_network_input dimensions: %d x %d\n", 
-				forward->density_network_input.m(), forward->density_network_input.n());
-			printf("DEBUG hash_surface forward: density_network->input_width(): %d\n", m_density_network->input_width());
+
 			
 			// Create padded matrix for density features
 			GPUMatrixDynamic<T> padded_density_features{padded_density_input_width, batch_size, stream, forward->density_network_input.layout()};
@@ -1968,8 +1889,7 @@ public:
 			// Clear the matrix (set to zero)
 			CUDA_CHECK_THROW(cudaMemsetAsync(padded_density_features.data(), 0, padded_density_features.n_bytes(), stream));
 			
-			printf("DEBUG hash_surface forward: padded_density_features dimensions: %d x %d\n", 
-				padded_density_features.m(), padded_density_features.n());
+
 			
 			// Extract density features to first n_levels rows (every 4th feature from hash interpolation)
 			linear_kernel(extract_hash_density_features_kernel<T>, 0, stream,
@@ -1986,11 +1906,7 @@ public:
 			forward->density_network_output = GPUMatrixDynamic<T>{m_density_network->padded_output_width(), batch_size, stream, AoS};
 			
 			// Pass padded density features to density MLP
-			printf("DEBUG hash_surface forward: About to call density MLP with padded_density_features: %d x %d\n", 
-				padded_density_features.m(), padded_density_features.n());
-			printf("DEBUG hash_surface forward: density_network expects input_width: %d\n", m_density_network->input_width());
-			printf("padded_density_features.n() = %d\n", padded_density_features.n());
-			printf("padded_density_features.m() = %d\n", padded_density_features.m());
+			
 			forward->density_network_ctx = m_density_network->forward(stream, padded_density_features, &forward->density_network_output, use_inference_params, true);
 			
 			// Compute analytical normals from density MLP output
@@ -2021,7 +1937,7 @@ public:
 			dir_out = forward->rgb_network_input.slice_rows(m_density_network->padded_output_width(), m_dir_encoding->padded_output_width());
 			forward->density_network_ctx = m_density_network->forward(stream, forward->density_network_input, &forward->density_network_output, use_inference_params, false);
 		}
-		printf("DEBUG: starting dir encoding fw :\n");
+
 		forward->dir_encoding_ctx = m_dir_encoding->forward(
 			stream,
 			input.slice_rows(m_dir_offset, m_dir_encoding->input_width()),
@@ -2095,16 +2011,10 @@ public:
 		}
 		
 		
-		printf("DEBUG: RGB network fw :\n");
-		printf("forward->rgb_network_input.m() = %d\n", forward->rgb_network_input.m());
-		printf("forward->rgb_network_input.n() = %d\n", forward->rgb_network_input.n());
-		printf("forward->rgb_network_output.m() = %d\n", forward->rgb_network_output.m());
-		printf("forward->rgb_network_output.n() = %d\n", forward->rgb_network_output.n());
-		printf("output->m() = %d\n", output->m());
-		printf("output->n() = %d\n", output->n());
+
 		
 		forward->rgb_network_ctx = m_rgb_network->forward(stream, forward->rgb_network_input, output ? &forward->rgb_network_output : nullptr, use_inference_params, prepare_input_gradients);
-		printf("DEBUG: RGB network fw END\n");
+
 		
 
 		if (output) {
@@ -2139,7 +2049,7 @@ public:
 		
 		GPUMatrix<T> dL_drgb{m_rgb_network->padded_output_width(), batch_size, stream};
 		CUDA_CHECK_THROW(cudaMemsetAsync(dL_drgb.data(), 0, dL_drgb.n_bytes(), stream));
-		printf("BDEBUG: extract_rgb\n");
+
 		linear_kernel(extract_rgb<T>, 0, stream,
 			batch_size*3, dL_drgb.m(), dL_doutput.m(), dL_doutput.data(), dL_drgb.data()
 		);
@@ -2184,7 +2094,7 @@ public:
 			} else {
 				dir_encoding_forward_output = forward.rgb_network_input.slice_rows(m_density_network->padded_output_width(), m_dir_encoding->padded_output_width());
 			}
-			printf("BDEBUG: dir_encoding_backward\n");
+
 			m_dir_encoding->backward(
 				stream,
 				*forward.dir_encoding_ctx,
@@ -2397,7 +2307,7 @@ public:
 			CUDA_CHECK_THROW(cudaMemsetAsync(dL_dnormals.data(), 0, dL_dnormals.n_bytes(), stream));
 			
 			// Backward through hash surface features computation
-			printf("BDEBUG: hash_surface_features_backward_kernel\n");
+
 			linear_kernel(hash_surface_features_backward_kernel<T>, 0, stream,
 				batch_size,
 				n_levels, // Dynamic number of levels
@@ -2410,9 +2320,9 @@ public:
 				dL_dhash_features.data(), // Output: gradients w.r.t. hash features (n_levels * 4)
 				dL_dnormals.data() // Output: gradients w.r.t. normals (3D)
 			);
-			printf("BDEBUG: hash_surface_features_backward_kernel END\n");
 
-			printf("BDEBUG: accumulate_analytical_normal_gradients\n");
+
+
 			// Backpropagate gradients through analytical normals to density network parameters
 			accumulate_analytical_normal_gradients(
 				stream, batch_size, input, forward, dL_dnormals,
@@ -2427,7 +2337,7 @@ public:
 			// Extract density features again for backward pass
 			GPUMatrixDynamic<T> extracted_density_features{extracted_density_features_size, batch_size, stream, forward.density_network_input.layout()};
 			CUDA_CHECK_THROW(cudaMemsetAsync(extracted_density_features.data(), 0, extracted_density_features.n_bytes(), stream));
-			printf("BDEBUG: extract_hash_density_features_kernel\n");
+
 			linear_kernel(extract_hash_density_features_kernel<T>, 0, stream,
 				batch_size,
 				n_levels,
@@ -2439,14 +2349,7 @@ public:
 			);
 			
 			// Backward through density MLP
-			printf("BDEBUG: density_network_backward\n");
-			printf("dL_ddensity_network_output.m() = %d\n", dL_ddensity_network_output.m());
-			printf("dL_ddensity_network_output.n() = %d\n", dL_ddensity_network_output.n());
-			printf("forward.density_network_output.m() = %d\n", forward.density_network_output.m());
-			printf("forward.density_network_output.n() = %d\n", forward.density_network_output.n());
-			printf("dL_dextracted_density_features.m() = %d\n", dL_dextracted_density_features.m());
-			printf("dL_dextracted_density_features.n() = %d\n", dL_dextracted_density_features.n());
-			printf("use_inference_params = %d\n", use_inference_params);
+			
 			m_density_network->backward(
 				stream,
 				*forward.density_network_ctx,
@@ -2457,7 +2360,7 @@ public:
 				use_inference_params,
 				param_gradients_mode
 			);
-			printf("BDEBUG: density_network_backward END\n");
+
 			// Accumulate gradients from extracted density features back to hash features (every 4th feature)
 			for (uint32_t level = 0; level < n_levels; ++level) {
 				linear_kernel(accumulate_density_gradient_to_hash_kernel<T>, 0, stream,
@@ -2478,7 +2381,7 @@ public:
 				if (dL_dinput) {
 					dL_dpos_encoding_input = dL_dinput->slice_rows(0, m_pos_encoding->input_width());
 				}
-				printf("BDEBUG: pos_encoding_backward\n");
+				
 				m_pos_encoding->backward(
 					stream,
 					*forward.pos_encoding_ctx,
@@ -2535,7 +2438,7 @@ public:
 		// 		dL_ddensity_network_output.data()
 		// 	);
 		// }
-		printf("BDEBUG: add_density_gradient\n");
+		
 		linear_kernel(add_density_gradient<T>, 0, stream,
 				batch_size,
 				dL_doutput.layout() == AoS ? dL_doutput.stride() : 1,
@@ -2561,7 +2464,7 @@ public:
 		if (dL_dinput) {
 			dL_dpos_encoding_input = dL_dinput->slice_rows(0, m_pos_encoding->input_width());
 		}
-		printf("BDEBUG: pos_encoding_backward\n");
+		
 			m_pos_encoding->backward(
 				stream,
 				*forward.pos_encoding_ctx,
@@ -2902,7 +2805,7 @@ public:
 				use_inference_params,
 				true  // prepare_input_gradients
 			);
-			printf("DEBUG: POS ENCODING FORWARD\n");
+			
 			// Create temporary padded density input and extract features
 			temp_density_input = GPUMatrixDynamic<T>{m_density_network->input_width(), batch_size, stream, density_network_input.layout()};
 			CUDA_CHECK_THROW(cudaMemsetAsync(temp_density_input.data(), 0, temp_density_input.n_bytes(), stream));
@@ -2918,11 +2821,7 @@ public:
 				temp_density_input.data(),
 				temp_density_input.layout() == AoS ? temp_density_input.stride() : 1
 			);
-			printf("DEBUG: EXTRACTS NORMAL DENSITY INPUT\n");
-			printf("DEBUG: temp_density_input.n() = %d\n", temp_density_input.n());
-			printf("DEBUG: temp_density_input.m() = %d\n", temp_density_input.m());
-			printf("DEBUG: density_network_output.n() = %d\n", density_network_output.n());
-			printf("DEBUG: density_network_output.m() = %d\n", density_network_output.m());
+			
 			// Density network forward with extracted features
 			temp_density_ctx = m_density_network->forward(
 				stream,
@@ -2940,7 +2839,7 @@ public:
 				use_inference_params,
 				true  // prepare_input_gradients
 			);
-			printf("GETS TO HERE\n");
+			
 			temp_density_ctx = m_density_network->forward(
 				stream,
 				density_network_input,
@@ -2966,13 +2865,8 @@ public:
 			// For hash_surface, we need to handle the gradient flow differently
 			// Create gradient buffer for the extracted density features (16D)
 			GPUMatrixDynamic<T> dL_dextracted_density{m_density_network->input_width(), batch_size, stream, density_network_input.layout()};
-			printf("DEBUG: dL_dextracted_density.n() = %d\n", dL_dextracted_density.n());
-			printf("DEBUG: dL_dextracted_density.m() = %d\n", dL_dextracted_density.m());
-			printf("DEBUG: temp_density_input.n() = %d\n", temp_density_input.n());
-			printf("DEBUG: temp_density_input.m() = %d\n", temp_density_input.m());
-			printf("DEBUG: density_network_output.n() = %d\n", density_network_output.n());
-			printf("DEBUG: density_network_output.m() = %d\n", density_network_output.m());
-			printf("DEBUG: dL_dsdf_seed.n() = %d\n", dL_dsdf_seed.n());
+			
+			
 			// Backward through density network (16D input/output)
 			m_density_network->backward(
 				stream, 
@@ -3003,13 +2897,7 @@ public:
 				dL_dhash_features.data(), // Target: gradients to hash features
 				dL_dhash_features.layout() == AoS ? dL_dhash_features.stride() : 1
 			);
-			printf("DEBUG: dL_dhash_features.n() = %d\n", dL_dhash_features.n());
-			printf("DEBUG: dL_dhash_features.m() = %d\n", dL_dhash_features.m());
-			printf("DEBUG: temp_hash_features.n() = %d\n", temp_hash_features.n());
-			printf("DEBUG: temp_hash_features.m() = %d\n", temp_hash_features.m());
-			printf("DEBUG: input.n() = %d\n", input.n());
-			printf("DEBUG: input.m() = %d\n", input.m());
-			printf("DEBUG: m_pos_encoding->input_width() = %d\n", m_pos_encoding->input_width());
+			
 			// Backward through position encoding with full 32D gradients
 			m_pos_encoding->backward(
 				stream,
@@ -3355,9 +3243,7 @@ public:
 		}
 
 		uint32_t batch_size = output.n();
-		printf("DEBUG: About to call density network in density method\n");
-		printf("DEBUG: output.n() = %d\n", output.n());
-		printf("DEBUG: output.m() = %d\n", output.m());
+		
 		if (m_method == "hash_surface") {
 			// For hash_surface: position encoding → extract density features → density network
 			GPUMatrixDynamic<T> hash_features{m_pos_encoding->padded_output_width(), batch_size, stream, input.layout()};
@@ -3382,8 +3268,7 @@ public:
 				padded_density_features.data(),
 				padded_density_features.layout() == AoS ? padded_density_features.stride() : 1
 			);
-			printf("DEBUG: padded_density_features.n() = %d\n", padded_density_features.n());
-			printf("DEBUG: padded_density_features.m() = %d\n", padded_density_features.m());
+			
 			// Step 3: Pass padded density features to density network
 			m_density_network->inference_mixed_precision(stream, padded_density_features, output, use_inference_params);
 		} else {
@@ -3431,7 +3316,7 @@ public:
 		if (m_variance_network) {
 			m_variance_network->initialize_params(rnd, params_full_precision, scale);
 			params_full_precision += m_variance_network->n_params();
-			printf("SDF/Surface mode: Initialized variance parameter (randomly initialized)\n");
+			
 		}
 	}
 
@@ -3532,7 +3417,7 @@ public:
 		const GPUMatrixDynamic<float>& input,
 		bool use_inference_params = true
 	) {
-		printf("DEBUG: About to call get_analytical_normals_for_visualization method\n");
+		
 		if (m_method != "surface" && m_method != "surface_normal" && m_method != "surface_reflect" && m_method != "hash_surface") {
 			throw std::runtime_error("Analytical normals only available for surface methods");
 		}
@@ -3627,7 +3512,7 @@ public:
 			}
 		}
 		
-		printf("Surface method: Computed analytical normals for visualization (batch_size=%d)\n", batch_size);
+		
 	}
 
 	// Variance monitoring functions for debugging and optimization
