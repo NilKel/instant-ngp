@@ -1154,7 +1154,27 @@ public:
 		}
 	}
 
-	// Helper function to compute analytical normals during forward pass (NeuS2 pattern) - UNIFIED
+	/**
+	 * @brief Computes analytical normals during forward pass using automatic differentiation.
+	 * 
+	 * Uses the chain rule to compute ∇SDF (gradients of SDF w.r.t. position) by:
+	 * 1. Seeding gradients at SDF output (channel 0 = 1.0)
+	 * 2. Backpropagating through density network
+	 * 3. Backpropagating through position encoding
+	 * 
+	 * Handles hash_surface method specially by extracting/distributing density features.
+	 * Stores raw gradients in forward context for Eikonal loss computation.
+	 * 
+	 * @param stream CUDA stream for operations
+	 * @param batch_size Number of samples to process
+	 * @param input Full network input (position + direction + extras)
+	 * @param forward Forward context containing network outputs and contexts (reused)
+	 * @param use_inference_params Whether to use inference or training parameters
+	 * @return Processed normals (normalized or clamped based on settings)
+	 * 
+	 * @note Use this during forward pass when you have a ForwardContext.
+	 *       For inference-only, use compute_analytical_normals_inference_unified().
+	 */
 	GPUMatrixDynamic<float> compute_analytical_normals_forward_unified(
 		cudaStream_t stream,
 		uint32_t batch_size,
@@ -1286,18 +1306,29 @@ public:
 		return normals;
 	}
 
-	// Legacy function for backward compatibility - redirects to unified function
-	GPUMatrixDynamic<float> compute_analytical_normals_forward_unnormalized(
-		cudaStream_t stream,
-		uint32_t batch_size,
-		const GPUMatrixDynamic<float>& input,
-		std::unique_ptr<ForwardContext>& forward,
-		bool use_inference_params
-	) {
-		return compute_analytical_normals_forward_unified(stream, batch_size, input, forward, use_inference_params);
-	}
-
-	// Helper function to compute volume divergences during inference (IMPROVED EFFICIENCY)
+	/**
+	 * @brief Computes volume divergences during inference (without existing ForwardContext).
+	 * 
+	 * Computes ∇·Φ_k = ∂Φ_kx/∂x + ∂Φ_ky/∂y + ∂Φ_kz/∂z for each of 15 3D vector fields.
+	 * 
+	 * Algorithm:
+	 * - For each of 15 vector fields:
+	 *   1. Seed gradients for all 3 components [Φ_kx, Φ_ky, Φ_kz]
+	 *   2. Backpropagate to get ∂Φ_k/∂position
+	 *   3. Extract diagonal: ∂Φ_kx/∂x + ∂Φ_ky/∂y + ∂Φ_kz/∂z
+	 * 
+	 * @param stream CUDA stream for operations
+	 * @param batch_size Number of samples to process
+	 * @param input Full network input
+	 * @param density_network_input Output from position encoding
+	 * @param density_network_output Output from density network (48D)
+	 * @param use_inference_params Whether to use inference parameters
+	 * @return 15D divergence values per sample
+	 * 
+	 * @note Creates temporary contexts. Use compute_volume_divergences_forward() if you
+	 *       already have a ForwardContext to reuse.
+	 * @note Efficiency: 15 passes through network stack (one per vector field)
+	 */
 	GPUMatrixDynamic<float> compute_volume_divergences_inference(
 		cudaStream_t stream,
 		uint32_t batch_size,
@@ -1358,7 +1389,29 @@ public:
 		return divergences;
 	}
 
-	// Helper function to compute volume divergences during forward pass (MAXIMALLY EFFICIENT VERSION)
+	/**
+	 * @brief Computes volume divergences during forward pass (reuses ForwardContext).
+	 * 
+	 * Computes ∇·Φ_k = ∂Φ_kx/∂x + ∂Φ_ky/∂y + ∂Φ_kz/∂z for each of 15 3D vector fields.
+	 * 
+	 * Algorithm (maximally efficient):
+	 * - For each spatial dimension (x, y, z):
+	 *   - For each vector field k (0-14):
+	 *     1. Seed gradient for single component Φ_{k,dim}
+	 *     2. Backpropagate to get ∂Φ_{k,dim}/∂dim
+	 *     3. Accumulate to divergence[k]
+	 * 
+	 * @param stream CUDA stream for operations
+	 * @param batch_size Number of samples to process
+	 * @param input Full network input
+	 * @param forward Forward context containing network outputs (reused)
+	 * @param use_inference_params Whether to use inference parameters
+	 * @return 15D divergence values per sample
+	 * 
+	 * @note Reuses existing contexts from forward pass.
+	 * @note Efficiency: 45 passes (3 spatial dims × 15 vector fields)
+	 * @warning Memory intensive due to 45 gradient computations
+	 */
 	GPUMatrixDynamic<float> compute_volume_divergences_forward(
 		cudaStream_t stream,
 		uint32_t batch_size,
@@ -1421,7 +1474,29 @@ public:
 		return divergences;
 	}
 
-	// Helper function for inference-only analytical normals - UNIFIED
+	/**
+	 * @brief Computes analytical normals during inference (without existing ForwardContext).
+	 * 
+	 * Uses the chain rule to compute ∇SDF (gradients of SDF w.r.t. position) by:
+	 * 1. Creating temporary forward contexts
+	 * 2. Seeding gradients at SDF output (channel 0 = 1.0)
+	 * 3. Backpropagating through density network
+	 * 4. Backpropagating through position encoding
+	 * 
+	 * Handles hash_surface method specially by extracting/distributing density features.
+	 * 
+	 * @param stream CUDA stream for operations
+	 * @param batch_size Number of samples to process
+	 * @param input Full network input (position + direction + extras)
+	 * @param density_network_input Output from position encoding
+	 * @param density_network_output Output from density network (48D)
+	 * @param use_inference_params Whether to use inference parameters
+	 * @return Processed normals (normalized or clamped based on settings)
+	 * 
+	 * @note Creates temporary contexts. Use compute_analytical_normals_forward_unified()
+	 *       if you already have a ForwardContext to reuse.
+	 * @note ~80% code duplication with forward version - consider refactoring
+	 */
 	GPUMatrixDynamic<float> compute_analytical_normals_inference_unified(
 		cudaStream_t stream,
 		uint32_t batch_size,
@@ -1595,31 +1670,29 @@ public:
 		return normals;
 	}
 
-	// Legacy function for backward compatibility
-	GPUMatrixDynamic<float> compute_analytical_normals_inference_unnormalized(
-		cudaStream_t stream,
-		uint32_t batch_size,
-		const GPUMatrixDynamic<float>& input,
-		const GPUMatrixDynamic<T>& density_network_input,
-		const GPUMatrixDynamic<T>& density_network_output,
-		bool use_inference_params
-	) {
-		return compute_analytical_normals_inference_unified(stream, batch_size, input, density_network_input, density_network_output, use_inference_params);
-	}
-
-	// Legacy function for backward compatibility
-	GPUMatrixDynamic<float> compute_analytical_normals_inference(
-		cudaStream_t stream,
-		uint32_t batch_size,
-		const GPUMatrixDynamic<float>& input,
-		const GPUMatrixDynamic<T>& density_network_input,
-		const GPUMatrixDynamic<T>& density_network_output,
-		bool use_inference_params
-	) {
-		return compute_analytical_normals_inference_unified(stream, batch_size, input, density_network_input, density_network_output, use_inference_params);
-	}
-
-	// Volume divergence gradient accumulation (similar to analytical normals)
+	/**
+	 * @brief Backpropagates gradients from divergence values to network parameters.
+	 * 
+	 * For each of 15 vector fields and 3 spatial components:
+	 * 1. Creates gradient seed from divergence gradients
+	 * 2. Backpropagates through position encoding (second-order)
+	 * 3. Backpropagates through density network (second-order)
+	 * 4. Accumulates to main gradient buffer
+	 * 
+	 * This computes second-order gradients: d(∇·Φ)/d(params)
+	 * 
+	 * @param stream CUDA stream for operations
+	 * @param batch_size Number of samples
+	 * @param input Network input from forward pass
+	 * @param forward Forward context containing cached values
+	 * @param dL_ddivergences Gradients w.r.t. 15D divergences
+	 * @param dL_ddensity_network_output Gradient buffer to accumulate into
+	 * @param use_inference_params Whether to use inference parameters
+	 * @param param_gradients_mode Gradient mode (typically Ignore for second-order)
+	 * 
+	 * @note Computationally expensive: 45 second-order gradient computations
+	 * @warning Memory intensive due to temporary context creation
+	 */
 	void accumulate_volume_divergence_gradients(
 		cudaStream_t stream,
 		uint32_t batch_size,
@@ -1688,7 +1761,31 @@ public:
 		}
 	}
 
-	// Second-order gradient accumulation with chain rule through normalization
+	/**
+	 * @brief Backpropagates gradients from normals to network parameters.
+	 * 
+	 * Applies chain rule through normalization: n = -∇SDF / ||∇SDF||
+	 * 1. Computes dL/d(∇SDF) using Jacobian of normalization
+	 * 2. Optionally adds Eikonal regularization gradients
+	 * 3. Backpropagates through position encoding (second-order)
+	 * 4. Backpropagates through density network (second-order)
+	 * 5. Accumulates to main gradient buffer with reduced weight (0.1)
+	 * 
+	 * Handles hash_surface method specially by extracting/distributing density features.
+	 * 
+	 * @param stream CUDA stream for operations
+	 * @param batch_size Number of samples
+	 * @param input Network input from forward pass
+	 * @param forward Forward context containing cached values (including raw_gradients)
+	 * @param dL_dnormals Gradients w.r.t. normalized normals
+	 * @param dL_ddensity_network_output Gradient buffer to accumulate into
+	 * @param use_inference_params Whether to use inference parameters
+	 * @param param_gradients_mode Gradient mode (typically Ignore for second-order)
+	 * 
+	 * @note Uses reduced weight (0.1) to prevent gradient explosion from second-order terms
+	 * @note Adds Eikonal loss if enabled: enforces ||∇SDF|| ≈ 1
+	 * @warning Hash_surface requires special handling for feature extraction
+	 */
 	void accumulate_analytical_normal_gradients(
 		cudaStream_t stream,
 		uint32_t batch_size,
