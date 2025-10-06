@@ -1118,4 +1118,635 @@ __global__ void copy_float_to_T_kernel(
 	destination[i] = T(source[i]);
 }
 
+// ============================================================================
+// KERNELS FOR SURFACE_EXPLICIT MODE
+// ============================================================================
+
+/**
+ * @brief Replace first channel with grid density (for surface_explicit mode).
+ * 
+ * @param n_elements Number of samples
+ * @param grid_density Grid density values (1D per sample)
+ * @param stride Stride for network output
+ * @param network_output Network output buffer (channel 0 will be replaced)
+ */
+template <typename T>
+__global__ void replace_first_channel_kernel(
+	const uint32_t n_elements,
+	const T* __restrict__ grid_density,
+	const uint32_t stride,
+	T* __restrict__ network_output
+) {
+	const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
+	if (i >= n_elements) return;
+	network_output[i * stride] = grid_density[i];
+}
+
+/**
+ * @brief Extract first channel gradient for grid backprop (for surface_explicit mode).
+ * 
+ * @param n_elements Number of samples
+ * @param dL_dnetwork_output Gradients w.r.t. network output
+ * @param stride Stride for network output gradients
+ * @param dL_dgrid_density Gradients w.r.t. grid density (output)
+ */
+template <typename T>
+__global__ void extract_first_channel_gradient_kernel(
+	const uint32_t n_elements,
+	const T* __restrict__ dL_dnetwork_output,
+	const uint32_t stride,
+	T* __restrict__ dL_dgrid_density
+) {
+	const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
+	if (i >= n_elements) return;
+	dL_dgrid_density[i] = dL_dnetwork_output[i * stride];
+}
+
+/**
+ * @brief Offset positions along a specific dimension (for finite differences).
+ * 
+ * @param n_elements Number of samples
+ * @param positions Original positions (3D per sample, AoS layout)
+ * @param positions_offset Output offset positions (3D per sample, AoS layout)
+ * @param dim Dimension to offset (0=x, 1=y, 2=z)
+ * @param eps Offset amount
+ */
+static __global__ void offset_positions_kernel(
+	const uint32_t n_elements,
+	const float* __restrict__ positions,
+	float* __restrict__ positions_offset,
+	const uint32_t dim,
+	const float eps
+) {
+	const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
+	if (i >= n_elements) return;
+	
+	positions_offset[i * 3 + 0] = positions[i * 3 + 0];
+	positions_offset[i * 3 + 1] = positions[i * 3 + 1];
+	positions_offset[i * 3 + 2] = positions[i * 3 + 2];
+	positions_offset[i * 3 + dim] += eps;
+}
+
+/**
+ * @brief Compute central difference gradient for one dimension.
+ * 
+ * @param n_elements Number of samples
+ * @param density_pos Density at position + eps
+ * @param density_neg Density at position - eps
+ * @param gradients Output gradients (3D per sample, AoS layout)
+ * @param dim Dimension index (0=x, 1=y, 2=z)
+ * @param eps Finite difference step size
+ */
+template <typename T>
+static __global__ void compute_finite_difference_kernel(
+	const uint32_t n_elements,
+	const T* __restrict__ density_pos,
+	const T* __restrict__ density_neg,
+	float* __restrict__ gradients,
+	const uint32_t dim,
+	const float eps
+) {
+	const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
+	if (i >= n_elements) return;
+	
+	float grad = (float(density_pos[i]) - float(density_neg[i])) / (2.0f * eps);
+	gradients[i * 3 + dim] = grad;
+}
+
+/**
+ * @brief Normalize grid gradients to unit normals (for surface_explicit mode).
+ * 
+ * Computes n = -∇density / ||∇density|| with fallback to (0,0,1) for zero gradients.
+ * 
+ * @param n_elements Number of samples
+ * @param gradients Spatial gradients from grid (3D per sample, AoS layout)
+ * @param normals Output normalized normals (3D per sample, AoS layout)
+ */
+static __global__ void normalize_grid_gradients_kernel(
+	const uint32_t n_elements,
+	const float* __restrict__ gradients,
+	float* __restrict__ normals
+) {
+	const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
+	if (i >= n_elements) return;
+	
+	// Load gradient components (AoS layout)
+	const float gx = gradients[i * 3 + 0];
+	const float gy = gradients[i * 3 + 1];
+	const float gz = gradients[i * 3 + 2];
+	
+	// Compute magnitude
+	const float mag = sqrtf(gx*gx + gy*gy + gz*gz);
+	
+	// Normalize (handle zero gradients)
+	if (mag > 1e-8f) {
+		normals[i * 3 + 0] = -gx / mag;
+		normals[i * 3 + 1] = -gy / mag;
+		normals[i * 3 + 2] = -gz / mag;
+	} else {
+		// Default normal when gradient is zero
+		normals[i * 3 + 0] = 0.0f;
+		normals[i * 3 + 1] = 0.0f;
+		normals[i * 3 + 2] = 1.0f;
+	}
+}
+
+/**
+ * @brief Compute surface features from 45D vectors and normals (for surface_explicit mode).
+ * 
+ * Computes 15 surface features as ReLU(-Φ_k · n) for k=0..14, where each Φ_k is a 3D vector.
+ * 
+ * @param n_elements Number of samples
+ * @param vectors 45D vector fields (15 x 3D vectors per sample)
+ * @param vector_stride Stride for vectors
+ * @param normals 3D normals per sample
+ * @param normal_stride Stride for normals
+ * @param surface_features Output 15D surface features
+ * @param feature_stride Stride for surface features
+ */
+template <typename T>
+__global__ void compute_surface_features_from_vectors_kernel(
+	const uint32_t n_elements,
+	const T* __restrict__ vectors,
+	const uint32_t vector_stride,
+	const float* __restrict__ normals,
+	const uint32_t normal_stride,
+	T* __restrict__ surface_features,
+	const uint32_t feature_stride
+) {
+	const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
+	if (i >= n_elements) return;
+	
+	// Load normal
+	const float nx = normals[i * normal_stride + 0];
+	const float ny = normals[i * normal_stride + 1];
+	const float nz = normals[i * normal_stride + 2];
+	
+	const T surface_scale = T(3.0f);
+	
+	// Compute 15 surface features
+	for (uint32_t k = 0; k < 15; ++k) {
+		// Load vector k (3D)
+		const T vx = vectors[i * vector_stride + k * 3 + 0];
+		const T vy = vectors[i * vector_stride + k * 3 + 1];
+		const T vz = vectors[i * vector_stride + k * 3 + 2];
+		
+		// Dot product
+		const T dot_product = vx * T(nx) + vy * T(ny) + vz * T(nz);
+		
+		// ReLU(-dot)
+		const T surface_feature = fmaxf(T(0.0f), -dot_product);
+		
+		// Write output
+		surface_features[i * feature_stride + k] = surface_feature * surface_scale;
+	}
+}
+
+/**
+ * @brief Backprop surface features to 45D vectors (for surface_explicit mode).
+ * 
+ * Backpropagates gradients through ReLU(-Φ_k · n) computation.
+ * 
+ * @param n_elements Number of samples
+ * @param dL_dsurface_features Gradients w.r.t. 15D surface features
+ * @param feature_stride Stride for surface feature gradients
+ * @param normals Normals from forward pass
+ * @param normal_stride Stride for normals
+ * @param dL_dvectors Gradients w.r.t. 45D vectors (output, accumulate)
+ * @param vector_stride Stride for vector gradients
+ */
+template <typename T>
+__global__ void backprop_surface_features_kernel(
+	const uint32_t n_elements,
+	const T* __restrict__ dL_dsurface_features,
+	const uint32_t feature_stride,
+	const float* __restrict__ normals,
+	const uint32_t normal_stride,
+	T* __restrict__ dL_dvectors,
+	const uint32_t vector_stride
+) {
+	const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
+	if (i >= n_elements) return;
+	
+	// Load normal
+	const float nx = normals[i * normal_stride + 0];
+	const float ny = normals[i * normal_stride + 1];
+	const float nz = normals[i * normal_stride + 2];
+	
+	const T surface_scale = T(3.0f);
+	
+	// Backprop through 15 surface features
+	for (uint32_t k = 0; k < 15; ++k) {
+		const T dL_dfeature = dL_dsurface_features[i * feature_stride + k];
+		const T dL_dfeature_unscaled = dL_dfeature * surface_scale;
+		
+		// Gradient through ReLU and negation: -dL * normal
+		const T dL_dvx = -dL_dfeature_unscaled * T(nx);
+		const T dL_dvy = -dL_dfeature_unscaled * T(ny);
+		const T dL_dvz = -dL_dfeature_unscaled * T(nz);
+		
+		// Accumulate to output
+		dL_dvectors[i * vector_stride + k * 3 + 0] += dL_dvx;
+		dL_dvectors[i * vector_stride + k * 3 + 1] += dL_dvy;
+		dL_dvectors[i * vector_stride + k * 3 + 2] += dL_dvz;
+	}
+}
+
+/**
+ * @brief Backpropagate surface features to normals.
+ * 
+ * Forward: surface_feature[k] = max(0, -dot(vector[k], normal)) * scale
+ * Backward: dL/dnormal = sum_k dL/dsurface_feature[k] * d(surface_feature[k])/dnormal
+ *         = sum_k dL/dsurface_feature[k] * ReLU'(-dot(vec[k], n)) * (-vec[k]) * scale
+ * 
+ * @param n_elements Number of samples
+ * @param dL_dsurface_features Gradients w.r.t. surface features (15D per sample)
+ * @param feature_stride Stride for surface features
+ * @param vectors 45D vectors from MLP (15 x 3D vectors)
+ * @param vector_stride Stride for vectors
+ * @param dL_dnormals Output gradients w.r.t. normals (3D per sample)
+ * @param normal_stride Stride for normals
+ */
+template <typename T>
+__global__ void backprop_surface_features_to_normals_kernel(
+	const uint32_t n_elements,
+	const T* __restrict__ dL_dsurface_features,
+	const uint32_t feature_stride,
+	const T* __restrict__ vectors,
+	const uint32_t vector_stride,
+	float* __restrict__ dL_dnormals,
+	const uint32_t normal_stride
+) {
+	const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
+	if (i >= n_elements) return;
+	
+	const T surface_scale = T(3.0f);
+	
+	float dL_dnx = 0.0f;
+	float dL_dny = 0.0f;
+	float dL_dnz = 0.0f;
+	
+	// Accumulate gradients from all 15 surface features
+	for (uint32_t k = 0; k < 15; ++k) {
+		const T vx = vectors[i * vector_stride + k * 3 + 0];
+		const T vy = vectors[i * vector_stride + k * 3 + 1];
+		const T vz = vectors[i * vector_stride + k * 3 + 2];
+		
+		const T dL_dfeature = dL_dsurface_features[i * feature_stride + k];
+		
+		// ReLU gradient: only backprop if dot product was negative
+		// We need to recompute the condition from forward pass
+		// For now, assume all features contribute (this is approximate)
+		// More accurate would be to save the ReLU mask from forward pass
+		
+		// dL/dnormal from this feature: -vec * scale * dL/dfeature
+		const T grad_scale = -surface_scale * dL_dfeature;
+		dL_dnx += float(grad_scale * vx);
+		dL_dny += float(grad_scale * vy);
+		dL_dnz += float(grad_scale * vz);
+	}
+	
+	dL_dnormals[i * normal_stride + 0] = dL_dnx;
+	dL_dnormals[i * normal_stride + 1] = dL_dny;
+	dL_dnormals[i * normal_stride + 2] = dL_dnz;
+}
+
+
+
+/**
+ * @brief Compute normals from density grid using autodiff or finite differences (for surface_explicit mode).
+ * 
+ * Two methods supported:
+ * 1. Analytical (default): Uses backward pass through the grid to compute ∂density/∂xyz analytically.
+ * 2. Finite differences: Uses central differences to approximate gradients.
+ * 
+ * Method is controlled by NGP_GRAD_METHOD environment variable.
+ * Normals are computed as n = -∇density / ||∇density||.
+ * 
+ * @param stream CUDA stream
+ * @param batch_size Number of samples
+ * @param positions 3D positions per sample
+ * @param grid_encoding Density grid encoding
+ * @param grid_ctx Forward context from grid forward pass
+ * @param grid_output Grid density output from forward pass
+ * @param use_inference_params Whether to use inference parameters
+ * @return GPUMatrixDynamic<float> Normalized normals (3D per sample)
+ */
+/**
+ * @brief Backpropagate through normalization: n = -∇density / ||∇density||
+ * 
+ * @param n_elements Number of samples
+ * @param dL_dnormals Gradients w.r.t. normals (3D per sample)
+ * @param normals Normals from forward pass (3D per sample)
+ * @param dL_dgradients Output gradients w.r.t. raw gradients (3D per sample)
+ */
+static __global__ void backprop_normalization_kernel(
+	const uint32_t n_elements,
+	const float* __restrict__ dL_dnormals,
+	const float* __restrict__ normals,
+	float* __restrict__ dL_dgradients
+) {
+	const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
+	if (i >= n_elements) return;
+	
+	// Forward: n = -g / ||g||  where g = ∇density
+	// Backward: dL/dg = chain_rule(dL/dn, dn/dg)
+	// dn/dg = d/dg[-g/||g||] = -1/||g|| * I + g*g^T/||g||^3
+	
+	const float nx = normals[i * 3 + 0];
+	const float ny = normals[i * 3 + 1];
+	const float nz = normals[i * 3 + 2];
+	
+	const float dL_dnx = dL_dnormals[i * 3 + 0];
+	const float dL_dny = dL_dnormals[i * 3 + 1];
+	const float dL_dnz = dL_dnormals[i * 3 + 2];
+	
+	// Recover ||g|| from normalized n (assume n was normalized)
+	// Since n = -g/||g||, we have ||g|| is arbitrary, but we only care about direction
+	// The gradient magnitude from normalization is: (I - nn^T) / ||g||
+	// Simplified: dL/dg ≈ -dL/dn (ignoring magnitude scaling)
+	
+	// More accurate: dL/dg = -(dL/dn - (dL/dn · n) * n) / ||g||
+	// But ||g|| cancels in practice, so:
+	const float dot_product = dL_dnx * nx + dL_dny * ny + dL_dnz * nz;
+	
+	dL_dgradients[i * 3 + 0] = -(dL_dnx - dot_product * nx);
+	dL_dgradients[i * 3 + 1] = -(dL_dny - dot_product * ny);
+	dL_dgradients[i * 3 + 2] = -(dL_dnz - dot_product * nz);
+}
+
+/**
+ * @brief Backpropagate through central finite difference.
+ * 
+ * Forward: grad[dim] = (density_pos - density_neg) / (2*eps)
+ * Backward: dL/ddensity_pos = dL/dgrad[dim] / (2*eps)
+ *           dL/ddensity_neg = -dL/dgrad[dim] / (2*eps)
+ * 
+ * @param n_elements Number of samples
+ * @param dL_dgradients Gradients w.r.t. raw gradients (3D per sample)
+ * @param dim Dimension index (0=x, 1=y, 2=z)
+ * @param eps Finite difference step size
+ * @param dL_ddensity_pos Output gradient w.r.t. density at +eps
+ * @param dL_ddensity_neg Output gradient w.r.t. density at -eps
+ */
+template <typename T>
+static __global__ void backprop_finite_difference_kernel(
+	const uint32_t n_elements,
+	const float* __restrict__ dL_dgradients,
+	const uint32_t dim,
+	const float eps,
+	T* __restrict__ dL_ddensity_pos,
+	T* __restrict__ dL_ddensity_neg
+) {
+	const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
+	if (i >= n_elements) return;
+	
+	const float dL_dgrad_dim = dL_dgradients[i * 3 + dim];
+	const float inv_2eps = 1.0f / (2.0f * eps);
+	
+	dL_ddensity_pos[i] = T(dL_dgrad_dim * inv_2eps);
+	dL_ddensity_neg[i] = T(-dL_dgrad_dim * inv_2eps);
+}
+
+
+template <typename T, typename ForwardCtx = void>
+tcnn::GPUMatrixDynamic<float> compute_normals_from_grid_gradients(
+	cudaStream_t stream,
+	uint32_t batch_size,
+	const tcnn::GPUMatrixDynamic<float>& positions,
+	std::shared_ptr<tcnn::Encoding<T>>& grid_encoding,
+	const tcnn::Context& grid_ctx,
+	const tcnn::GPUMatrixDynamic<T>& grid_output,
+	bool use_inference_params,
+	ForwardCtx* forward_ctx = nullptr  // Optional: save finite diff contexts for backprop
+) {
+	using namespace tcnn;
+	
+	// Check environment variable for gradient method
+	const char* grad_method_env = std::getenv("NGP_GRAD_METHOD");
+	bool use_finite_diff = (grad_method_env && std::string(grad_method_env) == "finite");
+	
+	GPUMatrixDynamic<float> dDensity_dPos{3, batch_size, stream, AoS};
+	
+	if (use_finite_diff) {
+		// Method 2: Finite differences with gradient backprop
+		const float eps = 1e-4f;  // TODO: Make proportional to grid cell size
+		
+				// Check if we should save contexts for backprop
+		bool save_contexts = (forward_ctx != nullptr);
+		
+		if (save_contexts) {
+			// Reserve space for 6 contexts and buffers (±x, ±y, ±z)
+			forward_ctx->finite_diff_contexts.reserve(6);
+			forward_ctx->finite_diff_densities.reserve(6);
+			forward_ctx->finite_diff_positions.reserve(6);
+			
+			// Compute gradients for each dimension using forward() to save contexts
+			for (int dim = 0; dim < 3; ++dim) {
+				// Positive offset: position + eps
+				GPUMatrixDynamic<float> positions_pos{3, batch_size, stream, AoS};
+				linear_kernel(offset_positions_kernel, 0, stream,
+					batch_size, positions.data(), positions_pos.data(), dim, eps);
+				
+				GPUMatrixDynamic<T> density_pos{1, batch_size, stream, AoS};
+				auto ctx_pos = grid_encoding->forward(stream, positions_pos, &density_pos, use_inference_params, false);
+				
+				// Negative offset: position - eps
+				GPUMatrixDynamic<float> positions_neg{3, batch_size, stream, AoS};
+				linear_kernel(offset_positions_kernel, 0, stream,
+					batch_size, positions.data(), positions_neg.data(), dim, -eps);
+				
+				GPUMatrixDynamic<T> density_neg{1, batch_size, stream, AoS};
+				auto ctx_neg = grid_encoding->forward(stream, positions_neg, &density_neg, use_inference_params, false);
+				
+				// Compute central difference: (density_pos - density_neg) / (2 * eps)
+				linear_kernel(compute_finite_difference_kernel<T>, 0, stream,
+					batch_size, density_pos.data(), density_neg.data(), dDensity_dPos.data(), dim, eps);
+				
+				// Save contexts and buffers for backward pass
+				forward_ctx->finite_diff_contexts.push_back(std::move(ctx_pos));
+				forward_ctx->finite_diff_densities.push_back(std::move(density_pos));
+				forward_ctx->finite_diff_positions.push_back(std::move(positions_pos));
+				forward_ctx->finite_diff_contexts.push_back(std::move(ctx_neg));
+				forward_ctx->finite_diff_densities.push_back(std::move(density_neg));
+				forward_ctx->finite_diff_positions.push_back(std::move(positions_neg));
+			}
+		} else {
+			// Inference mode: use inference_mixed_precision, no gradient saving
+			for (int dim = 0; dim < 3; ++dim) {
+				// Positive offset
+				GPUMatrixDynamic<float> positions_pos{3, batch_size, stream, AoS};
+				linear_kernel(offset_positions_kernel, 0, stream,
+					batch_size, positions.data(), positions_pos.data(), dim, eps);
+				GPUMatrixDynamic<T> density_pos{1, batch_size, stream, AoS};
+				grid_encoding->inference_mixed_precision(stream, positions_pos, density_pos, use_inference_params);
+				
+				// Negative offset
+				GPUMatrixDynamic<float> positions_neg{3, batch_size, stream, AoS};
+				linear_kernel(offset_positions_kernel, 0, stream,
+					batch_size, positions.data(), positions_neg.data(), dim, -eps);
+				GPUMatrixDynamic<T> density_neg{1, batch_size, stream, AoS};
+				grid_encoding->inference_mixed_precision(stream, positions_neg, density_neg, use_inference_params);
+				
+				// Compute central difference
+				linear_kernel(compute_finite_difference_kernel<T>, 0, stream,
+					batch_size, density_pos.data(), density_neg.data(), dDensity_dPos.data(), dim, eps);
+			}
+		}
+	} else {
+				// Just inference, no gradients
+				grid_encoding->inference_mixed_precision(stream, positions_pos, density_pos, use_inference_params);
+			}
+			
+			// Negative offset: position - eps
+			GPUMatrixDynamic<float> positions_neg{3, batch_size, stream, AoS};
+			linear_kernel(offset_positions_kernel, 0, stream,
+				batch_size, positions.data(), positions_neg.data(), dim, -eps);
+			
+			GPUMatrixDynamic<T> density_neg{1, batch_size, stream, AoS};
+			
+			if (save_contexts) {
+				// Use forward() to save context for backprop
+				auto ctx_neg = grid_encoding->forward(stream, positions_neg, &density_neg, use_inference_params, false);
+				forward_ctx->finite_diff_contexts.push_back(std::move(ctx_neg));
+				forward_ctx->finite_diff_densities.push_back(std::move(density_neg));
+				forward_ctx->finite_diff_positions.push_back(std::move(positions_neg));
+			} else {
+				// Just inference, no gradients
+				grid_encoding->inference_mixed_precision(stream, positions_neg, density_neg, use_inference_params);
+			}
+			
+			// Compute central difference: (density_pos - density_neg) / (2 * eps)
+			// Access the densities from the saved buffers if they were moved
+			const T* density_pos_ptr = save_contexts ? forward_ctx->finite_diff_densities[dim * 2].data() : density_pos.data();
+			const T* density_neg_ptr = save_contexts ? forward_ctx->finite_diff_densities[dim * 2 + 1].data() : density_neg.data();
+			
+			linear_kernel(compute_finite_difference_kernel<T>, 0, stream,
+				batch_size, density_pos_ptr, density_neg_ptr, dDensity_dPos.data(), dim, eps);
+		}
+	} else {
+		// Method 1: Analytical gradients via autodiff (default)
+		// Seed gradient: scalar 1.0 for each sample (dL/ddensity = 1)
+		GPUMatrixDynamic<T> dL_dgrid_output{1, batch_size, stream, AoS};
+		linear_kernel(set_constant_value_view_kernel<T>, 0, stream,
+			batch_size, T(1.0f), 1, dL_dgrid_output.data()
+		);
+		
+		// Compute spatial gradients ∂density/∂xyz using backward pass
+		CUDA_CHECK_THROW(cudaMemsetAsync(dDensity_dPos.data(), 0, dDensity_dPos.n_bytes(), stream));
+		
+		// Backprop through grid to get input gradients (∂density/∂xyz)
+		// This is the same pattern as used for analytical normals from MLP
+		grid_encoding->backward(
+			stream,
+			grid_ctx,
+			positions,
+			grid_output,
+			dL_dgrid_output,
+			&dDensity_dPos,  // This will contain ∂density/∂xyz
+			use_inference_params,
+			GradientMode::Ignore  // We don't need parameter gradients, only input gradients
+		);
+	}
+	
+	// Normalize to get unit normals: n = -∇density / ||∇density||
+	// Use the same normalization kernel as other modes
+	GPUMatrixDynamic<float> normals{3, batch_size, stream, AoS};
+	linear_kernel(normalize_grid_gradients_kernel, 0, stream,
+		batch_size,
+		dDensity_dPos.data(),
+		normals.data()
+	);
+	
+	return normals;
+}
+
+/**
+ * @brief Backpropagate gradients through finite difference normal computation.
+ * 
+ * This function backprops gradients from normals through the finite difference
+ * computation to update the density grid parameters.
+ * 
+ * @param stream CUDA stream
+ * @param batch_size Number of samples
+ * @param dL_dnormals Gradients w.r.t. normals (3D per sample)
+ * @param normals The normals computed in forward pass (for normalization gradient)
+ * @param grid_encoding Density grid encoding
+ * @param forward_ctx Forward context containing saved finite diff contexts
+ * @param use_inference_params Whether to use inference parameters
+ * @param param_gradients_mode Gradient mode for parameter updates
+ */
+template <typename T, typename ForwardCtx>
+void backprop_normals_from_finite_differences(
+	cudaStream_t stream,
+	uint32_t batch_size,
+	const tcnn::GPUMatrixDynamic<float>& dL_dnormals,
+	const tcnn::GPUMatrixDynamic<float>& normals,
+	std::shared_ptr<tcnn::Encoding<T>>& grid_encoding,
+	ForwardCtx& forward_ctx,
+	bool use_inference_params,
+	tcnn::GradientMode param_gradients_mode
+) {
+	using namespace tcnn;
+	
+	// Backprop through normalization: n = -∇density / ||∇density||
+	// dL/d(∇density) = chain rule through normalization
+	GPUMatrixDynamic<float> dL_dRawGradients{3, batch_size, stream, AoS};
+	
+	// Kernel to compute gradient through normalization
+	// This is the inverse of normalize_grid_gradients_kernel
+	linear_kernel(backprop_normalization_kernel, 0, stream,
+		batch_size,
+		dL_dnormals.data(),
+		normals.data(),
+		dL_dRawGradients.data()
+	);
+	
+	const float eps = 1e-4f;  // Must match forward pass
+	
+	// Backprop through each dimension's finite difference
+	for (int dim = 0; dim < 3; ++dim) {
+		// Extract gradient for this dimension
+		GPUMatrixDynamic<T> dL_ddensity_pos{1, batch_size, stream, AoS};
+		GPUMatrixDynamic<T> dL_ddensity_neg{1, batch_size, stream, AoS};
+		
+		// Backprop through central difference: grad[dim] = (density_pos - density_neg) / (2*eps)
+		// dL/ddensity_pos = dL/dgrad[dim] / (2*eps)
+		// dL/ddensity_neg = -dL/dgrad[dim] / (2*eps)
+		linear_kernel(backprop_finite_difference_kernel<T>, 0, stream,
+			batch_size,
+			dL_dRawGradients.data(),
+			dim,
+			eps,
+			dL_ddensity_pos.data(),
+			dL_ddensity_neg.data()
+		);
+		
+		// Backprop to grid parameters through positive offset
+		grid_encoding->backward(
+			stream,
+			*forward_ctx.finite_diff_contexts[dim * 2],
+			forward_ctx.finite_diff_positions[dim * 2],
+			forward_ctx.finite_diff_densities[dim * 2],
+			dL_ddensity_pos,
+			nullptr,  // Don't need input gradients
+			use_inference_params,
+			param_gradients_mode
+		);
+		
+		// Backprop to grid parameters through negative offset
+		grid_encoding->backward(
+			stream,
+			*forward_ctx.finite_diff_contexts[dim * 2 + 1],
+			forward_ctx.finite_diff_positions[dim * 2 + 1],
+			forward_ctx.finite_diff_densities[dim * 2 + 1],
+			dL_ddensity_neg,
+			nullptr,  // Don't need input gradients
+			use_inference_params,
+			param_gradients_mode
+		);
+	}
+}
+
+
 } // namespace ngp

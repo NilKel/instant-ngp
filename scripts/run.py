@@ -92,6 +92,9 @@ def parse_args():
 	parser.add_argument("--normalized", type=str, default="true", choices=["true", "false"], help="Whether to normalize analytical normals to unit vectors. Default: true (backward compatible)")
 	parser.add_argument("--clamp-gradients", action="store_true", dest="clamp_gradients", help="Enable gradient magnitude clamping for training stability when using raw gradients")
 	parser.add_argument("--max-gradient-mag", type=float, default=1.0, dest="max_gradient_mag", help="Maximum gradient magnitude when clamping is enabled. Default: 1.0")
+	
+	# New: Gradient computation method
+	parser.add_argument("--grad", type=str, default="analytical", choices=["analytical", "finite"], help="Gradient computation method. 'analytical' uses autodiff (default), 'finite' uses finite differences for surface_explicit mode.")
 
 	return parser.parse_args()
 
@@ -137,6 +140,12 @@ if __name__ == "__main__":
 		os.environ["NGP_MAX_GRADIENT_MAG"] = str(args.max_gradient_mag)
 	else:
 		os.environ["NGP_CLAMP_GRADIENTS"] = "0"
+	
+	# Export gradient computation method for C++ side to pick up
+	if args.grad == "finite":
+		os.environ["NGP_GRAD_METHOD"] = "finite"
+	else:
+		os.environ["NGP_GRAD_METHOD"] = "analytical"
 
 	testbed = ngp.Testbed()
 	testbed.root_dir = ROOT_DIR

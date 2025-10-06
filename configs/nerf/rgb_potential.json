@@ -1,0 +1,17 @@
+{
+	"parent": "base.json",
+	"network": {
+		"otype": "CutlassMLP",
+		"activation": "ReLU",
+		"output_activation": "None",
+		"n_neurons": 64,
+		"n_hidden_layers": 1
+	},
+	"rgb_network": {
+		"otype": "CutlassMLP",
+		"activation": "ReLU",
+		"output_activation": "None",
+		"n_neurons": 64,
+		"n_hidden_layers": 2
+	}
+} 

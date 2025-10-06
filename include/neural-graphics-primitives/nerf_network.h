@@ -72,46 +72,74 @@ public:
 			density_input_dims = padded_density_input_dims; // Use padded dimensions
 		}
 		
-		local_density_network_config["n_input_dims"] = density_input_dims;
-		if (!density_network.contains("n_output_dims")) {
-			if (m_method == "surface" || m_method == "surface_normal" || m_method == "surface_reflect" || m_method == "volume") {
-				// 48D: 1D density + 45D Φ features (15 x 3D vectors) for surface or volume features
-				local_density_network_config["n_output_dims"] = 48;
-			} else if (m_method == "hash_surface") {
-				// hash_surface: Density MLP takes n_levels density features and outputs 1D density
-				local_density_network_config["n_output_dims"] = 1;
-			} else if (m_use_sdf) {
-				// SDF mode: 1D SDF in channel 0, rest can be features for color
-				local_density_network_config["n_output_dims"] = 16;
-			} else {
-				local_density_network_config["n_output_dims"] = 16;
-			}
-		}
-		m_density_network.reset(create_network<T>(local_density_network_config));
-
-		if (m_method == "surface_normal") {
-			// Surface_normal: 16 surface features + encoded view dirs + encoded normals
-			uint32_t total_before_padding = 16 + m_dir_encoding->padded_output_width() + m_dir_encoding->padded_output_width();
-			m_rgb_network_input_width = next_multiple(total_before_padding, rgb_alignment);
-		} else if (m_method == "surface_reflect") {
-			// Surface_reflect: 16 surface features + encoded view dirs + encoded reflection vectors
-			uint32_t total_before_padding = 16 + m_dir_encoding->padded_output_width() + m_dir_encoding->padded_output_width();
-			m_rgb_network_input_width = next_multiple(total_before_padding, rgb_alignment);
-		} else if (m_method == "surface") {
-			// Surface: 16 surface features + direction encoding
-			m_rgb_network_input_width = next_multiple(16 + m_dir_encoding->padded_output_width(), rgb_alignment);
-		} else if (m_method == "volume") {
-			// Volume: 16 divergence features + direction encoding (same as surface)
-			m_rgb_network_input_width = next_multiple(16 + m_dir_encoding->padded_output_width(), rgb_alignment);
+	local_density_network_config["n_input_dims"] = density_input_dims;
+	if (!density_network.contains("n_output_dims")) {
+		if (m_method == "surface" || m_method == "surface_normal" || m_method == "surface_reflect" || m_method == "volume") {
+			// 48D: 1D density + 45D Φ features (15 x 3D vectors) for surface or volume features
+			local_density_network_config["n_output_dims"] = 48;
+		} else if (m_method == "surface_explicit") {
+			// surface_explicit: 48D output (1 dummy + 45D Φ features for 15 vectors)
+			// Density comes from grid, not MLP
+			local_density_network_config["n_output_dims"] = 48;
 		} else if (m_method == "hash_surface") {
-			// hash_surface: n_levels surface features + 1D density + direction encoding
-			uint32_t n_levels = m_pos_encoding->padded_output_width() / 4; // 32 / 4 = 8 levels
-			uint32_t surface_features = n_levels; // 8 hash surface features
-			m_rgb_network_input_width = next_multiple(surface_features + 1 + m_dir_encoding->padded_output_width(), rgb_alignment);
+			// hash_surface: Density MLP takes n_levels density features and outputs 1D density
+			local_density_network_config["n_output_dims"] = 1;
+		} else if (m_use_sdf) {
+			// SDF mode: 1D SDF in channel 0, rest can be features for color
+			local_density_network_config["n_output_dims"] = 16;
 		} else {
-			// Baseline: density output + direction encoding  
-			m_rgb_network_input_width = next_multiple(m_dir_encoding->padded_output_width() + std::max(16u, m_density_network->padded_output_width()), rgb_alignment);
+			local_density_network_config["n_output_dims"] = 16;
 		}
+	}
+	m_density_network.reset(create_network<T>(local_density_network_config));
+
+	// Initialize explicit density grid for surface_explicit mode
+	if (m_method == "surface_explicit") {
+		// Get grid resolution from config (default 128)
+		uint32_t grid_res = 128;
+		if (density_network.contains("explicit_grid_resolution")) {
+			grid_res = density_network["explicit_grid_resolution"];
+		}
+		
+		// Create DenseGrid encoding config
+		json dense_grid_config = {
+			{"otype", "Grid"},
+			{"type", "Dense"},
+			{"n_levels", 1},
+			{"n_features_per_level", 1},
+			{"base_resolution", grid_res},
+			{"interpolation", "Linear"}
+		};
+		
+		m_density_grid.reset(create_encoding<T>(3, dense_grid_config, 1));
+		
+		printf("surface_explicit: Created %dx%dx%d density grid with %zu parameters\n", 
+			grid_res, grid_res, grid_res, m_density_grid->n_params());
+	}
+
+	if (m_method == "surface_normal") {
+		// Surface_normal: 16 surface features + encoded view dirs + encoded normals
+		uint32_t total_before_padding = 16 + m_dir_encoding->padded_output_width() + m_dir_encoding->padded_output_width();
+		m_rgb_network_input_width = next_multiple(total_before_padding, rgb_alignment);
+	} else if (m_method == "surface_reflect") {
+		// Surface_reflect: 16 surface features + encoded view dirs + encoded reflection vectors
+		uint32_t total_before_padding = 16 + m_dir_encoding->padded_output_width() + m_dir_encoding->padded_output_width();
+		m_rgb_network_input_width = next_multiple(total_before_padding, rgb_alignment);
+	} else if (m_method == "surface" || m_method == "surface_explicit") {
+		// Surface/Surface_explicit: 16 surface features + direction encoding
+		m_rgb_network_input_width = next_multiple(16 + m_dir_encoding->padded_output_width(), rgb_alignment);
+	} else if (m_method == "volume") {
+		// Volume: 16 divergence features + direction encoding (same as surface)
+		m_rgb_network_input_width = next_multiple(16 + m_dir_encoding->padded_output_width(), rgb_alignment);
+	} else if (m_method == "hash_surface") {
+		// hash_surface: n_levels surface features + 1D density + direction encoding
+		uint32_t n_levels = m_pos_encoding->padded_output_width() / 4; // 32 / 4 = 8 levels
+		uint32_t surface_features = n_levels; // 8 hash surface features
+		m_rgb_network_input_width = next_multiple(surface_features + 1 + m_dir_encoding->padded_output_width(), rgb_alignment);
+	} else {
+		// Baseline: density output + direction encoding  
+		m_rgb_network_input_width = next_multiple(m_dir_encoding->padded_output_width() + std::max(16u, m_density_network->padded_output_width()), rgb_alignment);
+	}
 
 		json local_rgb_network_config = rgb_network;
 		local_rgb_network_config["n_input_dims"] = m_rgb_network_input_width;
@@ -156,31 +184,34 @@ public:
 			density_network_input = GPUMatrixDynamic<T>{m_pos_encoding->padded_output_width(), batch_size, stream, m_pos_encoding->preferred_output_layout()};
 		}
 		
-		// CRITICAL: For surface modes, force AoS layout to match Frequency encoding behavior
-		MatrixLayout surface_layout = (m_method == "surface" || m_method == "surface_normal" || m_method == "surface_reflect" || m_method == "volume" || m_method == "hash_surface") ? AoS : m_dir_encoding->preferred_output_layout();
-		// FIXED: Use the same RGB network input width as training (m_rgb_network_input_width) for all modes
-		GPUMatrixDynamic<T> rgb_network_input{m_rgb_network_input_width, batch_size, stream, surface_layout};
+	// CRITICAL: For surface modes, force AoS layout to match Frequency encoding behavior
+	MatrixLayout surface_layout = (m_method == "surface" || m_method == "surface_normal" || m_method == "surface_reflect" || m_method == "volume" || m_method == "hash_surface" || m_method == "surface_explicit") ? AoS : m_dir_encoding->preferred_output_layout();
+	// FIXED: Use the same RGB network input width as training (m_rgb_network_input_width) for all modes
+	GPUMatrixDynamic<T> rgb_network_input{m_rgb_network_input_width, batch_size, stream, surface_layout};
 
 		// CRITICAL FIX: Zero out the RGB network input buffer in inference mode too
 		CUDA_CHECK_THROW(cudaMemsetAsync(rgb_network_input.data(), 0, rgb_network_input.n_bytes(), stream));
 
 		GPUMatrixDynamic<T> density_network_output;
-		if (m_method == "surface" || m_method == "surface_normal" || m_method == "surface_reflect" || m_method == "volume") {
-			// CRITICAL: For surface modes, use AoS layout for density buffer to ensure copy compatibility
-			// This forces SphericalHarmonics to behave like Frequency encoding
-			density_network_output = GPUMatrixDynamic<T>{m_density_network->padded_output_width(), batch_size, stream, AoS};
-		} else if (m_method == "hash_surface") {
-			// hash_surface: Separate buffer for 1D density output
-			density_network_output = GPUMatrixDynamic<T>{m_density_network->padded_output_width(), batch_size, stream, AoS};
-		} else {
-			// Baseline mode (including SDF mode - use same pattern)
-			density_network_output = rgb_network_input.slice_rows(0, m_density_network->padded_output_width());
-		}
+	if (m_method == "surface" || m_method == "surface_normal" || m_method == "surface_reflect" || m_method == "volume" || m_method == "surface_explicit") {
+		// CRITICAL: For surface modes, use AoS layout for density buffer to ensure copy compatibility
+		// This forces SphericalHarmonics to behave like Frequency encoding
+		density_network_output = GPUMatrixDynamic<T>{m_density_network->padded_output_width(), batch_size, stream, AoS};
+	} else if (m_method == "hash_surface") {
+		// hash_surface: Separate buffer for 1D density output
+		density_network_output = GPUMatrixDynamic<T>{m_density_network->padded_output_width(), batch_size, stream, AoS};
+	} else {
+		// Baseline mode (including SDF mode - use same pattern)
+		density_network_output = rgb_network_input.slice_rows(0, m_density_network->padded_output_width());
+	}
 
-		GPUMatrixDynamic<T> rgb_network_output{output.data(), m_rgb_network->padded_output_width(), batch_size, output.layout()};
+	GPUMatrixDynamic<T> rgb_network_output{output.data(), m_rgb_network->padded_output_width(), batch_size, output.layout()};
+	
+	// For surface_explicit: grid density needs to persist until final extraction
+	GPUMatrixDynamic<T> grid_density_explicit;
 
-		// Standard forward pass
-		if (m_method == "hash_surface") {
+	// Standard forward pass
+	if (m_method == "hash_surface") {
 			// For hash_surface, position encoding outputs to hash_features_matrix (32D)
 			m_pos_encoding->inference_mixed_precision(
 				stream,
@@ -308,12 +339,62 @@ public:
 					stream,
 					reflection_vectors,
 					reflect_out,
-					use_inference_params
-				);
-			}
-			
-		} else if (m_method == "volume") {
-			// Volume mode: Compute divergences and use them for volume features
+			use_inference_params
+		);
+	}
+	
+} else if (m_method == "surface_explicit") {
+	// surface_explicit: density from grid + features from MLP + normals from grid gradients
+	
+	// Step 1: Get density from grid (need forward context for normals)
+	grid_density_explicit = GPUMatrixDynamic<T>{1, batch_size, stream, AoS};
+	auto grid_ctx = m_density_grid->forward(
+		stream,
+		input.slice_rows(0, 3),  // positions
+		&grid_density_explicit,
+		use_inference_params,
+		true  // prepare_input_gradients = true for normal computation
+	);
+	
+	// Step 2: Compute normals from grid gradients using autodiff
+	GPUMatrixDynamic<float> normals = compute_normals_from_grid_gradients(
+		stream, batch_size, input.slice_rows(0, 3), m_density_grid, *grid_ctx, grid_density_explicit, use_inference_params
+	);
+	
+	// Step 3: MLP forward for features
+	m_density_network->inference_mixed_precision(stream, density_network_input, density_network_output, use_inference_params);
+	
+	// Step 4: Compute surface features
+	auto surface_features_slice = rgb_network_input.slice_rows(1, 15);
+	linear_kernel(compute_surface_features_from_vectors_kernel<T>, 0, stream,
+		batch_size,
+		density_network_output.data() + 1,
+		density_network_output.layout() == AoS ? density_network_output.stride() : 1,
+		normals.data(),
+		normals.layout() == AoS ? 3 : 1,
+		surface_features_slice.data(),
+		surface_features_slice.layout() == AoS ? surface_features_slice.stride() : 1
+	);
+	
+	// Step 5: Replace channel 0 with grid density
+	linear_kernel(replace_first_channel_kernel<T>, 0, stream,
+		batch_size,
+		grid_density_explicit.data(),
+		rgb_network_input.layout() == AoS ? rgb_network_input.stride() : 1,
+		rgb_network_input.data()
+	);
+	
+	// Step 6: Direction encoding (same as surface mode)
+	auto dir_out = rgb_network_input.slice_rows(16, m_dir_encoding->padded_output_width());
+	m_dir_encoding->inference_mixed_precision(
+		stream,
+		input.slice_rows(m_dir_offset, m_dir_encoding->input_width()),
+		dir_out,
+		use_inference_params
+	);
+	
+} else if (m_method == "volume") {
+	// Volume mode: Compute divergences and use them for volume features
 			
 			// Compute volume divergences for inference
 			GPUMatrixDynamic<float> volume_divergences = compute_volume_divergences_inference(
@@ -406,7 +487,19 @@ public:
 
 		
 
-		// Extract density to output - use correct source for each mode
+	// Extract density to output - use correct source for each mode
+	if (m_method == "surface_explicit") {
+		// surface_explicit: Extract density from grid, not MLP
+		linear_kernel(extract_density<T>, 0, stream,
+			batch_size,
+			1,  // grid_density has stride 1
+			output.layout() == AoS ? padded_output_width() : 1,
+			grid_density_explicit.data(),
+			output.data() + 3 * (output.layout() == AoS ? 1 : batch_size),
+			false,  // grid stores density directly, not SDF
+			nullptr
+		);
+	} else {
 		linear_kernel(extract_density<T>, 0, stream,
 			batch_size,
 			density_network_output.layout() == AoS ? density_network_output.stride() : 1,
@@ -417,6 +510,7 @@ public:
 			m_variance_network ? m_variance_network->params() : nullptr  // Variance params
 		);
 	}
+}
 
 	uint32_t padded_density_output_width() const {
 		return m_density_network->padded_output_width();
@@ -432,21 +526,21 @@ public:
 			forward->density_network_input = GPUMatrixDynamic<T>{m_pos_encoding->padded_output_width(), batch_size, stream, m_pos_encoding->preferred_output_layout()};
 		}
 		
-		// CRITICAL: For surface modes, force AoS layout to match Frequency encoding behavior
-		MatrixLayout surface_layout = (m_method == "surface" || m_method == "surface_normal" || m_method == "surface_reflect" || m_method == "volume" || m_method == "hash_surface") ? AoS : m_dir_encoding->preferred_output_layout();
-		forward->rgb_network_input = GPUMatrixDynamic<T>{m_rgb_network_input_width, batch_size, stream, surface_layout};
+	// CRITICAL: For surface modes, force AoS layout to match Frequency encoding behavior
+	MatrixLayout surface_layout = (m_method == "surface" || m_method == "surface_normal" || m_method == "surface_reflect" || m_method == "volume" || m_method == "hash_surface" || m_method == "surface_explicit") ? AoS : m_dir_encoding->preferred_output_layout();
+	forward->rgb_network_input = GPUMatrixDynamic<T>{m_rgb_network_input_width, batch_size, stream, surface_layout};
 
 		// CRITICAL FIX: Zero out the RGB network input buffer to prevent garbage in unused sections
 		// This is especially important for surface_normal mode which has larger buffers
 		CUDA_CHECK_THROW(cudaMemsetAsync(forward->rgb_network_input.data(), 0, forward->rgb_network_input.n_bytes(), stream));
 
-		forward->pos_encoding_ctx = m_pos_encoding->forward(
-			stream,
-			input.slice_rows(0, m_pos_encoding->input_width()),
-			&forward->density_network_input,
-			use_inference_params,
-			prepare_input_gradients || m_method == "surface" || m_method == "surface_normal" || m_method == "surface_reflect" || m_method == "volume" || m_method == "hash_surface" // Always prepare gradients for surface and volume modes
-		);
+	forward->pos_encoding_ctx = m_pos_encoding->forward(
+		stream,
+		input.slice_rows(0, m_pos_encoding->input_width()),
+		&forward->density_network_input,
+		use_inference_params,
+		prepare_input_gradients || m_method == "surface" || m_method == "surface_normal" || m_method == "surface_reflect" || m_method == "volume" || m_method == "hash_surface" || m_method == "surface_explicit" // Always prepare gradients for surface and volume modes
+	);
 
 		GPUMatrixDynamic<T> dir_out;
 		if (m_method == "surface" || m_method == "surface_normal" || m_method == "surface_reflect") {
@@ -498,16 +592,63 @@ public:
 			// Compute volume features directly into RGB slice using divergences
 			auto volume_features_slice = forward->rgb_network_input.slice_rows(0, 16);
 			
-			// Compute volume features using divergences
-			linear_kernel(compute_volume_divergence_kernel<T>, 0, stream,
-				batch_size,
-				forward->density_network_output.layout() == AoS ? forward->density_network_output.stride() : 1,
-				forward->density_network_output.data(),
-				forward->volume_divergences.data(),  // Pass volume divergences
-				volume_features_slice.layout() == AoS ? volume_features_slice.stride() : 1,
-				volume_features_slice.data()
-			);
-		} else if (m_method == "hash_surface") {
+		// Compute volume features using divergences
+		linear_kernel(compute_volume_divergence_kernel<T>, 0, stream,
+			batch_size,
+			forward->density_network_output.layout() == AoS ? forward->density_network_output.stride() : 1,
+			forward->density_network_output.data(),
+			forward->volume_divergences.data(),  // Pass volume divergences
+			volume_features_slice.layout() == AoS ? volume_features_slice.stride() : 1,
+			volume_features_slice.data()
+		);
+} else if (m_method == "surface_explicit") {
+	// surface_explicit: density from grid + features from MLP
+	forward->density_network_output = GPUMatrixDynamic<T>{m_density_network->padded_output_width(), batch_size, stream, AoS};
+	
+	// Step 1: Get density from grid (with gradients for normal computation)
+	forward->grid_density = GPUMatrixDynamic<T>{1, batch_size, stream, AoS};
+	forward->density_grid_ctx = m_density_grid->forward(
+		stream,
+		input.slice_rows(0, 3),  // positions only
+		&forward->grid_density,
+		use_inference_params,
+		true  // prepare_input_gradients for normal computation
+	);
+	
+	// Step 2: MLP forward pass (48D output: 1 dummy + 45 features for 15 vectors)
+	forward->density_network_ctx = m_density_network->forward(
+		stream, forward->density_network_input, &forward->density_network_output, 
+		use_inference_params, false
+	);
+	
+	// Step 3: Compute normals from grid gradients using autodiff
+	forward->analytical_normals = compute_normals_from_grid_gradients(
+		stream, batch_size, input.slice_rows(0, 3), m_density_grid, *forward->density_grid_ctx, forward->grid_density, use_inference_params
+	);
+		
+		// Step 4: Compute 15 surface features using kernel
+		auto surface_features_slice = forward->rgb_network_input.slice_rows(1, 15);
+		linear_kernel(compute_surface_features_from_vectors_kernel<T>, 0, stream,
+			batch_size,
+			forward->density_network_output.data() + 1,  // Skip first channel (dummy)
+			forward->density_network_output.layout() == AoS ? forward->density_network_output.stride() : 1,
+			forward->analytical_normals.data(),
+			forward->analytical_normals.layout() == AoS ? 3 : 1,
+			surface_features_slice.data(),
+			surface_features_slice.layout() == AoS ? surface_features_slice.stride() : 1
+		);
+		
+	// Step 5: Replace channel 0 with grid density
+	linear_kernel(replace_first_channel_kernel<T>, 0, stream,
+		batch_size,
+		forward->grid_density.data(),
+		forward->rgb_network_input.layout() == AoS ? forward->rgb_network_input.stride() : 1,
+		forward->rgb_network_input.data()
+	);
+		
+		// Step 6: Direction encoding (same as surface mode)
+		dir_out = forward->rgb_network_input.slice_rows(16, m_dir_encoding->padded_output_width());
+	} else if (m_method == "hash_surface") {
 			// hash_surface mode: Extract density features from hash, pass to density MLP, then compute surface features
 			
 			// Extract density features from hash interpolation
@@ -661,9 +802,21 @@ public:
 
 		
 
-		if (output) {
-			// Extract density to output
-			// Both surface and baseline modes extract density from density_network_output
+	if (output) {
+		// Extract density to output
+		if (m_method == "surface_explicit") {
+			// surface_explicit: Extract density from grid, not MLP
+			linear_kernel(extract_density<T>, 0, stream,
+				batch_size,
+				1,  // grid_density has stride 1
+				output->layout() == AoS ? padded_output_width() : 1,
+				forward->grid_density.data(),
+				output->data() + 3 * (output->layout() == AoS ? 1 : batch_size),
+				false,  // grid stores density directly, not SDF
+				nullptr
+			);
+		} else {
+			// Other modes extract density from density_network_output
 			linear_kernel(extract_density<T>, 0, stream,
 				batch_size, 
 				forward->density_network_output.layout() == AoS ? forward->density_network_output.stride() : 1,
@@ -674,6 +827,7 @@ public:
 				m_variance_network ? m_variance_network->params() : nullptr  // Variance params
 			);
 		}
+	}
 
 		return forward;
 	}
@@ -700,9 +854,9 @@ public:
 		
 		const GPUMatrixDynamic<T> rgb_network_output{(T*)output.data(), m_rgb_network->padded_output_width(), batch_size, output.layout()};
 		
-		// CRITICAL: For surface modes, force AoS layout to match Frequency encoding behavior
-		MatrixLayout surface_layout = (m_method == "surface" || m_method == "surface_normal" || m_method == "surface_reflect" || m_method == "volume" || m_method == "hash_surface") ? AoS : m_dir_encoding->preferred_output_layout();
-		GPUMatrixDynamic<T> dL_drgb_network_input{m_rgb_network_input_width, batch_size, stream, surface_layout};
+	// CRITICAL: For surface modes, force AoS layout to match Frequency encoding behavior
+	MatrixLayout surface_layout = (m_method == "surface" || m_method == "surface_normal" || m_method == "surface_reflect" || m_method == "volume" || m_method == "hash_surface" || m_method == "surface_explicit") ? AoS : m_dir_encoding->preferred_output_layout();
+	GPUMatrixDynamic<T> dL_drgb_network_input{m_rgb_network_input_width, batch_size, stream, surface_layout};
 		
 		// CRITICAL FIX: Zero out the RGB network input gradient buffer to prevent accumulation into uninitialized memory
 		// This is especially important for surface_normal mode which has larger buffers with potentially unused sections
@@ -713,15 +867,15 @@ public:
 		// Backprop through dir encoding
 		if (m_dir_encoding->n_params() > 0 || dL_dinput) {
 			GPUMatrixDynamic<T> dL_ddir_encoding_output;
-			if (m_method == "surface" || m_method == "surface_normal" || m_method == "surface_reflect" || m_method == "volume") {
-				dL_ddir_encoding_output = dL_drgb_network_input.slice_rows(16, m_dir_encoding->padded_output_width());
-			} else if (m_method == "hash_surface") {
-				uint32_t n_levels = m_pos_encoding->padded_output_width() / 4; // Dynamic levels calculation
-				uint32_t surface_features = n_levels; // n_levels hash surface features (no density)
-				dL_ddir_encoding_output = dL_drgb_network_input.slice_rows(surface_features + 1, m_dir_encoding->padded_output_width());
-			} else {
-				dL_ddir_encoding_output = dL_drgb_network_input.slice_rows(m_density_network->padded_output_width(), m_dir_encoding->padded_output_width());
-			}
+		if (m_method == "surface" || m_method == "surface_normal" || m_method == "surface_reflect" || m_method == "volume" || m_method == "surface_explicit") {
+			dL_ddir_encoding_output = dL_drgb_network_input.slice_rows(16, m_dir_encoding->padded_output_width());
+		} else if (m_method == "hash_surface") {
+			uint32_t n_levels = m_pos_encoding->padded_output_width() / 4; // Dynamic levels calculation
+			uint32_t surface_features = n_levels; // n_levels hash surface features (no density)
+			dL_ddir_encoding_output = dL_drgb_network_input.slice_rows(surface_features + 1, m_dir_encoding->padded_output_width());
+		} else {
+			dL_ddir_encoding_output = dL_drgb_network_input.slice_rows(m_density_network->padded_output_width(), m_dir_encoding->padded_output_width());
+		}
 			
 			GPUMatrixDynamic<float> dL_ddir_encoding_input;
 			if (dL_dinput) {
@@ -729,15 +883,15 @@ public:
 			}
 
 			GPUMatrixDynamic<T> dir_encoding_forward_output;
-			if (m_method == "surface" || m_method == "surface_normal" || m_method == "surface_reflect" || m_method == "volume") {
-				dir_encoding_forward_output = forward.rgb_network_input.slice_rows(16, m_dir_encoding->padded_output_width());
-			} else if (m_method == "hash_surface") {
-				uint32_t n_levels = m_pos_encoding->padded_output_width() / 4; // Dynamic levels calculation
-				uint32_t surface_features = n_levels; // n_levels hash surface features (no density)
-				dir_encoding_forward_output = forward.rgb_network_input.slice_rows(surface_features, m_dir_encoding->padded_output_width());
-			} else {
-				dir_encoding_forward_output = forward.rgb_network_input.slice_rows(m_density_network->padded_output_width(), m_dir_encoding->padded_output_width());
-			}
+		if (m_method == "surface" || m_method == "surface_normal" || m_method == "surface_reflect" || m_method == "volume" || m_method == "surface_explicit") {
+			dir_encoding_forward_output = forward.rgb_network_input.slice_rows(16, m_dir_encoding->padded_output_width());
+		} else if (m_method == "hash_surface") {
+			uint32_t n_levels = m_pos_encoding->padded_output_width() / 4; // Dynamic levels calculation
+			uint32_t surface_features = n_levels; // n_levels hash surface features (no density)
+			dir_encoding_forward_output = forward.rgb_network_input.slice_rows(surface_features, m_dir_encoding->padded_output_width());
+		} else {
+			dir_encoding_forward_output = forward.rgb_network_input.slice_rows(m_density_network->padded_output_width(), m_dir_encoding->padded_output_width());
+		}
 
 			m_dir_encoding->backward(
 				stream,
@@ -756,17 +910,17 @@ public:
 
 		// Map gradients from surface features back to density outputs
 		GPUMatrixDynamic<T> dL_ddensity_network_output;
-		if (m_method == "surface" || m_method == "surface_normal" || m_method == "surface_reflect" || m_method == "volume") {
-			// CRITICAL: For surface/volume modes, use AoS layout for density gradient buffer to ensure copy compatibility
-			// This forces SphericalHarmonics to behave like Frequency encoding
-			dL_ddensity_network_output = GPUMatrixDynamic<T>{m_density_network->padded_output_width(), batch_size, stream, AoS};
-			CUDA_CHECK_THROW(cudaMemsetAsync(dL_ddensity_network_output.data(), 0, dL_ddensity_network_output.n_bytes(), stream));
-		} else if (m_method == "hash_surface") {
-			// hash_surface: Separate buffer for 1D density gradients
-			dL_ddensity_network_output = GPUMatrixDynamic<T>{m_density_network->padded_output_width(), batch_size, stream, AoS};
-			CUDA_CHECK_THROW(cudaMemsetAsync(dL_ddensity_network_output.data(), 0, dL_ddensity_network_output.n_bytes(), stream));
-		} else {
-			// Baseline mode (including SDF mode - use same pattern)
+	if (m_method == "surface" || m_method == "surface_normal" || m_method == "surface_reflect" || m_method == "volume" || m_method == "surface_explicit") {
+		// CRITICAL: For surface/volume modes, use AoS layout for density gradient buffer to ensure copy compatibility
+		// This forces SphericalHarmonics to behave like Frequency encoding
+		dL_ddensity_network_output = GPUMatrixDynamic<T>{m_density_network->padded_output_width(), batch_size, stream, AoS};
+		CUDA_CHECK_THROW(cudaMemsetAsync(dL_ddensity_network_output.data(), 0, dL_ddensity_network_output.n_bytes(), stream));
+	} else if (m_method == "hash_surface") {
+		// hash_surface: Separate buffer for 1D density gradients
+		dL_ddensity_network_output = GPUMatrixDynamic<T>{m_density_network->padded_output_width(), batch_size, stream, AoS};
+		CUDA_CHECK_THROW(cudaMemsetAsync(dL_ddensity_network_output.data(), 0, dL_ddensity_network_output.n_bytes(), stream));
+	} else {
+		// Baseline mode (including SDF mode - use same pattern)
 			dL_ddensity_network_output = dL_drgb_network_input.slice_rows(0, m_density_network->padded_output_width());
 		}
 
@@ -1063,14 +1217,87 @@ public:
 				dL_ddivergences.data()  // Collect gradients w.r.t. divergences
 			);
 			
-			// Backpropagate gradients from divergences back to density network parameters
-			accumulate_volume_divergence_gradients(
-				stream, batch_size, input, forward, dL_ddivergences,
-				dL_ddensity_network_output, use_inference_params, param_gradients_mode
+		// Backpropagate gradients from divergences back to density network parameters
+		accumulate_volume_divergence_gradients(
+			stream, batch_size, input, forward, dL_ddivergences,
+			dL_ddensity_network_output, use_inference_params, param_gradients_mode
+		);
+	} else if (m_method == "surface_explicit") {
+		// surface_explicit: backprop to both grid and MLP
+		
+		// Step 1: Backprop through surface features to get gradients for 45-D MLP output
+		auto dL_dsurface_slice = dL_drgb_network_input.slice_rows(1, 15);
+		CUDA_CHECK_THROW(cudaMemsetAsync(dL_ddensity_network_output.data(), 0, dL_ddensity_network_output.n_bytes(), stream));
+		
+		linear_kernel(backprop_surface_features_kernel<T>, 0, stream,
+			batch_size,
+			dL_dsurface_slice.data(),
+			dL_dsurface_slice.layout() == AoS ? dL_dsurface_slice.stride() : 1,
+			forward.analytical_normals.data(),
+			forward.analytical_normals.layout() == AoS ? 3 : 1,
+			dL_ddensity_network_output.data() + 1,  // Output to features (skip channel 0)
+			dL_ddensity_network_output.layout() == AoS ? dL_ddensity_network_output.stride() : 1
+		);
+		
+		// Step 2: Extract gradient for channel 0 (goes to grid)
+		GPUMatrixDynamic<T> dL_dgrid_density{1, batch_size, stream, AoS};
+		linear_kernel(extract_first_channel_gradient_kernel<T>, 0, stream,
+			batch_size,
+			dL_drgb_network_input.data(),
+			dL_drgb_network_input.layout() == AoS ? dL_drgb_network_input.stride() : 1,
+			dL_dgrid_density.data()
+		);
+		
+		// Step 3: Backprop to density network parameters
+		GPUMatrixDynamic<T> dL_ddensity_input;
+		if (m_pos_encoding->n_params() > 0 || dL_dinput) {
+			dL_ddensity_input = GPUMatrixDynamic<T>{m_pos_encoding->padded_output_width(), batch_size, stream, m_pos_encoding->preferred_output_layout()};
+		}
+		m_density_network->backward(
+			stream, *forward.density_network_ctx, forward.density_network_input, forward.density_network_output,
+			dL_ddensity_network_output, dL_ddensity_input.data() ? &dL_ddensity_input : nullptr, use_inference_params, param_gradients_mode
+		);
+		
+	// Step 4: Backprop to grid parameters
+	if (m_density_grid->n_params() > 0 || dL_dinput) {
+		GPUMatrixDynamic<float> dL_dpositions_from_grid{3, batch_size, stream, AoS};
+		
+		m_density_grid->backward(
+			stream, *forward.density_grid_ctx, 
+			input.slice_rows(0, 3),  // positions
+			forward.grid_density,  // grid output from forward pass
+			dL_dgrid_density,  // gradients from channel 0
+			dL_dinput ? &dL_dpositions_from_grid : nullptr,
+			use_inference_params,
+			param_gradients_mode
+		);
+	}
+		
+		// Step 5: Backprop through pos encoding
+		if (dL_ddensity_input.data()) {
+			GPUMatrixDynamic<float> dL_dpos_encoding_input;
+			if (dL_dinput) {
+				dL_dpos_encoding_input = dL_dinput->slice_rows(0, m_pos_encoding->input_width());
+			}
+			
+			m_pos_encoding->backward(
+				stream,
+				*forward.pos_encoding_ctx,
+				input.slice_rows(0, m_pos_encoding->input_width()),
+				forward.density_network_input,
+				dL_ddensity_input,
+				dL_dinput ? &dL_dpos_encoding_input : nullptr,
+				use_inference_params,
+				param_gradients_mode
 			);
 		}
 		
-		// Add gradient from final RGBD output (alpha blending)
+		// Don't do the standard density network backward for surface_explicit
+		// Skip the standard backprop below by zeroing dL_ddensity_network_output
+		CUDA_CHECK_THROW(cudaMemsetAsync(dL_ddensity_network_output.data(), 0, dL_ddensity_network_output.n_bytes(), stream));
+	}
+	
+	// Add gradient from final RGBD output (alpha blending)
 		// if (m_method == "surface") {
 		// 	// In surface mode, alpha gradient goes to RGB input[0]
 		// 	linear_kernel(add_density_gradient<T>, 0, stream,
@@ -1105,13 +1332,13 @@ public:
 			dL_ddensity_network_input = GPUMatrixDynamic<T>{m_pos_encoding->padded_output_width(), batch_size, stream, m_pos_encoding->preferred_output_layout()};
 		}
 
-		// Skip density network backward for hash_surface since it was already handled in the hash_surface block
-		if (m_method != "hash_surface") {
-			m_density_network->backward(stream, *forward.density_network_ctx, forward.density_network_input, forward.density_network_output, dL_ddensity_network_output, dL_ddensity_network_input.data() ? &dL_ddensity_network_input : nullptr, use_inference_params, param_gradients_mode);
-		}
+	// Skip density network backward for hash_surface and surface_explicit since they were already handled
+	if (m_method != "hash_surface" && m_method != "surface_explicit") {
+		m_density_network->backward(stream, *forward.density_network_ctx, forward.density_network_input, forward.density_network_output, dL_ddensity_network_output, dL_ddensity_network_input.data() ? &dL_ddensity_network_input : nullptr, use_inference_params, param_gradients_mode);
+	}
 
-		// Backprop through pos encoding (skip for hash_surface since it's handled specially)
-		if (dL_ddensity_network_input.data() && m_method != "hash_surface") {
+	// Backprop through pos encoding (skip for hash_surface and surface_explicit since they're handled specially)
+	if (dL_ddensity_network_input.data() && m_method != "hash_surface" && m_method != "surface_explicit") {
 					GPUMatrixDynamic<float> dL_dpos_encoding_input;
 		if (dL_dinput) {
 			dL_dpos_encoding_input = dL_dinput->slice_rows(0, m_pos_encoding->input_width());
@@ -2276,6 +2503,7 @@ private:
 	std::shared_ptr<Encoding<T>> m_pos_encoding;
 	std::shared_ptr<Encoding<T>> m_dir_encoding;
 	std::shared_ptr<TrainableBuffer<1, 1, T>> m_variance_network;  // For SDF mode
+	std::shared_ptr<Encoding<T>> m_density_grid;  // Explicit density grid (for surface_explicit mode only)
 
 	std::shared_ptr<NetworkWithInputEncoding<T>> m_density_model;
 
@@ -2309,18 +2537,22 @@ private:
 		std::unique_ptr<Context> rgb_network_ctx;
 		std::unique_ptr<Context> normal_encoding_ctx;     // For surface_normal mode
 		std::unique_ptr<Context> reflection_encoding_ctx; // For surface_reflect mode
+		std::unique_ptr<Context> density_grid_ctx;        // For surface_explicit mode grid encoding
 
 		// Analytical normals (∂SDF/∂xyz) - stored in forward context for backward pass
 		GPUMatrixDynamic<float> dSDF_dPos;
 		GPUMatrixDynamic<float> raw_gradients;     // Raw ∇SDF before normalization
 		GPUMatrixDynamic<float> analytical_normals;
 		
-		// For volume mode: divergences of 15 3D vector fields
-		GPUMatrixDynamic<float> volume_divergences;      // 15D divergence values per sample
-		
-		// For surface_normal mode: encoded normals
-		GPUMatrixDynamic<T> encoded_normals_out;         // Output slice for encoded normals
-	};
+	// For volume mode: divergences of 15 3D vector fields
+	GPUMatrixDynamic<float> volume_divergences;      // 15D divergence values per sample
+	
+	// For surface_normal mode: encoded normals
+	GPUMatrixDynamic<T> encoded_normals_out;         // Output slice for encoded normals
+	
+	// For surface_explicit mode: grid density output
+	GPUMatrixDynamic<T> grid_density;                // Grid density output for backward pass
+};
 
 	
 };
