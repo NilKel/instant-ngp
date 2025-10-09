@@ -47,11 +47,12 @@ __global__ void extract_density(
 	const T* __restrict__ density,
 	T* __restrict__ rgbd,
 	bool sdf_mode = false,
-	const T* __restrict__ variance_params = nullptr
+	const T* __restrict__ variance_params = nullptr,
+	bool apply_exp = false  // NEW: Apply exponential activation (for grid-based density)
 ) {
 	const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
 	if (i >= n_elements) return;
-
+	
 	T density_val = density[i * density_stride];
 	
 	if (sdf_mode) {
@@ -75,6 +76,10 @@ __global__ void extract_density(
 		}
 		
 		density_val = T(density_result);
+	} else if (apply_exp) {
+		// Apply exponential activation for grid-based density
+		// Grid stores log-density, so we need exp() to get actual density
+		density_val = T(expf(float(density_val)));
 	}
 	
 	rgbd[i * rgbd_stride] = density_val;
@@ -1126,20 +1131,32 @@ __global__ void copy_float_to_T_kernel(
  * @brief Replace first channel with grid density (for surface_explicit mode).
  * 
  * @param n_elements Number of samples
- * @param grid_density Grid density values (1D per sample)
- * @param stride Stride for network output
+ * @param grid_density Grid density values (padded, extract first channel)
+ * @param grid_stride Stride for grid density (usually padded_output_width)
+ * @param output_stride Stride for network output
  * @param network_output Network output buffer (channel 0 will be replaced)
  */
 template <typename T>
 __global__ void replace_first_channel_kernel(
 	const uint32_t n_elements,
 	const T* __restrict__ grid_density,
-	const uint32_t stride,
+	const uint32_t grid_stride,
+	const uint32_t output_stride,
 	T* __restrict__ network_output
 ) {
 	const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
 	if (i >= n_elements) return;
-	network_output[i * stride] = grid_density[i];
+	
+	// For AoS grid (stride > 1): sample i is at i * stride
+	// For SoA grid (stride = 1): sample i, channel 0 is at i
+	uint32_t grid_idx = (grid_stride > 1) ? (i * grid_stride) : i;
+	
+	// For AoS output (stride > 1): sample i, channel 0 is at i * stride
+	// For SoA output (stride = 1): sample i, channel 0 is at i
+	uint32_t output_idx = (output_stride > 1) ? (i * output_stride) : i;
+	
+	// Extract first channel from padded grid output
+	network_output[output_idx] = grid_density[grid_idx];
 }
 
 /**
@@ -1147,19 +1164,150 @@ __global__ void replace_first_channel_kernel(
  * 
  * @param n_elements Number of samples
  * @param dL_dnetwork_output Gradients w.r.t. network output
- * @param stride Stride for network output gradients
- * @param dL_dgrid_density Gradients w.r.t. grid density (output)
+ * @param input_stride Stride for network output gradients
+ * @param grid_stride Stride for grid density gradients (usually padded_output_width)
+ * @param dL_dgrid_density Gradients w.r.t. grid density (padded output)
  */
 template <typename T>
 __global__ void extract_first_channel_gradient_kernel(
 	const uint32_t n_elements,
 	const T* __restrict__ dL_dnetwork_output,
-	const uint32_t stride,
-	T* __restrict__ dL_dgrid_density
+	const uint32_t input_stride,
+	const uint32_t grid_stride,
+	T* __restrict__ dL_dgrid_density,
+	const T* __restrict__ grid_forward_values = nullptr,  // Forward grid values for chain rule
+	bool apply_exp_chain_rule = false  // Apply d(exp(x))/dx = exp(x) chain rule
 ) {
 	const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
 	if (i >= n_elements) return;
-	dL_dgrid_density[i] = dL_dnetwork_output[i * stride];
+	
+	// For AoS input (stride > 1): sample i, channel 0 is at i * stride
+	// For SoA input (stride = 1): sample i, channel 0 is at 0 * batch_size + i = i
+	uint32_t input_idx = (input_stride > 1) ? (i * input_stride) : i;
+	
+	// For AoS grid (stride > 1): sample i is at i * stride
+	// For SoA grid (stride = 1): sample i is at i
+	uint32_t grid_idx = (grid_stride > 1) ? (i * grid_stride) : i;
+	
+	T grad = dL_dnetwork_output[input_idx];
+	
+	// Apply chain rule for exp activation: dL/d(grid) = dL/d(density) * exp(grid)
+	if (apply_exp_chain_rule && grid_forward_values) {
+		T grid_val = grid_forward_values[grid_idx];
+		grad *= T(expf(float(grid_val)));
+	}
+	
+	// Atomically accumulate to avoid race conditions when multiple samples hit same grid cell
+	atomicAdd(&dL_dgrid_density[grid_idx], grad);
+}
+
+/**
+ * @brief Accumulate density gradient from RGBD output to grid (for surface_explicit mode).
+ * 
+ * Reads gradient from channel 3 (density) of RGBD output and accumulates to channel 0 of grid.
+ * 
+ * @param n_elements Number of samples
+ * @param dL_drgbd RGBD output gradients (4 channels: RGB + density)
+ * @param rgbd_stride Stride for RGBD output
+ * @param dL_dgrid_density Grid density gradients (padded)
+ * @param grid_stride Stride for grid density (usually padded_output_width)
+ */
+template <typename T>
+__global__ void accumulate_density_gradient_to_grid_kernel(
+	const uint32_t n_elements,
+	const T* __restrict__ dL_drgbd,
+	const uint32_t rgbd_stride,
+	T* __restrict__ dL_dgrid_density,
+	const uint32_t grid_stride,
+	const uint32_t rgbd_n_rows,  // Number of rows (channels) in RGBD
+	const T* __restrict__ grid_forward_values = nullptr,  // Forward grid values for chain rule
+	bool apply_exp_chain_rule = false  // Apply d(exp(x))/dx = exp(x) chain rule
+) {
+	const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
+	if (i >= n_elements) return;
+	
+	// Read density gradient from channel 3 of RGBD output and accumulate to channel 0 of grid
+	// For AoS (stride=4): sample i, channel 3 is at data[i*4+3]
+	// For SoA (stride=1): sample i, channel 3 is at data[3*batch_size+i]
+	const uint32_t density_idx = (rgbd_stride > 1) ? (i * rgbd_stride + 3) : (3 * n_elements + i);
+	
+	// For AoS grid (stride > 1): sample i is at i * stride
+	// For SoA grid (stride = 1): sample i is at i
+	uint32_t grid_idx = (grid_stride > 1) ? (i * grid_stride) : i;
+	
+	T grad = dL_drgbd[density_idx];
+	
+	// Apply chain rule for exp activation: dL/d(grid) = dL/d(density) * exp(grid)
+	if (apply_exp_chain_rule && grid_forward_values) {
+		T grid_val = grid_forward_values[grid_idx];
+		grad *= T(expf(float(grid_val)));
+	}
+	
+	// Atomically accumulate to avoid race conditions when multiple samples hit same grid cell
+	atomicAdd(&dL_dgrid_density[grid_idx], grad);
+}
+
+/**
+ * @brief Copy N channels from source to destination with offset.
+ * 
+ * @param n_elements Number of samples
+ * @param n_channels Number of channels to copy
+ * @param src Source data
+ * @param src_stride Stride for source
+ * @param dst Destination data
+ * @param dst_stride Stride for destination
+ * @param dst_offset Starting channel offset in destination
+ */
+template <typename T>
+__global__ void copy_channels_kernel(
+	const uint32_t n_elements,
+	const uint32_t n_channels,
+	const T* __restrict__ src,
+	const uint32_t src_stride,
+	T* __restrict__ dst,
+	const uint32_t dst_stride,
+	const uint32_t dst_offset
+) {
+	const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
+	if (i >= n_elements) return;
+	
+	for (uint32_t c = 0; c < n_channels; ++c) {
+		// For AoS src (stride > 1): src[i * stride + c]
+		// For SoA src (stride = 1): src[c * batch_size + i]
+		uint32_t src_idx = (src_stride > 1) ? (i * src_stride + c) : (c * n_elements + i);
+		
+		// For AoS dst (stride > 1): dst[i * stride + offset + c]
+		// For SoA dst (stride = 1): dst[(offset + c) * batch_size + i]
+		uint32_t dst_idx = (dst_stride > 1) ? (i * dst_stride + dst_offset + c) : ((dst_offset + c) * n_elements + i);
+		
+		dst[dst_idx] = src[src_idx];
+	}
+}
+
+template <typename T>
+__global__ void copy_channels_with_src_offset_kernel(
+	const uint32_t n_elements,
+	const uint32_t n_channels,
+	const T* __restrict__ src,
+	const uint32_t src_stride,
+	const uint32_t src_offset,
+	T* __restrict__ dst,
+	const uint32_t dst_stride
+) {
+	const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
+	if (i >= n_elements) return;
+	
+	for (uint32_t c = 0; c < n_channels; ++c) {
+		// For AoS src (stride > 1): src[i * stride + offset + c]
+		// For SoA src (stride = 1): src[(offset + c) * batch_size + i]
+		uint32_t src_idx = (src_stride > 1) ? (i * src_stride + src_offset + c) : ((src_offset + c) * n_elements + i);
+		
+		// For AoS dst (stride > 1): dst[i * stride + c]
+		// For SoA dst (stride = 1): dst[c * batch_size + i]
+		uint32_t dst_idx = (dst_stride > 1) ? (i * dst_stride + c) : (c * n_elements + i);
+		
+		dst[dst_idx] = src[src_idx];
+	}
 }
 
 /**
@@ -1188,14 +1336,95 @@ static __global__ void offset_positions_kernel(
 }
 
 /**
- * @brief Compute central difference gradient for one dimension.
+ * @brief Daubechies derivative stencil coefficients.
+ * 
+ * These are connection coefficients for first derivatives with different genus (accuracy order).
+ * Genus 1: 2-point stencil (standard central difference)
+ * Genus 2: 4-point stencil (higher accuracy)
+ */
+struct DaubechiesStencil {
+	int genus;
+	int num_points;  // Number of points on each side (total = 2*num_points for symmetric stencil)
+	float coeffs[5];  // Max 5 coefficients per side for genus 2
+	
+	__host__ __device__ DaubechiesStencil(int g = 1) : genus(g) {
+		if (g == 1) {
+			// Genus 1: [1/2, 0, -1/2] -> coefficient is 1/2 at offset ±1
+			num_points = 1;
+			coeffs[0] = 0.5f;  // Position +1 gets +1/2, position -1 gets -1/2
+		} else if (g == 2) {
+			// Genus 2: [1/12, -2/3, 0, 2/3, -1/12]
+			// Positions: -2, -1, 0, +1, +2
+			// Coefficients: -1/12, 2/3, 0, -2/3, 1/12 (antisymmetric)
+			num_points = 2;
+			coeffs[0] = 2.0f/3.0f;     // Position ±1
+			coeffs[1] = -1.0f/12.0f;   // Position ±2
+		} else {
+			// Default to genus 1
+			num_points = 1;
+			coeffs[0] = 0.5f;
+		}
+	}
+	
+	__device__ float compute_gradient(const float* densities, int center_idx, float eps) const {
+		float grad = 0.0f;
+		for (int i = 0; i < num_points; ++i) {
+			// Antisymmetric stencil: f'(x) ≈ Σ c_i [f(x+i*eps) - f(x-i*eps)] / eps
+			int offset = i + 1;  // Offset 1, 2, 3, ...
+			float density_plus = densities[center_idx + offset];
+			float density_minus = densities[center_idx - offset];
+			grad += coeffs[i] * (density_plus - density_minus);
+		}
+		return grad / eps;
+	}
+};
+
+/**
+ * @brief Compute finite difference gradient using Daubechies stencil.
  * 
  * @param n_elements Number of samples
- * @param density_pos Density at position + eps
- * @param density_neg Density at position - eps
+ * @param densities Array of density samples [batch_size * (2*num_points + 1)]
+ *                  Layout: [..., d_{-n}, ..., d_{-1}, d_0, d_{+1}, ..., d_{+n}, ...]
+ * @param num_points Number of points on each side
+ * @param stencil_coeffs Stencil coefficients
  * @param gradients Output gradients (3D per sample, AoS layout)
  * @param dim Dimension index (0=x, 1=y, 2=z)
  * @param eps Finite difference step size
+ */
+template <typename T>
+static __global__ void compute_finite_difference_stencil_kernel(
+	const uint32_t n_elements,
+	const T* const* __restrict__ density_samples,  // Array of pointers to density buffers
+	const int num_points,
+	const float* __restrict__ stencil_coeffs,
+	float* __restrict__ gradients,
+	const uint32_t dim,
+	const float eps,
+	const uint32_t density_stride  // Stride for density buffers (padded_output_width)
+) {
+	const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
+	if (i >= n_elements) return;
+	
+	// Compute gradient using antisymmetric stencil
+	float grad = 0.0f;
+	for (int j = 0; j < num_points; ++j) {
+		// density_samples layout: [0]=offset -num_points, ..., [num_points-1]=offset -1,
+		//                         [num_points]=offset +1, ..., [2*num_points-1]=offset +num_points
+		int idx_plus = num_points + j;      // Positive offsets start at num_points
+		int idx_minus = num_points - 1 - j; // Negative offsets: num_points-1, num_points-2, ...
+		
+		// CRITICAL: Use stride to access first channel of padded output
+		float density_plus = float(density_samples[idx_plus][i * density_stride]);
+		float density_minus = float(density_samples[idx_minus][i * density_stride]);
+		
+		grad += stencil_coeffs[j] * (density_plus - density_minus);
+	}
+	
+	gradients[i * 3 + dim] = grad / eps;
+}
+
+/**
+ * @brief Legacy 2-point central difference (for genus=1).
  */
 template <typename T>
 static __global__ void compute_finite_difference_kernel(
@@ -1508,6 +1737,35 @@ static __global__ void backprop_finite_difference_kernel(
 	dL_ddensity_neg[i] = T(-dL_dgrad_dim * inv_2eps);
 }
 
+/**
+ * @brief Backprop through Daubechies stencil.
+ * 
+ * Forward: grad[dim] = Σ c_i * [density(+i*eps) - density(-i*eps)] / eps
+ * Backward: dL/ddensity_sample = scale * dL/dgrad[dim]
+ * 
+ * @param n_elements Number of samples
+ * @param dL_dgradients Gradients w.r.t. raw gradients (3D per sample)
+ * @param dim Dimension index (0=x, 1=y, 2=z)
+ * @param scale Scale factor (±coefficient / eps)
+ * @param dL_ddensity_sample Output gradient w.r.t. density at this offset
+ */
+template <typename T>
+static __global__ void backprop_daubechies_stencil_kernel(
+	const uint32_t n_elements,
+	const float* __restrict__ dL_dgradients,
+	const uint32_t dim,
+	const float scale,
+	T* __restrict__ dL_ddensity_sample,
+	const uint32_t density_stride  // Stride for density buffer (padded_output_width)
+) {
+	const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
+	if (i >= n_elements) return;
+	
+	const float dL_dgrad_dim = dL_dgradients[i * 3 + dim];
+	// CRITICAL: Use stride to write to first channel of padded output
+	dL_ddensity_sample[i * density_stride] = T(scale * dL_dgrad_dim);
+}
+
 
 template <typename T, typename ForwardCtx = void>
 tcnn::GPUMatrixDynamic<float> compute_normals_from_grid_gradients(
@@ -1529,124 +1787,157 @@ tcnn::GPUMatrixDynamic<float> compute_normals_from_grid_gradients(
 	GPUMatrixDynamic<float> dDensity_dPos{3, batch_size, stream, AoS};
 	
 	if (use_finite_diff) {
-		// Method 2: Finite differences with gradient backprop
+		// Method 2: Finite differences with Daubechies stencils
 		const float eps = 1e-4f;  // TODO: Make proportional to grid cell size
 		
-				// Check if we should save contexts for backprop
-		bool save_contexts = (forward_ctx != nullptr);
+		// Get genus from environment variable (default: 1)
+		const char* genus_env = std::getenv("NGP_GENUS");
+		int genus = (genus_env && std::strlen(genus_env) > 0) ? std::atoi(genus_env) : 1;
+		genus = std::min(std::max(genus, 1), 2);  // Clamp to [1, 2]
 		
-		if (save_contexts) {
-			// Reserve space for 6 contexts and buffers (±x, ±y, ±z)
-			forward_ctx->finite_diff_contexts.reserve(6);
-			forward_ctx->finite_diff_densities.reserve(6);
-			forward_ctx->finite_diff_positions.reserve(6);
-			
-			// Compute gradients for each dimension using forward() to save contexts
-			for (int dim = 0; dim < 3; ++dim) {
-				// Positive offset: position + eps
-				GPUMatrixDynamic<float> positions_pos{3, batch_size, stream, AoS};
-				linear_kernel(offset_positions_kernel, 0, stream,
-					batch_size, positions.data(), positions_pos.data(), dim, eps);
-				
-				GPUMatrixDynamic<T> density_pos{1, batch_size, stream, AoS};
-				auto ctx_pos = grid_encoding->forward(stream, positions_pos, &density_pos, use_inference_params, false);
-				
-				// Negative offset: position - eps
-				GPUMatrixDynamic<float> positions_neg{3, batch_size, stream, AoS};
-				linear_kernel(offset_positions_kernel, 0, stream,
-					batch_size, positions.data(), positions_neg.data(), dim, -eps);
-				
-				GPUMatrixDynamic<T> density_neg{1, batch_size, stream, AoS};
-				auto ctx_neg = grid_encoding->forward(stream, positions_neg, &density_neg, use_inference_params, false);
-				
-				// Compute central difference: (density_pos - density_neg) / (2 * eps)
-				linear_kernel(compute_finite_difference_kernel<T>, 0, stream,
-					batch_size, density_pos.data(), density_neg.data(), dDensity_dPos.data(), dim, eps);
-				
-				// Save contexts and buffers for backward pass
-				forward_ctx->finite_diff_contexts.push_back(std::move(ctx_pos));
-				forward_ctx->finite_diff_densities.push_back(std::move(density_pos));
-				forward_ctx->finite_diff_positions.push_back(std::move(positions_pos));
-				forward_ctx->finite_diff_contexts.push_back(std::move(ctx_neg));
-				forward_ctx->finite_diff_densities.push_back(std::move(density_neg));
-				forward_ctx->finite_diff_positions.push_back(std::move(positions_neg));
-			}
-		} else {
-			// Inference mode: use inference_mixed_precision, no gradient saving
-			for (int dim = 0; dim < 3; ++dim) {
-				// Positive offset
-				GPUMatrixDynamic<float> positions_pos{3, batch_size, stream, AoS};
-				linear_kernel(offset_positions_kernel, 0, stream,
-					batch_size, positions.data(), positions_pos.data(), dim, eps);
-				GPUMatrixDynamic<T> density_pos{1, batch_size, stream, AoS};
-				grid_encoding->inference_mixed_precision(stream, positions_pos, density_pos, use_inference_params);
-				
-				// Negative offset
-				GPUMatrixDynamic<float> positions_neg{3, batch_size, stream, AoS};
-				linear_kernel(offset_positions_kernel, 0, stream,
-					batch_size, positions.data(), positions_neg.data(), dim, -eps);
-				GPUMatrixDynamic<T> density_neg{1, batch_size, stream, AoS};
-				grid_encoding->inference_mixed_precision(stream, positions_neg, density_neg, use_inference_params);
-				
-				// Compute central difference
-				linear_kernel(compute_finite_difference_kernel<T>, 0, stream,
-					batch_size, density_pos.data(), density_neg.data(), dDensity_dPos.data(), dim, eps);
-			}
-		}
-	} else {
-				// Just inference, no gradients
-				grid_encoding->inference_mixed_precision(stream, positions_pos, density_pos, use_inference_params);
-			}
-			
-			// Negative offset: position - eps
-			GPUMatrixDynamic<float> positions_neg{3, batch_size, stream, AoS};
-			linear_kernel(offset_positions_kernel, 0, stream,
-				batch_size, positions.data(), positions_neg.data(), dim, -eps);
-			
-			GPUMatrixDynamic<T> density_neg{1, batch_size, stream, AoS};
+		DaubechiesStencil stencil(genus);
+		int num_points = stencil.num_points;  // Number of points on each side
+		
+		// Check if we should save contexts for backprop (only possible when ForwardCtx != void)
+		constexpr bool has_forward_ctx = !std::is_same<ForwardCtx, void>::value;
+		
+		if constexpr (has_forward_ctx) {
+			// Training mode: Use forward() to save contexts
+			bool save_contexts = (forward_ctx != nullptr);
 			
 			if (save_contexts) {
-				// Use forward() to save context for backprop
-				auto ctx_neg = grid_encoding->forward(stream, positions_neg, &density_neg, use_inference_params, false);
-				forward_ctx->finite_diff_contexts.push_back(std::move(ctx_neg));
-				forward_ctx->finite_diff_densities.push_back(std::move(density_neg));
-				forward_ctx->finite_diff_positions.push_back(std::move(positions_neg));
-			} else {
-				// Just inference, no gradients
-				grid_encoding->inference_mixed_precision(stream, positions_neg, density_neg, use_inference_params);
+				// Reserve space: num_points * 2 samples per dimension * 3 dimensions
+				int total_samples = 2 * num_points * 3;
+				forward_ctx->finite_diff_contexts.reserve(total_samples);
+				forward_ctx->finite_diff_densities.reserve(total_samples);
+				forward_ctx->finite_diff_positions.reserve(total_samples);
+				forward_ctx->finite_diff_genus = genus;  // Store genus for backward pass
+				
+				// Compute gradients for each dimension using forward() to save contexts
+				for (int dim = 0; dim < 3; ++dim) {
+					// Sample at multiple offsets based on genus
+					for (int offset_idx = 1; offset_idx <= num_points; ++offset_idx) {
+						float offset = offset_idx * eps;
+						
+						// Positive offset
+						// CRITICAL: Must use padded_output_width(), not 1
+						GPUMatrixDynamic<float> positions_pos{3, batch_size, stream, AoS};
+						linear_kernel(offset_positions_kernel, 0, stream,
+							batch_size, positions.data(), positions_pos.data(), dim, offset);
+						GPUMatrixDynamic<T> density_pos{grid_encoding->padded_output_width(), batch_size, stream, AoS};
+						auto ctx_pos = grid_encoding->forward(stream, positions_pos, &density_pos, use_inference_params, false);
+						
+						// Negative offset
+						// CRITICAL: Must use padded_output_width(), not 1
+						GPUMatrixDynamic<float> positions_neg{3, batch_size, stream, AoS};
+						linear_kernel(offset_positions_kernel, 0, stream,
+							batch_size, positions.data(), positions_neg.data(), dim, -offset);
+						GPUMatrixDynamic<T> density_neg{grid_encoding->padded_output_width(), batch_size, stream, AoS};
+						auto ctx_neg = grid_encoding->forward(stream, positions_neg, &density_neg, use_inference_params, false);
+						
+						// Save contexts (order: all negatives for this dim, then all positives)
+						forward_ctx->finite_diff_contexts.push_back(std::move(ctx_neg));
+						forward_ctx->finite_diff_densities.push_back(std::move(density_neg));
+						forward_ctx->finite_diff_positions.push_back(std::move(positions_neg));
+						forward_ctx->finite_diff_contexts.push_back(std::move(ctx_pos));
+						forward_ctx->finite_diff_densities.push_back(std::move(density_pos));
+						forward_ctx->finite_diff_positions.push_back(std::move(positions_pos));
+					}
+					
+					// Compute gradient for this dimension using stencil
+					// Create array of density pointers: [offset -n, ..., -1, +1, ..., +n]
+					std::vector<const T*> density_ptrs(2 * num_points);
+					int base_idx = dim * 2 * num_points;
+					for (int i = 0; i < 2 * num_points; ++i) {
+						density_ptrs[i] = forward_ctx->finite_diff_densities[base_idx + i].data();
+					}
+					
+					// Copy density pointers to GPU
+					GPUMemory<const T*> d_density_ptrs(2 * num_points);
+					CUDA_CHECK_THROW(cudaMemcpyAsync(d_density_ptrs.data(), density_ptrs.data(), 
+						2 * num_points * sizeof(T*), cudaMemcpyHostToDevice, stream));
+					
+					// Copy stencil coefficients to GPU
+					GPUMemory<float> d_stencil_coeffs(num_points);
+					CUDA_CHECK_THROW(cudaMemcpyAsync(d_stencil_coeffs.data(), stencil.coeffs, 
+						num_points * sizeof(float), cudaMemcpyHostToDevice, stream));
+					
+			linear_kernel(compute_finite_difference_stencil_kernel<T>, 0, stream,
+				batch_size, d_density_ptrs.data(), num_points, d_stencil_coeffs.data(), 
+				dDensity_dPos.data(), dim, eps, grid_encoding->padded_output_width());
+		}
+	}
+} else {
+			// Inference mode: use inference_mixed_precision, no gradient saving
+			for (int dim = 0; dim < 3; ++dim) {
+				// Create temporary buffers for all density samples
+				std::vector<GPUMatrixDynamic<T>> density_samples;
+				std::vector<const T*> density_ptrs;
+				density_samples.reserve(2 * num_points);
+				density_ptrs.reserve(2 * num_points);
+				
+				for (int offset_idx = 1; offset_idx <= num_points; ++offset_idx) {
+					float offset = offset_idx * eps;
+					
+					// Negative offset
+					// CRITICAL: Must use padded_output_width(), not 1
+					GPUMatrixDynamic<float> positions_neg{3, batch_size, stream, AoS};
+					linear_kernel(offset_positions_kernel, 0, stream,
+						batch_size, positions.data(), positions_neg.data(), dim, -offset);
+					density_samples.emplace_back(grid_encoding->padded_output_width(), batch_size, stream, AoS);
+					grid_encoding->inference_mixed_precision(stream, positions_neg, density_samples.back(), use_inference_params);
+					density_ptrs.push_back(density_samples.back().data());
+					
+					// Positive offset
+					// CRITICAL: Must use padded_output_width(), not 1
+					GPUMatrixDynamic<float> positions_pos{3, batch_size, stream, AoS};
+					linear_kernel(offset_positions_kernel, 0, stream,
+						batch_size, positions.data(), positions_pos.data(), dim, offset);
+					density_samples.emplace_back(grid_encoding->padded_output_width(), batch_size, stream, AoS);
+					grid_encoding->inference_mixed_precision(stream, positions_pos, density_samples.back(), use_inference_params);
+					density_ptrs.push_back(density_samples.back().data());
+				}
+				
+				// Copy density pointers to GPU
+				GPUMemory<const T*> d_density_ptrs(2 * num_points);
+				CUDA_CHECK_THROW(cudaMemcpyAsync(d_density_ptrs.data(), density_ptrs.data(), 
+					2 * num_points * sizeof(T*), cudaMemcpyHostToDevice, stream));
+				
+				// Copy stencil coefficients to GPU
+				GPUMemory<float> d_stencil_coeffs(num_points);
+				CUDA_CHECK_THROW(cudaMemcpyAsync(d_stencil_coeffs.data(), stencil.coeffs, 
+					num_points * sizeof(float), cudaMemcpyHostToDevice, stream));
+				
+				linear_kernel(compute_finite_difference_stencil_kernel<T>, 0, stream,
+					batch_size, d_density_ptrs.data(), num_points, d_stencil_coeffs.data(), 
+					dDensity_dPos.data(), dim, eps, grid_encoding->padded_output_width());
 			}
-			
-			// Compute central difference: (density_pos - density_neg) / (2 * eps)
-			// Access the densities from the saved buffers if they were moved
-			const T* density_pos_ptr = save_contexts ? forward_ctx->finite_diff_densities[dim * 2].data() : density_pos.data();
-			const T* density_neg_ptr = save_contexts ? forward_ctx->finite_diff_densities[dim * 2 + 1].data() : density_neg.data();
-			
-			linear_kernel(compute_finite_difference_kernel<T>, 0, stream,
-				batch_size, density_pos_ptr, density_neg_ptr, dDensity_dPos.data(), dim, eps);
 		}
 	} else {
 		// Method 1: Analytical gradients via autodiff (default)
 		// Seed gradient: scalar 1.0 for each sample (dL/ddensity = 1)
-		GPUMatrixDynamic<T> dL_dgrid_output{1, batch_size, stream, AoS};
+		// CRITICAL: Must use padded_output_width(), not 1
+		GPUMatrixDynamic<T> dL_dgrid_output{grid_encoding->padded_output_width(), batch_size, stream, AoS};
+		CUDA_CHECK_THROW(cudaMemsetAsync(dL_dgrid_output.data(), 0, dL_dgrid_output.n_bytes(), stream));
 		linear_kernel(set_constant_value_view_kernel<T>, 0, stream,
-			batch_size, T(1.0f), 1, dL_dgrid_output.data()
+			batch_size, T(1.0f), grid_encoding->padded_output_width(), dL_dgrid_output.data()
 		);
 		
 		// Compute spatial gradients ∂density/∂xyz using backward pass
 		CUDA_CHECK_THROW(cudaMemsetAsync(dDensity_dPos.data(), 0, dDensity_dPos.n_bytes(), stream));
 		
-		// Backprop through grid to get input gradients (∂density/∂xyz)
-		// This is the same pattern as used for analytical normals from MLP
-		grid_encoding->backward(
-			stream,
-			grid_ctx,
-			positions,
-			grid_output,
-			dL_dgrid_output,
-			&dDensity_dPos,  // This will contain ∂density/∂xyz
-			use_inference_params,
-			GradientMode::Ignore  // We don't need parameter gradients, only input gradients
-		);
+	// Backprop through grid to get input gradients (∂density/∂xyz)
+	// This is the same pattern as used for analytical normals from MLP
+	grid_encoding->backward(
+		stream,
+		grid_ctx,
+		positions,
+		grid_output,
+		dL_dgrid_output,
+		&dDensity_dPos,  // This will contain ∂density/∂xyz
+		use_inference_params,
+		GradientMode::Ignore  // We don't need parameter gradients, only input gradients
+	);
 	}
 	
 	// Normalize to get unit normals: n = -∇density / ||∇density||
@@ -1704,47 +1995,58 @@ void backprop_normals_from_finite_differences(
 	
 	const float eps = 1e-4f;  // Must match forward pass
 	
-	// Backprop through each dimension's finite difference
+	// Get genus and create stencil
+	int genus = forward_ctx.finite_diff_genus;
+	DaubechiesStencil stencil(genus);
+	int num_points = stencil.num_points;
+	
+	// Backprop through each dimension's finite difference using Daubechies stencil
 	for (int dim = 0; dim < 3; ++dim) {
-		// Extract gradient for this dimension
-		GPUMatrixDynamic<T> dL_ddensity_pos{1, batch_size, stream, AoS};
-		GPUMatrixDynamic<T> dL_ddensity_neg{1, batch_size, stream, AoS};
+		// For each offset in the stencil
+		int base_idx = dim * 2 * num_points;
 		
-		// Backprop through central difference: grad[dim] = (density_pos - density_neg) / (2*eps)
-		// dL/ddensity_pos = dL/dgrad[dim] / (2*eps)
-		// dL/ddensity_neg = -dL/dgrad[dim] / (2*eps)
-		linear_kernel(backprop_finite_difference_kernel<T>, 0, stream,
-			batch_size,
-			dL_dRawGradients.data(),
-			dim,
-			eps,
-			dL_ddensity_pos.data(),
-			dL_ddensity_neg.data()
-		);
-		
-		// Backprop to grid parameters through positive offset
-		grid_encoding->backward(
-			stream,
-			*forward_ctx.finite_diff_contexts[dim * 2],
-			forward_ctx.finite_diff_positions[dim * 2],
-			forward_ctx.finite_diff_densities[dim * 2],
-			dL_ddensity_pos,
-			nullptr,  // Don't need input gradients
-			use_inference_params,
-			param_gradients_mode
-		);
-		
-		// Backprop to grid parameters through negative offset
-		grid_encoding->backward(
-			stream,
-			*forward_ctx.finite_diff_contexts[dim * 2 + 1],
-			forward_ctx.finite_diff_positions[dim * 2 + 1],
-			forward_ctx.finite_diff_densities[dim * 2 + 1],
-			dL_ddensity_neg,
-			nullptr,  // Don't need input gradients
-			use_inference_params,
-			param_gradients_mode
-		);
+		for (int offset_idx = 0; offset_idx < num_points; ++offset_idx) {
+			// Compute gradient contributions
+			// Forward: grad[dim] = Σ c_i * [density(+i*eps) - density(-i*eps)] / eps
+			// Backward: dL/ddensity(±i*eps) = ±c_i * dL/dgrad[dim] / eps
+			
+			float coeff = stencil.coeffs[offset_idx];
+			float scale_neg = -coeff / eps;
+			float scale_pos = coeff / eps;
+			
+			// CRITICAL: Must use padded_output_width(), not 1
+			GPUMatrixDynamic<T> dL_ddensity_neg{grid_encoding->padded_output_width(), batch_size, stream, AoS};
+			GPUMatrixDynamic<T> dL_ddensity_pos{grid_encoding->padded_output_width(), batch_size, stream, AoS};
+			// Zero-initialize since kernel only writes to first channel
+			CUDA_CHECK_THROW(cudaMemsetAsync(dL_ddensity_neg.data(), 0, dL_ddensity_neg.n_bytes(), stream));
+			CUDA_CHECK_THROW(cudaMemsetAsync(dL_ddensity_pos.data(), 0, dL_ddensity_pos.n_bytes(), stream));
+			
+		// Gradient for negative offset sample: -coeff * dL/dgrad / eps
+		linear_kernel(backprop_daubechies_stencil_kernel<T>, 0, stream,
+			batch_size, dL_dRawGradients.data(), dim, scale_neg, dL_ddensity_neg.data(), 
+			grid_encoding->padded_output_width());
+			
+			grid_encoding->backward(
+				stream,
+				*forward_ctx.finite_diff_contexts[base_idx + offset_idx * 2],
+				forward_ctx.finite_diff_positions[base_idx + offset_idx * 2],
+				forward_ctx.finite_diff_densities[base_idx + offset_idx * 2],
+				dL_ddensity_neg, nullptr, use_inference_params, param_gradients_mode
+			);
+			
+		// Gradient for positive offset sample: +coeff * dL/dgrad / eps
+		linear_kernel(backprop_daubechies_stencil_kernel<T>, 0, stream,
+			batch_size, dL_dRawGradients.data(), dim, scale_pos, dL_ddensity_pos.data(), 
+			grid_encoding->padded_output_width());
+			
+			grid_encoding->backward(
+				stream,
+				*forward_ctx.finite_diff_contexts[base_idx + offset_idx * 2 + 1],
+				forward_ctx.finite_diff_positions[base_idx + offset_idx * 2 + 1],
+				forward_ctx.finite_diff_densities[base_idx + offset_idx * 2 + 1],
+				dL_ddensity_pos, nullptr, use_inference_params, param_gradients_mode
+			);
+		}
 	}
 }
 

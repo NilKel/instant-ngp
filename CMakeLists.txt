@@ -404,4 +404,14 @@ if (Python_FOUND)
 	target_link_libraries(pyngp PRIVATE ngp PUBLIC ${PYTHON_LIBRARIES} pybind11::module)
 	target_compile_definitions(pyngp PUBLIC -DNGP_PYTHON)
 	pybind11_extension(pyngp)
+	
+	# Automatically copy pyngp to root directory after build (for Python imports)
+	# First, clean up any old versions to prevent confusion
+	add_custom_command(TARGET pyngp POST_BUILD
+		COMMAND ${CMAKE_COMMAND} -E echo "Cleaning old pyngp files from root directory..."
+		COMMAND ${CMAKE_COMMAND} -E remove -f ${CMAKE_SOURCE_DIR}/pyngp.so ${CMAKE_SOURCE_DIR}/pyngp.cpython-*.so
+		COMMAND ${CMAKE_COMMAND} -E echo "Copying $<TARGET_FILE:pyngp> to ${CMAKE_SOURCE_DIR}/pyngp.so"
+		COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:pyngp> ${CMAKE_SOURCE_DIR}/pyngp.so
+		COMMENT "Installing pyngp to project root for Python imports"
+	)
 endif()

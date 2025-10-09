@@ -55,9 +55,11 @@ public:
 
 		json local_density_network_config = density_network;
 		
-		// HashPot mode: encoding output is 3x larger (conceptually N,F,3 vectors)
-		// but density network input size is just the encoding output width
-		uint32_t density_input_dims = m_pos_encoding->padded_output_width();
+	// HashPot mode: encoding output is 3x larger (conceptually N,F,3 vectors)
+	// but density network input size is just the encoding output width
+	uint32_t density_input_dims = m_pos_encoding->padded_output_width();
+	printf("=== NerfNetwork CONSTRUCTOR REACHED, method=%s ===\n", m_method.c_str());
+	fflush(stdout);
 		if (m_hashpot_mode) {
 			uint32_t encoding_output_width = m_pos_encoding->padded_output_width();
 		} else if (m_method == "hash_surface") {
@@ -81,6 +83,10 @@ public:
 			// surface_explicit: 48D output (1 dummy + 45D Φ features for 15 vectors)
 			// Density comes from grid, not MLP
 			local_density_network_config["n_output_dims"] = 48;
+		} else if (m_method == "baseline_explicit") {
+			// baseline_explicit: 15D output (15 features for RGB input[1-15])
+			// Density comes from grid (goes to RGB input[0])
+			local_density_network_config["n_output_dims"] = 15;
 		} else if (m_method == "hash_surface") {
 			// hash_surface: Density MLP takes n_levels density features and outputs 1D density
 			local_density_network_config["n_output_dims"] = 1;
@@ -92,29 +98,52 @@ public:
 		}
 	}
 	m_density_network.reset(create_network<T>(local_density_network_config));
-
-	// Initialize explicit density grid for surface_explicit mode
-	if (m_method == "surface_explicit") {
+	
+	// Initialize explicit density grid for surface_explicit and baseline_explicit modes
+	if (m_method == "surface_explicit" || m_method == "baseline_explicit") {
 		// Get grid resolution from config (default 128)
 		uint32_t grid_res = 128;
 		if (density_network.contains("explicit_grid_resolution")) {
 			grid_res = density_network["explicit_grid_resolution"];
 		}
 		
+		printf("GRID RESOLUTION: %d\n", grid_res);
 		// Create DenseGrid encoding config
+		// NOTE: For single-level grids, must set per_level_scale=1.0 to avoid division by zero
+		// NOTE: Can't specify both n_features and n_levels - use n_levels instead
 		json dense_grid_config = {
-			{"otype", "Grid"},
-			{"type", "Dense"},
-			{"n_levels", 1},
-			{"n_features_per_level", 1},
+			{"otype", "DenseGrid"},
+			{"n_levels", 1},  // Single level grid
+			{"n_features_per_level", 1},  // 1 feature per level
 			{"base_resolution", grid_res},
+			{"per_level_scale", 1.0f},  // Must be 1.0 to avoid div-by-zero with n_levels=1
 			{"interpolation", "Linear"}
 		};
 		
-		m_density_grid.reset(create_encoding<T>(3, dense_grid_config, 1));
+		printf("Dense grid config: %s\n", dense_grid_config.dump().c_str());
+		fflush(stdout);
 		
-		printf("surface_explicit: Created %dx%dx%d density grid with %zu parameters\n", 
+		m_density_grid.reset(create_encoding<T>(3, dense_grid_config, 1));  // Use alignment=1 to avoid padding
+		
+		printf("%s: Created %dx%dx%d density grid with %zu parameters\n",
+			m_method.c_str(), 
 			grid_res, grid_res, grid_res, m_density_grid->n_params());
+		printf("  padded_output_width: %u, n_output_dims: %u\n", 
+			m_density_grid->padded_output_width(), m_density_grid->output_width());
+		fflush(stdout);
+		
+		// Initialize grid to NEGATIVE log-density values for low-density start
+		// Standard NeRF initializes to ~exp(-5) ≈ 0.007 density (nearly transparent)
+		// We'll initialize uniformly to around -5 with small noise
+		std::vector<T> init_params(m_density_grid->n_params());
+		pcg32 rng(42);
+		for (size_t i = 0; i < init_params.size(); ++i) {
+			// Uniform in [-5.5, -4.5] → after exp(): [0.004, 0.011] - nearly transparent
+			init_params[i] = T(-5.0f + (rng.next_float() - 0.5f));  // -5 ± 0.5
+		}
+		m_density_grid->set_params(init_params.data(), init_params.data(), init_params.data());
+		printf("Initialized grid to log-density ~[-5.5, -4.5] (density ~[0.004, 0.011] after exp)\n");
+		fflush(stdout);
 	}
 
 	if (m_method == "surface_normal") {
@@ -168,12 +197,12 @@ public:
 	
 	bool hashpot_mode() const { return m_hashpot_mode; }
 
-	void inference_mixed_precision_impl(cudaStream_t stream, const GPUMatrixDynamic<float>& input, GPUMatrixDynamic<T>& output, bool use_inference_params = true) override {
-		uint32_t batch_size = input.n();
-		GPUMatrixDynamic<T> density_network_input;
+void inference_mixed_precision_impl(cudaStream_t stream, const GPUMatrixDynamic<float>& input, GPUMatrixDynamic<T>& output, bool use_inference_params = true) override {
+	uint32_t batch_size = input.n();
+	GPUMatrixDynamic<T> density_network_input;
 
-		
-		// For hash_surface, we need separate matrices for hash features and density features
+	
+	// For hash_surface, we need separate matrices for hash features and density features
 		GPUMatrixDynamic<T> hash_features_matrix;
 		if (m_method == "hash_surface") {
 			// Create separate 32D matrix for hash features from position encoding
@@ -199,6 +228,9 @@ public:
 		density_network_output = GPUMatrixDynamic<T>{m_density_network->padded_output_width(), batch_size, stream, AoS};
 	} else if (m_method == "hash_surface") {
 		// hash_surface: Separate buffer for 1D density output
+		density_network_output = GPUMatrixDynamic<T>{m_density_network->padded_output_width(), batch_size, stream, AoS};
+	} else if (m_method == "baseline_explicit") {
+		// baseline_explicit: Separate buffer for 15D MLP features (not a slice!)
 		density_network_output = GPUMatrixDynamic<T>{m_density_network->padded_output_width(), batch_size, stream, AoS};
 	} else {
 		// Baseline mode (including SDF mode - use same pattern)
@@ -344,10 +376,11 @@ public:
 	}
 	
 } else if (m_method == "surface_explicit") {
-	// surface_explicit: density from grid + features from MLP + normals from grid gradients
-	
+		// surface_explicit: density from grid + features from MLP + normals from grid gradients
+		
 	// Step 1: Get density from grid (need forward context for normals)
-	grid_density_explicit = GPUMatrixDynamic<T>{1, batch_size, stream, AoS};
+	// Use grid's preferred layout (SoA) to match hash encoding
+	grid_density_explicit = GPUMatrixDynamic<T>{m_density_grid->padded_output_width(), batch_size, stream, m_density_grid->preferred_output_layout()};
 	auto grid_ctx = m_density_grid->forward(
 		stream,
 		input.slice_rows(0, 3),  // positions
@@ -355,36 +388,84 @@ public:
 		use_inference_params,
 		true  // prepare_input_gradients = true for normal computation
 	);
-	
-	// Step 2: Compute normals from grid gradients using autodiff
-	GPUMatrixDynamic<float> normals = compute_normals_from_grid_gradients(
-		stream, batch_size, input.slice_rows(0, 3), m_density_grid, *grid_ctx, grid_density_explicit, use_inference_params
-	);
-	
-	// Step 3: MLP forward for features
-	m_density_network->inference_mixed_precision(stream, density_network_input, density_network_output, use_inference_params);
-	
+		
+		// Step 2: Compute normals from grid gradients using autodiff
+		GPUMatrixDynamic<float> normals = compute_normals_from_grid_gradients(
+			stream, batch_size, input.slice_rows(0, 3), m_density_grid, *grid_ctx, grid_density_explicit, use_inference_params
+		);
+		
+		// Step 3: MLP forward for features
+		m_density_network->inference_mixed_precision(stream, density_network_input, density_network_output, use_inference_params);
+		
 	// Step 4: Compute surface features
+	// MLP outputs 45D vectors (15 x 3D) starting from channel 0
 	auto surface_features_slice = rgb_network_input.slice_rows(1, 15);
 	linear_kernel(compute_surface_features_from_vectors_kernel<T>, 0, stream,
 		batch_size,
-		density_network_output.data() + 1,
+		density_network_output.data(),  // Use channels 0-44 (45 features for 15 3D vectors)
 		density_network_output.layout() == AoS ? density_network_output.stride() : 1,
 		normals.data(),
 		normals.layout() == AoS ? 3 : 1,
 		surface_features_slice.data(),
 		surface_features_slice.layout() == AoS ? surface_features_slice.stride() : 1
 	);
+		
+		// Step 5: Replace channel 0 with grid density (extract from padded grid output)
+		linear_kernel(replace_first_channel_kernel<T>, 0, stream,
+			batch_size,
+			grid_density_explicit.data(),
+			grid_density_explicit.layout() == AoS ? grid_density_explicit.stride() : 1,  // grid stride (padded)
+			rgb_network_input.layout() == AoS ? rgb_network_input.stride() : 1,  // output stride
+			rgb_network_input.data()
+		);
+		
+		// Step 6: Direction encoding (same as surface mode)
+		auto dir_out = rgb_network_input.slice_rows(16, m_dir_encoding->padded_output_width());
+		m_dir_encoding->inference_mixed_precision(
+			stream,
+			input.slice_rows(m_dir_offset, m_dir_encoding->input_width()),
+			dir_out,
+			use_inference_params
+		);
 	
-	// Step 5: Replace channel 0 with grid density
+} else if (m_method == "baseline_explicit") {
+	// baseline_explicit: density from grid, features from MLP (no surface computations)
+	
+	
+	// Step 1: Get density from grid
+	grid_density_explicit = GPUMatrixDynamic<T>{m_density_grid->padded_output_width(), batch_size, stream, m_density_grid->preferred_output_layout()};
+	auto grid_ctx = m_density_grid->forward(
+		stream,
+		input.slice_rows(0, 3),  // positions
+		&grid_density_explicit,
+		use_inference_params,
+		false  // don't need input gradients
+	);
+	
+	// Step 2: MLP forward for 15D features
+	m_density_network->inference_mixed_precision(stream, density_network_input, density_network_output, use_inference_params);
+	
+	// Step 3: Copy grid density to RGB input[0]
 	linear_kernel(replace_first_channel_kernel<T>, 0, stream,
 		batch_size,
 		grid_density_explicit.data(),
+		grid_density_explicit.layout() == AoS ? grid_density_explicit.stride() : 1,
 		rgb_network_input.layout() == AoS ? rgb_network_input.stride() : 1,
 		rgb_network_input.data()
 	);
 	
-	// Step 6: Direction encoding (same as surface mode)
+	// Step 4: Copy MLP features[0-14] to RGB input[1-15]
+	linear_kernel(copy_channels_kernel<T>, 0, stream,
+		batch_size,
+		15,  // number of channels to copy
+		density_network_output.data(),
+		density_network_output.layout() == AoS ? density_network_output.stride() : 1,
+		rgb_network_input.data(),
+		rgb_network_input.layout() == AoS ? rgb_network_input.stride() : 1,
+		1  // destination offset (skip channel 0)
+	);
+	
+	// Step 5: Direction encoding
 	auto dir_out = rgb_network_input.slice_rows(16, m_dir_encoding->padded_output_width());
 	m_dir_encoding->inference_mixed_precision(
 		stream,
@@ -392,7 +473,7 @@ public:
 		dir_out,
 		use_inference_params
 	);
-	
+
 } else if (m_method == "volume") {
 	// Volume mode: Compute divergences and use them for volume features
 			
@@ -453,7 +534,8 @@ public:
 				density_network_output.data(),
 				rgb_network_input.data() + (rgb_network_input.layout() == AoS ? surface_features : surface_features * batch_size),
 				m_use_sdf,  // SDF mode flag
-				m_variance_network ? m_variance_network->params() : nullptr  // Variance params
+				m_variance_network ? m_variance_network->params() : nullptr,  // Variance params
+				false  // MLP already has activation
 			);
 			
 			// Direction encoding goes after the surface features + density
@@ -487,19 +569,20 @@ public:
 
 		
 
-	// Extract density to output - use correct source for each mode
-	if (m_method == "surface_explicit") {
-		// surface_explicit: Extract density from grid, not MLP
-		linear_kernel(extract_density<T>, 0, stream,
-			batch_size,
-			1,  // grid_density has stride 1
-			output.layout() == AoS ? padded_output_width() : 1,
-			grid_density_explicit.data(),
-			output.data() + 3 * (output.layout() == AoS ? 1 : batch_size),
-			false,  // grid stores density directly, not SDF
-			nullptr
-		);
-	} else {
+// Extract density to output - use correct source for each mode
+if (m_method == "surface_explicit" || m_method == "baseline_explicit") {
+	// surface_explicit/baseline_explicit: Extract density from grid, not MLP
+	linear_kernel(extract_density<T>, 0, stream,
+		batch_size,
+		grid_density_explicit.layout() == AoS ? grid_density_explicit.stride() : 1,  // Use actual stride from padded grid
+		output.layout() == AoS ? padded_output_width() : 1,
+		grid_density_explicit.data(),
+		output.data() + 3 * (output.layout() == AoS ? 1 : batch_size),
+		false,  // grid stores log-density, not SDF
+		nullptr,
+		false  // Don't apply exp() - rendering kernels will do it (consistent with baseline mode)
+	);
+} else {
 		linear_kernel(extract_density<T>, 0, stream,
 			batch_size,
 			density_network_output.layout() == AoS ? density_network_output.stride() : 1,
@@ -507,7 +590,8 @@ public:
 			density_network_output.data(),
 			output.data() + 3 * (output.layout() == AoS ? 1 : batch_size),
 			m_use_sdf,
-			m_variance_network ? m_variance_network->params() : nullptr  // Variance params
+			m_variance_network ? m_variance_network->params() : nullptr,  // Variance params
+			false  // MLP already has activation
 		);
 	}
 }
@@ -516,10 +600,10 @@ public:
 		return m_density_network->padded_output_width();
 	}
 
-	std::unique_ptr<Context> forward_impl(cudaStream_t stream, const GPUMatrixDynamic<float>& input, GPUMatrixDynamic<T>* output = nullptr, bool use_inference_params = false, bool prepare_input_gradients = false) override {
-		uint32_t batch_size = input.n();
-		auto forward = std::make_unique<ForwardContext>();
-		GPUMatrixDynamic<T> density_network_input;
+std::unique_ptr<Context> forward_impl(cudaStream_t stream, const GPUMatrixDynamic<float>& input, GPUMatrixDynamic<T>* output = nullptr, bool use_inference_params = false, bool prepare_input_gradients = false) override {
+	uint32_t batch_size = input.n();
+	auto forward = std::make_unique<ForwardContext>();
+	GPUMatrixDynamic<T> density_network_input;
 		if (m_method == "hash_surface") {
 			forward->density_network_input = GPUMatrixDynamic<T>{m_pos_encoding->padded_output_width(), batch_size, stream, m_pos_encoding->preferred_output_layout()};
 		} else {
@@ -605,15 +689,16 @@ public:
 	// surface_explicit: density from grid + features from MLP
 	forward->density_network_output = GPUMatrixDynamic<T>{m_density_network->padded_output_width(), batch_size, stream, AoS};
 	
-	// Step 1: Get density from grid (with gradients for normal computation)
-	forward->grid_density = GPUMatrixDynamic<T>{1, batch_size, stream, AoS};
-	forward->density_grid_ctx = m_density_grid->forward(
-		stream,
-		input.slice_rows(0, 3),  // positions only
-		&forward->grid_density,
-		use_inference_params,
-		true  // prepare_input_gradients for normal computation
-	);
+// Step 1: Get density from grid (with gradients for normal computation)
+// Use grid's preferred layout (SoA) to match hash encoding
+forward->grid_density = GPUMatrixDynamic<T>{m_density_grid->padded_output_width(), batch_size, stream, m_density_grid->preferred_output_layout()};
+forward->density_grid_ctx = m_density_grid->forward(
+	stream,
+	input.slice_rows(0, 3),  // positions only
+	&forward->grid_density,
+	use_inference_params,
+	true  // prepare_input_gradients for normal computation
+);
 	
 	// Step 2: MLP forward pass (48D output: 1 dummy + 45 features for 15 vectors)
 	forward->density_network_ctx = m_density_network->forward(
@@ -623,30 +708,87 @@ public:
 	
 	// Step 3: Compute normals from grid gradients using autodiff
 	forward->analytical_normals = compute_normals_from_grid_gradients(
-		stream, batch_size, input.slice_rows(0, 3), m_density_grid, *forward->density_grid_ctx, forward->grid_density, use_inference_params
+		stream, batch_size, input.slice_rows(0, 3), m_density_grid, *forward->density_grid_ctx, forward->grid_density, use_inference_params,
+		forward.get()  // Pass context to enable gradient saving for finite diff
 	);
 		
-		// Step 4: Compute 15 surface features using kernel
-		auto surface_features_slice = forward->rgb_network_input.slice_rows(1, 15);
-		linear_kernel(compute_surface_features_from_vectors_kernel<T>, 0, stream,
-			batch_size,
-			forward->density_network_output.data() + 1,  // Skip first channel (dummy)
-			forward->density_network_output.layout() == AoS ? forward->density_network_output.stride() : 1,
-			forward->analytical_normals.data(),
-			forward->analytical_normals.layout() == AoS ? 3 : 1,
-			surface_features_slice.data(),
-			surface_features_slice.layout() == AoS ? surface_features_slice.stride() : 1
-		);
+	// Step 4: Compute 15 surface features using kernel
+	// MLP outputs 45D vectors (15 x 3D) starting from channel 0
+	auto surface_features_slice = forward->rgb_network_input.slice_rows(1, 15);
+	linear_kernel(compute_surface_features_from_vectors_kernel<T>, 0, stream,
+		batch_size,
+		forward->density_network_output.data(),  // Use channels 0-44 (45 features for 15 3D vectors)
+		forward->density_network_output.layout() == AoS ? forward->density_network_output.stride() : 1,
+		forward->analytical_normals.data(),
+		forward->analytical_normals.layout() == AoS ? 3 : 1,
+		surface_features_slice.data(),
+		surface_features_slice.layout() == AoS ? surface_features_slice.stride() : 1
+	);
 		
-	// Step 5: Replace channel 0 with grid density
+	// Step 5: Replace channel 0 with grid density (extract from padded grid output)
 	linear_kernel(replace_first_channel_kernel<T>, 0, stream,
 		batch_size,
 		forward->grid_density.data(),
-		forward->rgb_network_input.layout() == AoS ? forward->rgb_network_input.stride() : 1,
+		forward->grid_density.layout() == AoS ? forward->grid_density.stride() : 1,  // grid stride (padded)
+		forward->rgb_network_input.layout() == AoS ? forward->rgb_network_input.stride() : 1,  // output stride
 		forward->rgb_network_input.data()
 	);
 		
 		// Step 6: Direction encoding (same as surface mode)
+		dir_out = forward->rgb_network_input.slice_rows(16, m_dir_encoding->padded_output_width());
+	} else if (m_method == "baseline_explicit") {
+		// baseline_explicit: density from grid + 15D features from MLP (no surface computation)
+		
+		
+		forward->density_network_output = GPUMatrixDynamic<T>{m_density_network->padded_output_width(), batch_size, stream, AoS};
+		
+		// Step 1: Get density from grid
+		forward->grid_density = GPUMatrixDynamic<T>{m_density_grid->padded_output_width(), batch_size, stream, m_density_grid->preferred_output_layout()};
+		forward->density_grid_ctx = m_density_grid->forward(
+			stream,
+			input.slice_rows(0, 3),  // positions only
+			&forward->grid_density,
+			use_inference_params,
+			false  // don't need input gradients
+		);
+		
+
+		
+		// Step 2: MLP forward pass (15D features)
+		forward->density_network_ctx = m_density_network->forward(
+			stream, forward->density_network_input, &forward->density_network_output, 
+			use_inference_params, false
+		);
+		
+
+		
+		// Step 3: Copy grid density to RGB input[0]
+		uint32_t grid_src_stride = forward->grid_density.layout() == AoS ? forward->grid_density.stride() : 1;
+		uint32_t rgb_dst_stride = forward->rgb_network_input.layout() == AoS ? forward->rgb_network_input.stride() : 1;
+
+		
+		linear_kernel(replace_first_channel_kernel<T>, 0, stream,
+			batch_size,
+			forward->grid_density.data(),
+			grid_src_stride,
+			rgb_dst_stride,
+			forward->rgb_network_input.data()
+		);
+		
+		// Step 4: Copy MLP features[0-14] to RGB input[1-15]
+		uint32_t mlp_src_stride = forward->density_network_output.layout() == AoS ? forward->density_network_output.stride() : 1;
+
+		linear_kernel(copy_channels_kernel<T>, 0, stream,
+			batch_size,
+			15,  // number of channels to copy
+			forward->density_network_output.data(),
+			mlp_src_stride,
+			forward->rgb_network_input.data(),
+			rgb_dst_stride,
+			1  // destination offset
+		);
+		
+		// Step 5: Direction encoding
 		dir_out = forward->rgb_network_input.slice_rows(16, m_dir_encoding->padded_output_width());
 	} else if (m_method == "hash_surface") {
 			// hash_surface mode: Extract density features from hash, pass to density MLP, then compute surface features
@@ -711,7 +853,8 @@ public:
 				forward->density_network_output.data(),
 				forward->rgb_network_input.data() + (forward->rgb_network_input.layout() == AoS ? surface_features : surface_features * batch_size),
 				m_use_sdf,  // SDF mode flag
-				m_variance_network ? m_variance_network->params() : nullptr  // Variance params
+				m_variance_network ? m_variance_network->params() : nullptr,  // Variance params
+				false  // MLP already has activation
 			);
 			
 			// Direction encoding goes after the surface features + density
@@ -720,7 +863,12 @@ public:
 			// Baseline mode (including SDF mode - use same pattern)
 			forward->density_network_output = forward->rgb_network_input.slice_rows(0, m_density_network->padded_output_width());
 			dir_out = forward->rgb_network_input.slice_rows(m_density_network->padded_output_width(), m_dir_encoding->padded_output_width());
+
+
+			
 			forward->density_network_ctx = m_density_network->forward(stream, forward->density_network_input, &forward->density_network_output, use_inference_params, false);
+			
+
 		}
 
 		forward->dir_encoding_ctx = m_dir_encoding->forward(
@@ -804,16 +952,17 @@ public:
 
 	if (output) {
 		// Extract density to output
-		if (m_method == "surface_explicit") {
-			// surface_explicit: Extract density from grid, not MLP
+		if (m_method == "surface_explicit" || m_method == "baseline_explicit") {
+			// surface_explicit/baseline_explicit: Extract density from grid, not MLP
 			linear_kernel(extract_density<T>, 0, stream,
 				batch_size,
-				1,  // grid_density has stride 1
+				forward->grid_density.layout() == AoS ? forward->grid_density.stride() : 1,  // Use actual stride from padded grid
 				output->layout() == AoS ? padded_output_width() : 1,
 				forward->grid_density.data(),
 				output->data() + 3 * (output->layout() == AoS ? 1 : batch_size),
-				false,  // grid stores density directly, not SDF
-				nullptr
+				false,  // grid stores log-density, not SDF
+				nullptr,
+				true  // Apply exp() activation to grid density
 			);
 		} else {
 			// Other modes extract density from density_network_output
@@ -824,7 +973,8 @@ public:
 				forward->density_network_output.data(), 
 				output->data() + 3 * (output->layout() == AoS ? 1 : batch_size),
 				m_use_sdf,
-				m_variance_network ? m_variance_network->params() : nullptr  // Variance params
+				m_variance_network ? m_variance_network->params() : nullptr,  // Variance params
+				false  // MLP already has activation
 			);
 		}
 	}
@@ -841,11 +991,11 @@ public:
 		GPUMatrixDynamic<float>* dL_dinput = nullptr,
 		bool use_inference_params = false,
 		GradientMode param_gradients_mode = GradientMode::Overwrite
-	) override {
-		const auto& forward = dynamic_cast<const ForwardContext&>(ctx);
-		uint32_t batch_size = input.n();
-		
-		GPUMatrix<T> dL_drgb{m_rgb_network->padded_output_width(), batch_size, stream};
+) override {
+	const auto& forward = dynamic_cast<const ForwardContext&>(ctx);
+	uint32_t batch_size = input.n();
+	
+	GPUMatrix<T> dL_drgb{m_rgb_network->padded_output_width(), batch_size, stream};
 		CUDA_CHECK_THROW(cudaMemsetAsync(dL_drgb.data(), 0, dL_drgb.n_bytes(), stream));
 
 		linear_kernel(extract_rgb<T>, 0, stream,
@@ -917,6 +1067,10 @@ public:
 		CUDA_CHECK_THROW(cudaMemsetAsync(dL_ddensity_network_output.data(), 0, dL_ddensity_network_output.n_bytes(), stream));
 	} else if (m_method == "hash_surface") {
 		// hash_surface: Separate buffer for 1D density gradients
+		dL_ddensity_network_output = GPUMatrixDynamic<T>{m_density_network->padded_output_width(), batch_size, stream, AoS};
+		CUDA_CHECK_THROW(cudaMemsetAsync(dL_ddensity_network_output.data(), 0, dL_ddensity_network_output.n_bytes(), stream));
+	} else if (m_method == "baseline_explicit") {
+		// baseline_explicit: Separate buffer with AoS layout to match forward pass
 		dL_ddensity_network_output = GPUMatrixDynamic<T>{m_density_network->padded_output_width(), batch_size, stream, AoS};
 		CUDA_CHECK_THROW(cudaMemsetAsync(dL_ddensity_network_output.data(), 0, dL_ddensity_network_output.n_bytes(), stream));
 	} else {
@@ -1088,10 +1242,10 @@ public:
 			}
 			
 			// Backpropagate gradients through analytical normals to density network parameters
-			accumulate_analytical_normal_gradients(
-				stream, batch_size, input, forward, dL_dnormals,
-				dL_ddensity_network_output, use_inference_params, param_gradients_mode
-			);
+			// accumulate_analytical_normal_gradients(
+			// 	stream, batch_size, input, forward, dL_dnormals,
+			// 	dL_ddensity_network_output, use_inference_params, param_gradients_mode
+			// );
 		} else if (m_method == "hash_surface") {
 			// Backward pass: gradients from hash surface features back to hash interpolation and density
 			uint32_t n_levels = m_pos_encoding->padded_output_width() / 4; // Dynamic levels calculation
@@ -1235,18 +1389,71 @@ public:
 			dL_dsurface_slice.layout() == AoS ? dL_dsurface_slice.stride() : 1,
 			forward.analytical_normals.data(),
 			forward.analytical_normals.layout() == AoS ? 3 : 1,
-			dL_ddensity_network_output.data() + 1,  // Output to features (skip channel 0)
+			dL_ddensity_network_output.data(),  // Output to features (skip channel 0)
 			dL_ddensity_network_output.layout() == AoS ? dL_ddensity_network_output.stride() : 1
 		);
 		
-		// Step 2: Extract gradient for channel 0 (goes to grid)
-		GPUMatrixDynamic<T> dL_dgrid_density{1, batch_size, stream, AoS};
+		// Step 2: Extract gradient for channel 0 (goes to grid) - allocate with padding
+		// Use grid's preferred layout (SoA) to match hash encoding
+		GPUMatrixDynamic<T> dL_dgrid_density{m_density_grid->padded_output_width(), batch_size, stream, m_density_grid->preferred_output_layout()};
+		CUDA_CHECK_THROW(cudaMemsetAsync(dL_dgrid_density.data(), 0, dL_dgrid_density.n_bytes(), stream));
+
+		// Step 2a: Extract gradient from RGB network input (channel 0)
 		linear_kernel(extract_first_channel_gradient_kernel<T>, 0, stream,
 			batch_size,
 			dL_drgb_network_input.data(),
 			dL_drgb_network_input.layout() == AoS ? dL_drgb_network_input.stride() : 1,
-			dL_dgrid_density.data()
+			dL_dgrid_density.layout() == AoS ? dL_dgrid_density.stride() : 1,  // grid stride
+			dL_dgrid_density.data(),
+			forward.grid_density.data(),  // Forward grid values (not used when apply_exp=false)
+			false  // Don't apply exp() - gradients already w.r.t. log-density from fused kernels
 		);
+
+		// Step 2b: ACCUMULATE density gradient from RGBD output (channel 3) to grid
+		// This is the gradient from the rendering loss w.r.t. density
+		linear_kernel(accumulate_density_gradient_to_grid_kernel<T>, 0, stream,
+			batch_size,
+			dL_doutput.data(),
+			dL_doutput.layout() == AoS ? dL_doutput.m() : 1,  // RGBD output stride
+			dL_dgrid_density.data(),
+			dL_dgrid_density.layout() == AoS ? dL_dgrid_density.stride() : 1,  // grid stride
+			dL_doutput.m(),  // Number of rows (channels) = 4 for RGBD
+			forward.grid_density.data(),  // Forward grid values (not used when apply_exp=false)
+			false  // Don't apply exp() - gradients already w.r.t. log-density from fused kernels
+		);
+
+		// Step 2.5: Backprop gradients from normals to grid (for finite differences)
+		// This computes dL/dnormals from the surface features and backprops through finite diff
+		GPUMatrixDynamic<float> dL_dnormals{3, batch_size, stream, forward.analytical_normals.layout()};
+		CUDA_CHECK_THROW(cudaMemsetAsync(dL_dnormals.data(), 0, dL_dnormals.n_bytes(), stream));
+		
+		linear_kernel(backprop_surface_features_to_normals_kernel<T>, 0, stream,
+			batch_size,
+			dL_dsurface_slice.data(),
+			dL_dsurface_slice.layout() == AoS ? dL_dsurface_slice.stride() : 1,
+			forward.density_network_output.data() ,
+			forward.density_network_output.layout() == AoS ? forward.density_network_output.stride() : 1,
+			dL_dnormals.data(),
+			dL_dnormals.layout() == AoS ? 3 : 1
+		);
+		
+		// Check if we're using finite differences and have saved contexts
+		const char* grad_method_env = std::getenv("NGP_GRAD_METHOD");
+		bool use_finite_diff = (grad_method_env && std::string(grad_method_env) == "finite");
+		
+		if (use_finite_diff && !forward.finite_diff_contexts.empty()) {
+			backprop_normals_from_finite_differences(
+				stream, batch_size, dL_dnormals, forward.analytical_normals,
+				m_density_grid, forward, use_inference_params, param_gradients_mode
+			);
+		}
+		
+		// NOTE: For surface_explicit, we do NOT call accumulate_analytical_normal_gradients()
+		// because the normals come from the GRID, not from the MLP density output.
+		// The gradient flow is:
+		//   - dL/dnormals → grid (via backprop_normals_from_finite_differences or grid->backward)
+		//   - dL/dnormals → MLP vectors (already handled by backprop_surface_features_to_normals_kernel)
+		// The MLP does NOT output density (channel 0), only feature vectors (channels 1-47).
 		
 		// Step 3: Backprop to density network parameters
 		GPUMatrixDynamic<T> dL_ddensity_input;
@@ -1257,21 +1464,20 @@ public:
 			stream, *forward.density_network_ctx, forward.density_network_input, forward.density_network_output,
 			dL_ddensity_network_output, dL_ddensity_input.data() ? &dL_ddensity_input : nullptr, use_inference_params, param_gradients_mode
 		);
-		
-	// Step 4: Backprop to grid parameters
-	if (m_density_grid->n_params() > 0 || dL_dinput) {
-		GPUMatrixDynamic<float> dL_dpositions_from_grid{3, batch_size, stream, AoS};
-		
-		m_density_grid->backward(
-			stream, *forward.density_grid_ctx, 
-			input.slice_rows(0, 3),  // positions
-			forward.grid_density,  // grid output from forward pass
-			dL_dgrid_density,  // gradients from channel 0
-			dL_dinput ? &dL_dpositions_from_grid : nullptr,
-			use_inference_params,
-			param_gradients_mode
-		);
-	}
+				
+		// Step 4: Backprop to grid parameters
+		// Note: We don't need dL_dinput from grid since we already get it from hash encoding
+		if (m_density_grid->n_params() > 0) {
+			m_density_grid->backward(
+				stream, *forward.density_grid_ctx, 
+				input.slice_rows(0, 3),  // positions
+				forward.grid_density,  // grid output from forward pass
+				dL_dgrid_density,  // gradients from channel 0
+				nullptr,  // Don't need input gradients - hash encoding handles that
+				use_inference_params,
+				param_gradients_mode
+			);
+		}
 		
 		// Step 5: Backprop through pos encoding
 		if (dL_ddensity_input.data()) {
@@ -1295,6 +1501,114 @@ public:
 		// Don't do the standard density network backward for surface_explicit
 		// Skip the standard backprop below by zeroing dL_ddensity_network_output
 		CUDA_CHECK_THROW(cudaMemsetAsync(dL_ddensity_network_output.data(), 0, dL_ddensity_network_output.n_bytes(), stream));
+	} else if (m_method == "baseline_explicit") {
+		// baseline_explicit: backprop to both grid and MLP (simple feature copy, no surface features)
+
+		
+		// Step 1: Extract gradients for MLP features from RGB input[1-15]
+		// NOTE: dL_ddensity_network_output is now allocated separately with AoS layout (not zeroed by allocation above)
+		
+		uint32_t rgb_src_stride = dL_drgb_network_input.layout() == AoS ? dL_drgb_network_input.stride() : 1;
+		uint32_t mlp_dst_stride = dL_ddensity_network_output.layout() == AoS ? dL_ddensity_network_output.stride() : 1;
+
+		
+		linear_kernel(copy_channels_with_src_offset_kernel<T>, 0, stream,
+			batch_size,
+			15,  // number of channels to copy
+			dL_drgb_network_input.data(),
+			rgb_src_stride,
+			1,  // source offset (skip channel 0, read from RGB[1-15])
+			dL_ddensity_network_output.data(),
+			mlp_dst_stride
+		);
+		
+		// Step 2: Extract gradient for grid density from RGB input[0]
+		GPUMatrixDynamic<T> dL_dgrid_density{m_density_grid->padded_output_width(), batch_size, stream, m_density_grid->preferred_output_layout()};
+		CUDA_CHECK_THROW(cudaMemsetAsync(dL_dgrid_density.data(), 0, dL_dgrid_density.n_bytes(), stream));
+		
+		
+		
+		uint32_t grid_dst_stride = dL_dgrid_density.layout() == AoS ? dL_dgrid_density.stride() : 1;
+		
+		
+		linear_kernel(extract_first_channel_gradient_kernel<T>, 0, stream,
+			batch_size,
+			dL_drgb_network_input.data(),
+			rgb_src_stride,
+			grid_dst_stride,
+			dL_dgrid_density.data(),
+			forward.grid_density.data(),  // Forward grid values (not used when apply_exp=false)
+			false  // Don't apply exp() - gradients already w.r.t. log-density from fused kernels
+		);
+		
+		// Step 2b: ACCUMULATE density gradient from RGBD output (channel 3) to grid
+		uint32_t rgbd_src_stride = dL_doutput.layout() == AoS ? dL_doutput.m() : 1;
+		
+		
+		
+		linear_kernel(accumulate_density_gradient_to_grid_kernel<T>, 0, stream,
+			batch_size,
+			dL_doutput.data(),
+			rgbd_src_stride,  // For AoS: stride=4, for SoA: stride=1
+			dL_dgrid_density.data(),
+			grid_dst_stride,
+			dL_doutput.m(),  // Number of rows (channels) = 4 for RGBD
+			forward.grid_density.data(),  // Forward grid values (not used when apply_exp=false)
+			false  // Don't apply exp() - gradients already w.r.t. log-density from fused kernels
+		);
+		
+		// Step 3: Backprop to MLP
+		GPUMatrixDynamic<T> dL_ddensity_input;
+		if (m_pos_encoding->n_params() > 0 || dL_dinput) {
+			dL_ddensity_input = GPUMatrixDynamic<T>{m_pos_encoding->padded_output_width(), batch_size, stream, m_pos_encoding->preferred_output_layout()};
+		}
+		
+		
+		
+		m_density_network->backward(
+			stream, *forward.density_network_ctx, forward.density_network_input, forward.density_network_output,
+			dL_ddensity_network_output, dL_ddensity_input.data() ? &dL_ddensity_input : nullptr, use_inference_params, param_gradients_mode
+		);
+		
+
+		
+		// Step 4: Backprop to grid
+		if (m_density_grid->n_params() > 0) {
+			
+			
+			m_density_grid->backward(
+				stream, *forward.density_grid_ctx, 
+				input.slice_rows(0, 3),
+				forward.grid_density,
+				dL_dgrid_density,
+				nullptr,  // Don't need input gradients
+				use_inference_params,
+				param_gradients_mode
+			);
+			
+		}
+		
+		// Step 5: Backprop through hash encoding
+		if (dL_ddensity_input.data()) {
+			GPUMatrixDynamic<float> dL_dpos_encoding_input;
+			if (dL_dinput) {
+				dL_dpos_encoding_input = dL_dinput->slice_rows(0, m_pos_encoding->input_width());
+			}
+			
+			m_pos_encoding->backward(
+				stream,
+				*forward.pos_encoding_ctx,
+				input.slice_rows(0, m_pos_encoding->input_width()),
+				forward.density_network_input,
+				dL_ddensity_input,
+				dL_dinput ? &dL_dpos_encoding_input : nullptr,
+				use_inference_params,
+				param_gradients_mode
+			);
+		}
+		
+		// Skip standard backprop
+		CUDA_CHECK_THROW(cudaMemsetAsync(dL_ddensity_network_output.data(), 0, dL_ddensity_network_output.n_bytes(), stream));
 	}
 	
 	// Add gradient from final RGBD output (alpha blending)
@@ -1316,29 +1630,40 @@ public:
 		// 		dL_ddensity_network_output.layout() == RM ? 1 : dL_ddensity_network_output.stride(),
 		// 		dL_ddensity_network_output.data()
 		// 	);
-		// }
+	// }
+	
+	// CRITICAL: For surface_explicit and baseline_explicit, density comes from GRID, not MLP
+	// So density gradients from RGBD output should NOT go to dL_ddensity_network_output
+	if (m_method != "surface_explicit" && m_method != "baseline_explicit") {
+
 		
 		linear_kernel(add_density_gradient<T>, 0, stream,
 				batch_size,
-				dL_doutput.layout() == AoS ? dL_doutput.stride() : 1,
+				dL_doutput.m(),
 				dL_doutput.data(),
-				dL_ddensity_network_output.layout() == AoS ? dL_ddensity_network_output.stride() : 1,
+				dL_ddensity_network_output.layout() == RM ? 1 : dL_ddensity_network_output.stride(),
 				dL_ddensity_network_output.data()
 			);
-		// NOTE: No gradient clipping needed - working NeuS2 implementations don't use it
+		
 
-		GPUMatrixDynamic<T> dL_ddensity_network_input;
+	}
+	// NOTE: No gradient clipping needed - working NeuS2 implementations don't use it
+
+	GPUMatrixDynamic<T> dL_ddensity_network_input;
 		if (m_pos_encoding->n_params() > 0 || dL_dinput || m_backprop_normals) {
 			dL_ddensity_network_input = GPUMatrixDynamic<T>{m_pos_encoding->padded_output_width(), batch_size, stream, m_pos_encoding->preferred_output_layout()};
 		}
 
-	// Skip density network backward for hash_surface and surface_explicit since they were already handled
-	if (m_method != "hash_surface" && m_method != "surface_explicit") {
+	// Skip density network backward for hash_surface, surface_explicit, and baseline_explicit since they were already handled
+	if (m_method != "hash_surface" && m_method != "surface_explicit" && m_method != "baseline_explicit") {
+
+		
 		m_density_network->backward(stream, *forward.density_network_ctx, forward.density_network_input, forward.density_network_output, dL_ddensity_network_output, dL_ddensity_network_input.data() ? &dL_ddensity_network_input : nullptr, use_inference_params, param_gradients_mode);
+
 	}
 
-	// Backprop through pos encoding (skip for hash_surface and surface_explicit since they're handled specially)
-	if (dL_ddensity_network_input.data() && m_method != "hash_surface" && m_method != "surface_explicit") {
+	// Backprop through pos encoding (skip for hash_surface, surface_explicit, and baseline_explicit since they're handled specially)
+	if (dL_ddensity_network_input.data() && m_method != "hash_surface" && m_method != "surface_explicit" && m_method != "baseline_explicit") {
 					GPUMatrixDynamic<float> dL_dpos_encoding_input;
 		if (dL_dinput) {
 			dL_dpos_encoding_input = dL_dinput->slice_rows(0, m_pos_encoding->input_width());
@@ -2267,6 +2592,11 @@ public:
 			m_variance_network->set_params(params + offset, inference_params + offset, gradients + offset);
 			offset += m_variance_network->n_params();
 		}
+		
+		if (m_density_grid) {
+			m_density_grid->set_params(params + offset, inference_params + offset, gradients + offset);
+			offset += m_density_grid->n_params();
+		}
 	}
 
 	void initialize_params(pcg32& rnd, float* params_full_precision, float scale = 1) override {
@@ -2285,14 +2615,28 @@ public:
 		if (m_variance_network) {
 			m_variance_network->initialize_params(rnd, params_full_precision, scale);
 			params_full_precision += m_variance_network->n_params();
-			
 		}
+		
+		// if (m_density_grid) {
+		// 	// Initialize to near-empty: scale=0.01 gives [-0.01, 0.01], then subtract 3 to get [-3.01, -2.99]
+		// 	// After exp(), this gives density ~ [0.05, 0.05] which is near-empty
+		// 	size_t n = m_density_grid->n_params();
+		// 	std::vector<float> temp(n);
+		// 	for (size_t i = 0; i < n; ++i) {
+		// 		temp[i] = (rnd.next_float() * 2.0f - 1.0f) * 0.01f - 3.0f;  // ~[-3.01, -2.99], exp() ~ 0.05
+		// 	}
+		// 	CUDA_CHECK_THROW(cudaMemcpy(params_full_precision, temp.data(), n * sizeof(float), cudaMemcpyHostToDevice));
+		// 	params_full_precision += n;
+		// }
 	}
 
 	size_t n_params() const override {
 		size_t params = m_pos_encoding->n_params() + m_density_network->n_params() + m_dir_encoding->n_params() + m_rgb_network->n_params();
 		if (m_variance_network) {
 			params += m_variance_network->n_params();
+		}
+		if (m_density_grid) {
+			params += m_density_grid->n_params();
 		}
 		return params;
 	}
@@ -2552,6 +2896,12 @@ private:
 	
 	// For surface_explicit mode: grid density output
 	GPUMatrixDynamic<T> grid_density;                // Grid density output for backward pass
+	
+	// For finite difference gradient computation (surface_explicit --grad finite)
+	std::vector<std::unique_ptr<Context>> finite_diff_contexts;  // Variable number based on genus
+	std::vector<GPUMatrixDynamic<T>> finite_diff_densities;      // Variable number based on genus
+	std::vector<GPUMatrixDynamic<float>> finite_diff_positions;  // Variable number based on genus
+	int finite_diff_genus = 1;  // Genus used for finite differences (1 or 2)
 };
 
 	

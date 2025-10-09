@@ -95,6 +95,9 @@ def parse_args():
 	
 	# New: Gradient computation method
 	parser.add_argument("--grad", type=str, default="analytical", choices=["analytical", "finite"], help="Gradient computation method. 'analytical' uses autodiff (default), 'finite' uses finite differences for surface_explicit mode.")
+	
+	# New: Daubechies stencil genus for finite differences
+	parser.add_argument("--genus", type=int, default=1, choices=[1, 2], help="Daubechies stencil genus for finite differences. 1 = 2-point stencil (default), 2 = 4-point stencil (higher accuracy). Only used with --grad finite.")
 
 	return parser.parse_args()
 
@@ -144,11 +147,17 @@ if __name__ == "__main__":
 	# Export gradient computation method for C++ side to pick up
 	if args.grad == "finite":
 		os.environ["NGP_GRAD_METHOD"] = "finite"
+		# Export genus for finite differences
+		os.environ["NGP_GENUS"] = str(args.genus)
 	else:
 		os.environ["NGP_GRAD_METHOD"] = "analytical"
 
 	testbed = ngp.Testbed()
 	testbed.root_dir = ROOT_DIR
+
+	# Set method BEFORE loading data/network so constructor sees it
+	testbed.method = args.method
+	print(f"DEBUG: Method set to: {args.method}")
 
 	for file in args.files:
 		scene_info = get_scene(file)
@@ -175,10 +184,6 @@ if __name__ == "__main__":
 		testbed.init_window(sw, sh, second_window=args.second_window)
 		if args.vr:
 			testbed.init_vr()
-
-	testbed.method = args.method
-	# Add debug print to verify method is set
-	print(f"DEBUG: Method set to: {args.method}")
 
 	if args.load_snapshot:
 		scene_info = get_scene(args.load_snapshot)
