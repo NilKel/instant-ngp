@@ -292,9 +292,146 @@ public:
 		bool use_inference_params = false,
 		tcnn::GradientMode param_gradients_mode = tcnn::GradientMode::Overwrite
 	) override {
-		// Hash surface backward is complex - implement based on original nerf_network.h lines 1249-1356
-		// For now, stub implementation
-		throw std::runtime_error("HashSurfaceNetwork::backward_impl not yet fully implemented");
+		// Backward pass: gradients from hash surface features back to hash interpolation and density
+		const auto& forward = dynamic_cast<const ForwardContext&>(ctx);
+		uint32_t batch_size = input.n();
+		uint32_t n_levels = this->m_pos_encoding->padded_output_width() / 4; // Dynamic levels calculation
+		uint32_t surface_features = n_levels; // n_levels hash surface features (no density)
+		
+		// Standard RGB network backward
+		tcnn::GPUMatrixDynamic<T> dL_drgb_network_input{
+			this->m_rgb_network_input_width, batch_size, stream, tcnn::AoS
+		};
+		CUDA_CHECK_THROW(cudaMemsetAsync(dL_drgb_network_input.data(), 0,
+		                                  dL_drgb_network_input.n_bytes(), stream));
+		
+		this->m_rgb_network->backward(
+			stream, *forward.rgb_network_ctx, forward.rgb_network_input,
+			forward.rgb_network_output, dL_doutput.slice_rows(0, 3),
+			&dL_drgb_network_input, use_inference_params, param_gradients_mode
+		);
+		
+		// Direction encoding backward
+		auto dL_ddir_out = dL_drgb_network_input.slice_rows(surface_features + 1, this->m_dir_encoding->padded_output_width());
+		tcnn::GPUMatrixDynamic<float> dL_ddir_encoding_input;
+		if (dL_dinput) {
+			dL_ddir_encoding_input = dL_dinput->slice_rows(this->m_dir_offset, this->m_dir_encoding->input_width());
+		}
+		
+		this->m_dir_encoding->backward(
+			stream, *forward.dir_encoding_ctx,
+			input.slice_rows(this->m_dir_offset, this->m_dir_encoding->input_width()),
+			dL_ddir_out.slice_rows(0, this->m_dir_encoding->padded_output_width()),
+			dL_ddir_out, dL_dinput ? &dL_ddir_encoding_input : nullptr,
+			use_inference_params, param_gradients_mode
+		);
+		
+		auto dL_dhash_surface_slice = dL_drgb_network_input.slice_rows(0, surface_features);
+		
+		// Create gradient buffers
+		tcnn::GPUMatrixDynamic<T> dL_dhash_features{
+			this->m_pos_encoding->padded_output_width(), batch_size, stream, forward.density_network_input.layout()
+		};
+		tcnn::GPUMatrixDynamic<float> dL_dnormals{3, batch_size, stream, forward.analytical_normals.layout()};
+		CUDA_CHECK_THROW(cudaMemsetAsync(dL_dhash_features.data(), 0, dL_dhash_features.n_bytes(), stream));
+		CUDA_CHECK_THROW(cudaMemsetAsync(dL_dnormals.data(), 0, dL_dnormals.n_bytes(), stream));
+		
+		// Backward through hash surface features computation
+		linear_kernel(hash_surface_features_backward_kernel<T>, 0, stream,
+			batch_size,
+			n_levels, // Dynamic number of levels
+			4, // 4 features per level
+			forward.density_network_input.data(), // Hash interpolation output (n_levels * 4)
+			forward.density_network_input.layout() == tcnn::AoS ? forward.density_network_input.stride() : 1,
+			forward.analytical_normals.data(), // 3D analytical normals
+			dL_dhash_surface_slice.data(), // Gradients w.r.t. hash surface features (n_levels)
+			dL_dhash_surface_slice.layout() == tcnn::AoS ? dL_dhash_surface_slice.stride() : 1,
+			dL_dhash_features.data(), // Output: gradients w.r.t. hash features (n_levels * 4)
+			dL_dnormals.data() // Output: gradients w.r.t. normals (3D)
+		);
+		
+		// Density network output gradients
+		tcnn::GPUMatrixDynamic<T> dL_ddensity_network_output{
+			this->m_density_network->padded_output_width(), batch_size, stream, tcnn::AoS
+		};
+		CUDA_CHECK_THROW(cudaMemsetAsync(dL_ddensity_network_output.data(), 0,
+		                                  dL_ddensity_network_output.n_bytes(), stream));
+		
+		// Extract gradient w.r.t. density from RGB input and accumulate to density MLP output
+		auto dL_ddensity_from_rgb = dL_drgb_network_input.slice_rows(surface_features, 1);
+		linear_kernel(add_to_buffer_kernel<T>, 0, stream,
+			batch_size,
+			dL_ddensity_from_rgb.data(),
+			dL_ddensity_network_output.data()
+		);
+		
+		// Accumulate density gradient from output[3]
+		linear_kernel(add_density_gradient_from_output<T>, 0, stream,
+			batch_size,
+			dL_doutput.layout() == tcnn::AoS ? dL_doutput.m() : 1,
+			dL_doutput.data(),
+			dL_ddensity_network_output.layout() == tcnn::AoS ? dL_ddensity_network_output.stride() : 1,
+			dL_ddensity_network_output.data()
+		);
+		
+		// Backpropagate gradients through analytical normals to density network parameters
+		accumulate_analytical_normal_gradients(
+			stream, batch_size, input, forward, dL_dnormals,
+			dL_ddensity_network_output, use_inference_params, param_gradients_mode
+		);
+		
+		// Backpropagate through density MLP (from 1D density to extracted density features)
+		uint32_t extracted_density_features_size = this->m_density_network->input_width(); // padded
+		tcnn::GPUMatrixDynamic<T> dL_dextracted_density_features{
+			extracted_density_features_size, batch_size, stream, forward.density_network_input.layout()
+		};
+		CUDA_CHECK_THROW(cudaMemsetAsync(dL_dextracted_density_features.data(), 0,
+		                                  dL_dextracted_density_features.n_bytes(), stream));
+		
+		// Backward through density MLP
+		this->m_density_network->backward(
+			stream,
+			*forward.density_network_ctx,
+			forward.extracted_density_features,
+			forward.density_network_output,
+			dL_ddensity_network_output,
+			&dL_dextracted_density_features,
+			use_inference_params,
+			param_gradients_mode
+		);
+		
+		// Accumulate gradients from extracted density features back to hash features (every 4th feature)
+		for (uint32_t level = 0; level < n_levels; ++level) {
+			linear_kernel(accumulate_density_gradient_to_hash_kernel<T>, 0, stream,
+				batch_size,
+				level, // level index
+				4, // features per level
+				dL_dextracted_density_features.data(),
+				dL_dextracted_density_features.layout() == tcnn::AoS ? dL_dextracted_density_features.stride() : 1,
+				level, // gradient index in extracted features
+				dL_dhash_features.data(),
+				dL_dhash_features.layout() == tcnn::AoS ? dL_dhash_features.stride() : 1
+			);
+		}
+		
+		// Backpropagate through position encoding for hash_surface
+		if (this->m_pos_encoding->n_params() > 0 || dL_dinput) {
+			tcnn::GPUMatrixDynamic<float> dL_dpos_encoding_input;
+			if (dL_dinput) {
+				dL_dpos_encoding_input = dL_dinput->slice_rows(0, this->m_pos_encoding->input_width());
+			}
+			
+			this->m_pos_encoding->backward(
+				stream,
+				*forward.pos_encoding_ctx,
+				input.slice_rows(0, this->m_pos_encoding->input_width()),
+				forward.density_network_input,
+				dL_dhash_features,  // Use hash features gradients instead of density network input gradients
+				dL_dinput ? &dL_dpos_encoding_input : nullptr,
+				use_inference_params,
+				param_gradients_mode
+			);
+		}
 	}
 
 	void density(
