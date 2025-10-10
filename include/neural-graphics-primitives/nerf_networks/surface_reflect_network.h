@@ -196,9 +196,10 @@ public:
 			use_inference_params, true
 		);
 		
-		// Compute analytical normals
+		// Compute analytical normals (cast to parent's ForwardContext type)
+		auto& base_forward = reinterpret_cast<std::unique_ptr<typename SurfaceNetwork<T>::ForwardContext>&>(forward);
 		forward->analytical_normals = this->compute_analytical_normals_forward(
-			stream, batch_size, input, forward, use_inference_params
+			stream, batch_size, input, base_forward, use_inference_params
 		);
 		
 		// Compute surface features
@@ -251,7 +252,7 @@ public:
 		);
 		
 		if (output) {
-			forward->rgb_network_output = tcnn::GPUMatrix<T>{
+			forward->rgb_network_output = tcnn::GPUMatrixDynamic<T>{
 				output->data(), this->m_rgb_network->padded_output_width(), batch_size, output->layout()
 			};
 		}

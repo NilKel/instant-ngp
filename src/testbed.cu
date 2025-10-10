@@ -17,7 +17,7 @@
 #include <neural-graphics-primitives/json_binding.h>
 #include <neural-graphics-primitives/marching_cubes.h>
 #include <neural-graphics-primitives/nerf_loader.h>
-#include <neural-graphics-primitives/nerf_network.h>
+#include <neural-graphics-primitives/nerf_networks/nerf_network_factory.h>
 #include <neural-graphics-primitives/render_buffer.h>
 #include <neural-graphics-primitives/takikawa_encoding.cuh>
 #include <neural-graphics-primitives/testbed.h>
@@ -4353,7 +4353,7 @@ void Testbed::reset_network(bool clear_density_grid) {
 		// Instantiate an additional model for each auxiliary GPU
 		for (auto& device : m_devices) {
 			device.set_nerf_network(
-				std::make_shared<NerfNetwork<network_precision_t>>(
+				create_nerf_network<network_precision_t>(
 					dims.n_pos,
 					n_dir_dims,
 					n_extra_dims,
@@ -5682,7 +5682,7 @@ void Testbed::CudaDevice::set_network(const std::shared_ptr<Network<float, netwo
 	m_fused_render_kernel = nullptr;
 }
 
-void Testbed::CudaDevice::set_nerf_network(const std::shared_ptr<NerfNetwork<network_precision_t>>& nerf_network) {
+void Testbed::CudaDevice::set_nerf_network(const std::shared_ptr<NerfNetworkBase<network_precision_t>>& nerf_network) {
 	m_nerf_network = nerf_network;
 	set_network(nerf_network);
 }

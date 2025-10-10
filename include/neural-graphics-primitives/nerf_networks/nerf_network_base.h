@@ -71,9 +71,9 @@ public:
 			rgb_alignment
 		));
 		
-		// Create density and RGB networks (overridden in derived classes for custom configurations)
-		m_density_network.reset(tcnn::create_network<T>(density_network));
-		m_rgb_network.reset(tcnn::create_network<T>(rgb_network));
+		// Note: Density and RGB networks are created in derived classes
+		// Each derived class modifies the config (adds n_input_dims, n_output_dims, etc.)
+		// before creating the networks to avoid passing unexpected config parameters
 		
 		// Initialize variance network for SDF mode
 		if (m_use_sdf) {
@@ -81,8 +81,8 @@ public:
 			m_variance_network = std::make_shared<TrainableBuffer<1, 1, T>>(resolution);
 		}
 		
-		// Create density model (fused pos encoding + density network)
-		m_density_model = std::make_shared<tcnn::NetworkWithInputEncoding<T>>(m_pos_encoding, m_density_network);
+		// Note: Density model (fused pos encoding + density network) is created in derived classes
+		// after the density network is initialized
 	}
 
 	virtual ~NerfNetworkBase() = default;
@@ -171,6 +171,10 @@ public:
 
 	uint32_t n_extra_dims() const {
 		return m_n_extra_dims;
+	}
+	
+	uint32_t padded_density_output_width() const {
+		return m_density_network->padded_output_width();
 	}
 
 	uint32_t required_input_alignment() const override {
@@ -301,7 +305,7 @@ protected:
 		tcnn::GPUMatrixDynamic<T> density_network_input;
 		tcnn::GPUMatrixDynamic<T> density_network_output;
 		tcnn::GPUMatrixDynamic<T> rgb_network_input;
-		tcnn::GPUMatrix<T> rgb_network_output;
+		tcnn::GPUMatrixDynamic<T> rgb_network_output;
 
 		std::unique_ptr<tcnn::Context> pos_encoding_ctx;
 		std::unique_ptr<tcnn::Context> dir_encoding_ctx;

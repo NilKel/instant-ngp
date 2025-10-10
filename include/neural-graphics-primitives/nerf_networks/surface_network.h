@@ -211,7 +211,7 @@ public:
 		);
 		
 		if (output) {
-			forward->rgb_network_output = tcnn::GPUMatrix<T>{
+			forward->rgb_network_output = tcnn::GPUMatrixDynamic<T>{
 				output->data(), this->m_rgb_network->padded_output_width(), batch_size, output->layout()
 			};
 		}
@@ -365,7 +365,7 @@ public:
 		}
 	}
 
-private:
+protected:
 	struct ForwardContext : public NerfNetworkBase<T>::ForwardContextBase {
 		tcnn::GPUMatrixDynamic<float> raw_gradients;
 		tcnn::GPUMatrixDynamic<float> analytical_normals;

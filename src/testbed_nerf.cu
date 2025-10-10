@@ -19,7 +19,7 @@
 #include <neural-graphics-primitives/json_binding.h>
 #include <neural-graphics-primitives/marching_cubes.h>
 #include <neural-graphics-primitives/nerf_loader.h>
-#include <neural-graphics-primitives/nerf_network.h>
+#include <neural-graphics-primitives/nerf_networks/nerf_network_base.h>
 #include <neural-graphics-primitives/render_buffer.h>
 #include <neural-graphics-primitives/testbed.h>
 #include <neural-graphics-primitives/trainable_buffer.cuh>
@@ -1666,7 +1666,7 @@ void Testbed::NerfTracer::init_rays_from_camera(
 }
 
 uint32_t Testbed::NerfTracer::trace(
-	const std::shared_ptr<NerfNetwork<network_precision_t>>& network,
+	const std::shared_ptr<NerfNetworkBase<network_precision_t>>& network,
 	const BoundingBox& render_aabb,
 	const mat3& render_aabb_to_local,
 	const BoundingBox& train_aabb,
@@ -1912,7 +1912,7 @@ void Testbed::render_nerf(
 	cudaStream_t stream,
 	CudaDevice& device,
 	const CudaRenderBufferView& render_buffer,
-	const std::shared_ptr<NerfNetwork<network_precision_t>>& nerf_network,
+	const std::shared_ptr<NerfNetworkBase<network_precision_t>>& nerf_network,
 	const uint8_t* density_grid_bitfield,
 	const vec2& focal_length,
 	const mat4x3& camera_matrix0,

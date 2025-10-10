@@ -285,7 +285,7 @@ public:
 		);
 		
 		if (output) {
-			forward->rgb_network_output = tcnn::GPUMatrix<T>{
+			forward->rgb_network_output = tcnn::GPUMatrixDynamic<T>{
 				output->data(), this->m_rgb_network->padded_output_width(), batch_size, output->layout()
 			};
 		}

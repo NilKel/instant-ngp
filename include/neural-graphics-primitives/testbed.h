@@ -57,7 +57,7 @@ template <uint32_t N_DIMS, uint32_t RANK, typename T> class TrainableBuffer;
 
 namespace ngp {
 
-template <typename T> class NerfNetwork;
+template <typename T> class NerfNetworkBase;
 class TriangleOctree;
 class TriangleBvh;
 struct Triangle;
@@ -197,7 +197,7 @@ public:
 		);
 
 		uint32_t trace(
-			const std::shared_ptr<NerfNetwork<network_precision_t>>& network,
+			const std::shared_ptr<NerfNetworkBase<network_precision_t>>& network,
 			const BoundingBox& render_aabb,
 			const mat3& render_aabb_to_local,
 			const BoundingBox& train_aabb,
@@ -331,7 +331,7 @@ public:
 		cudaStream_t stream,
 		CudaDevice& device,
 		const CudaRenderBufferView& render_buffer,
-		const std::shared_ptr<NerfNetwork<network_precision_t>>& nerf_network,
+		const std::shared_ptr<NerfNetworkBase<network_precision_t>>& nerf_network,
 		const uint8_t* density_grid_bitfield,
 		const vec2& focal_length,
 		const mat4x3& camera_matrix0,
@@ -1145,11 +1145,11 @@ public:
 		void set_dirty(bool value) { m_dirty = value; }
 
 		void set_network(const std::shared_ptr<Network<float, network_precision_t>>& network);
-		void set_nerf_network(const std::shared_ptr<NerfNetwork<network_precision_t>>& nerf_network);
+		void set_nerf_network(const std::shared_ptr<NerfNetworkBase<network_precision_t>>& nerf_network);
 
 		const std::shared_ptr<Network<float, network_precision_t>>& network() const { return m_network; }
 
-		const std::shared_ptr<NerfNetwork<network_precision_t>>& nerf_network() const { return m_nerf_network; }
+		const std::shared_ptr<NerfNetworkBase<network_precision_t>>& nerf_network() const { return m_nerf_network; }
 
 		void clear() {
 			m_data = std::make_unique<Data>();
@@ -1194,7 +1194,7 @@ public:
 		CudaRenderBufferView m_render_buffer_view = {};
 
 		std::shared_ptr<Network<float, network_precision_t>> m_network;
-		std::shared_ptr<NerfNetwork<network_precision_t>> m_nerf_network;
+		std::shared_ptr<NerfNetworkBase<network_precision_t>> m_nerf_network;
 
 		std::unique_ptr<CudaRtcKernel> m_fused_render_kernel;
 
@@ -1293,7 +1293,7 @@ public:
 		}
 	} m_distortion;
 
-	std::shared_ptr<NerfNetwork<network_precision_t>> m_nerf_network;
+	std::shared_ptr<NerfNetworkBase<network_precision_t>> m_nerf_network;
 
 };
 
