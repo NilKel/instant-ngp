@@ -102,6 +102,15 @@ auto volume_net = create_nerf_network<T>(..., "volume", ...);
 //   - All mode-specific features
 ```
 
+## 📚 Documentation
+
+- **ARCHITECTURE.md**: Comprehensive technical documentation for all 8 modes
+  - Detailed MLP architectures and dimensions
+  - Data structure specifications (HashGrid, DenseGrid, encodings)
+  - Step-by-step forward pass flows with activations
+  - Detailed backward pass gradient flows
+  - Comparison table across all modes
+
 ## 📋 Completion Checklist
 
 ### ✅ COMPLETED - All Core Functionality
