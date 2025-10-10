@@ -54,7 +54,8 @@ __launch_bounds__(128, 4) __global__ void render_nerf(
 	float min_transmittance,
 	bool train_in_linear_colors,
 	bool surface_rendering,
-	float surface_rendering_threshold
+	float surface_rendering_threshold,
+	uint32_t padded_output_width = 4
 ) {
 	uint32_t x = threadIdx.x + blockDim.x * blockIdx.x;
 	uint32_t y = threadIdx.y + blockDim.y * blockIdx.y;
@@ -102,6 +103,11 @@ __launch_bounds__(128, 4) __global__ void render_nerf(
 	t = advance_n_steps(t, cone_angle, ld_random_val(sample_index, idx * 786433));
 
 	float max_weight = 0.0f;
+	
+	// For baseline_aggregate mode: separate accumulators
+	vec4 diffuse_color = vec4(0.0f);
+	vec4 accumulated_features = vec4(0.0f);
+	bool is_baseline_aggregate = (padded_output_width == 8);
 
 	while (true) {
 		// Advance to next occupied voxel
@@ -133,7 +139,7 @@ __launch_bounds__(128, 4) __global__ void render_nerf(
 			break;
 		}
 
-		vec4 nerf_out = eval_nerf(nerf_in, params);
+		auto nerf_out = eval_nerf(nerf_in, params);
 
 		// All threads in the warp must execute the above MLPs for coherence reasons.
 		// Starting from here, it's fine to skip computation.
@@ -143,11 +149,30 @@ __launch_bounds__(128, 4) __global__ void render_nerf(
 
 		t += dt;
 
-		// Composit color
-		float alpha = 1.f - __expf(-network_to_density(nerf_out.w, density_activation) * dt);
-		float weight = alpha * (1.0f - color.a);
-		vec3 rgb = network_to_rgb_vec(nerf_out.xyz(), rgb_activation);
-		color += vec4(rgb * weight, weight);
+		// Composit color - handle both standard and baseline_aggregate modes
+		float alpha, weight;
+		vec3 rgb;
+		
+		if (is_baseline_aggregate) {
+			// baseline_aggregate: 8D output [density, diffuse_RGB(3), features(4)]
+			float density = float(nerf_out[0]);
+			vec3 diffuse_rgb = {float(nerf_out[1]), float(nerf_out[2]), float(nerf_out[3])};
+			vec4 features = {float(nerf_out[4]), float(nerf_out[5]), float(nerf_out[6]), float(nerf_out[7])};
+			
+			alpha = 1.f - __expf(-network_to_density(density, density_activation) * dt);
+			weight = alpha * (1.0f - diffuse_color.a);
+			
+			diffuse_color += vec4(network_to_rgb_vec(diffuse_rgb, rgb_activation) * weight, weight);
+			accumulated_features += features * weight;
+			
+			rgb = network_to_rgb_vec(diffuse_rgb, rgb_activation);  // For surface rendering
+		} else {
+			// Standard mode: 4D output [R, G, B, density]
+			alpha = 1.f - __expf(-network_to_density(float(nerf_out[3]), density_activation) * dt);
+			weight = alpha * (1.0f - color.a);
+			rgb = network_to_rgb_vec(vec3(nerf_out[0], nerf_out[1], nerf_out[2]), rgb_activation);
+			color += vec4(rgb * weight, weight);
+		}
 
 		if (weight > max_weight) {
 			max_weight = weight;
@@ -156,14 +181,29 @@ __launch_bounds__(128, 4) __global__ void render_nerf(
 
 		if (surface_rendering && alpha >= surface_rendering_threshold) {
 			// Surface rendering: return the first surface point that has a sufficient occupancy
+			if (is_baseline_aggregate) {
+				color = diffuse_color;
+			}
 			color.rgb() = rgb;
 			color.a = 1.0f;
 			best_depth_candidate = lens.is_360() ? distance(pos, cam_pos) : dot(cam_fwd, pos - cam_pos);
 			alive = false;
-		} else if (color.a > (1.0f - min_transmittance)) {
-			color /= color.a;
-			alive = false;
+		} else {
+			float current_alpha = is_baseline_aggregate ? diffuse_color.a : color.a;
+			if (current_alpha > (1.0f - min_transmittance)) {
+				if (is_baseline_aggregate) {
+					color = diffuse_color;
+				}
+				color /= color.a;
+				alive = false;
+			}
 		}
+	}
+
+	// For baseline_aggregate: apply final composition (currently using diffuse only)
+	// TODO: Add per-pixel RGB MLP evaluation for directional component
+	if (is_baseline_aggregate) {
+		color = diffuse_color;
 	}
 
 	if (!valid) {

@@ -48,7 +48,7 @@ __global__ void extract_density(
 	T* __restrict__ rgbd,
 	bool sdf_mode = false,
 	const T* __restrict__ variance_params = nullptr,
-	bool apply_exp = false  // NEW: Apply exponential activation (for grid-based density)
+	bool apply_relu = false  // Apply ReLU activation (for grid-based density in baseline_explicit)
 ) {
 	const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
 	if (i >= n_elements) return;
@@ -76,10 +76,10 @@ __global__ void extract_density(
 		}
 		
 		density_val = T(density_result);
-	} else if (apply_exp) {
-		// Apply exponential activation for grid-based density
-		// Grid stores log-density, so we need exp() to get actual density
-		density_val = T(expf(float(density_val)));
+	} else if (apply_relu) {
+		// Apply ReLU activation for grid-based density
+		// baseline_explicit: grid stores raw density, apply ReLU to match baseline MLP behavior
+		density_val = T(fmaxf(float(density_val), 0.0f));
 	}
 	
 	rgbd[i * rgbd_stride] = density_val;
@@ -1142,7 +1142,8 @@ __global__ void replace_first_channel_kernel(
 	const T* __restrict__ grid_density,
 	const uint32_t grid_stride,
 	const uint32_t output_stride,
-	T* __restrict__ network_output
+	T* __restrict__ network_output,
+	bool apply_relu  // Apply ReLU activation (for grid-based density in baseline_explicit)
 ) {
 	const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
 	if (i >= n_elements) return;
@@ -1156,7 +1157,14 @@ __global__ void replace_first_channel_kernel(
 	uint32_t output_idx = (output_stride > 1) ? (i * output_stride) : i;
 	
 	// Extract first channel from padded grid output
-	network_output[output_idx] = grid_density[grid_idx];
+	T value = grid_density[grid_idx];
+	
+	// Apply ReLU activation if needed (baseline_explicit uses ReLU like baseline MLP)
+	if (apply_relu) {
+		value = T(fmaxf(float(value), 0.0f));
+	}
+	
+	network_output[output_idx] = value;
 }
 
 /**
@@ -1176,7 +1184,7 @@ __global__ void extract_first_channel_gradient_kernel(
 	const uint32_t grid_stride,
 	T* __restrict__ dL_dgrid_density,
 	const T* __restrict__ grid_forward_values = nullptr,  // Forward grid values for chain rule
-	bool apply_exp_chain_rule = false  // Apply d(exp(x))/dx = exp(x) chain rule
+	bool apply_relu_chain_rule = false  // Apply d(ReLU(x))/dx chain rule (1 if x > 0, else 0)
 ) {
 	const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
 	if (i >= n_elements) return;
@@ -1191,10 +1199,12 @@ __global__ void extract_first_channel_gradient_kernel(
 	
 	T grad = dL_dnetwork_output[input_idx];
 	
-	// Apply chain rule for exp activation: dL/d(grid) = dL/d(density) * exp(grid)
-	if (apply_exp_chain_rule && grid_forward_values) {
+	// Apply chain rule for ReLU activation: dL/d(grid) = dL/d(density) * (1 if grid > 0 else 0)
+	if (apply_relu_chain_rule && grid_forward_values) {
 		T grid_val = grid_forward_values[grid_idx];
-		grad *= T(expf(float(grid_val)));
+		if (float(grid_val) <= 0.0f) {
+			grad = T(0.0f);  // Zero gradient for negative values
+		}
 	}
 	
 	// Atomically accumulate to avoid race conditions when multiple samples hit same grid cell
@@ -1221,7 +1231,7 @@ __global__ void accumulate_density_gradient_to_grid_kernel(
 	const uint32_t grid_stride,
 	const uint32_t rgbd_n_rows,  // Number of rows (channels) in RGBD
 	const T* __restrict__ grid_forward_values = nullptr,  // Forward grid values for chain rule
-	bool apply_exp_chain_rule = false  // Apply d(exp(x))/dx = exp(x) chain rule
+	bool apply_relu_chain_rule = false  // Apply d(ReLU(x))/dx chain rule (1 if x > 0, else 0)
 ) {
 	const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
 	if (i >= n_elements) return;
@@ -1237,10 +1247,12 @@ __global__ void accumulate_density_gradient_to_grid_kernel(
 	
 	T grad = dL_drgbd[density_idx];
 	
-	// Apply chain rule for exp activation: dL/d(grid) = dL/d(density) * exp(grid)
-	if (apply_exp_chain_rule && grid_forward_values) {
+	// Apply chain rule for ReLU activation: dL/d(grid) = dL/d(density) * (1 if grid > 0 else 0)
+	if (apply_relu_chain_rule && grid_forward_values) {
 		T grid_val = grid_forward_values[grid_idx];
-		grad *= T(expf(float(grid_val)));
+		if (float(grid_val) <= 0.0f) {
+			grad = T(0.0f);  // Zero gradient for negative values
+		}
 	}
 	
 	// Atomically accumulate to avoid race conditions when multiple samples hit same grid cell

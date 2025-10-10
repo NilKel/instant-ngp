@@ -33,7 +33,7 @@
 		"output_activation": "None",
 		"n_neurons": 64,
 		"n_hidden_layers": 1,
-		"explicit_grid_resolution": 64
+		"n_output_dims": 8
 	},
 	"dir_encoding": {
 		"otype": "Composite",

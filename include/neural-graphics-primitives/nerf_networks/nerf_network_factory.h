@@ -10,6 +10,7 @@
 
 #include "nerf_network_base.h"
 #include "baseline_network.h"
+#include "baseline_aggregate_network.h"
 #include "surface_network.h"
 #include "surface_normal_network.h"
 #include "surface_reflect_network.h"
@@ -58,6 +59,13 @@ std::shared_ptr<NerfNetworkBase<T>> create_nerf_network(
 	// Create mode-specific network based on method string
 	if (method == "baseline") {
 		return std::make_shared<BaselineNetwork<T>>(
+			n_pos_dims, n_dir_dims, n_extra_dims, dir_offset,
+			pos_encoding, dir_encoding, density_network, rgb_network,
+			use_sdf
+		);
+	}
+	else if (method == "baseline_aggregate") {
+		return std::make_shared<BaselineAggregateNetwork<T>>(
 			n_pos_dims, n_dir_dims, n_extra_dims, dir_offset,
 			pos_encoding, dir_encoding, density_network, rgb_network,
 			use_sdf
@@ -130,6 +138,7 @@ std::shared_ptr<NerfNetworkBase<T>> create_nerf_network(
 inline std::vector<std::string> get_supported_methods() {
 	return {
 		"baseline",
+		"baseline_aggregate",
 		"surface",
 		"surface_normal",
 		"surface_reflect",

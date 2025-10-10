@@ -65,7 +65,97 @@ This document provides detailed architectural specifications for all 8 NeRF netw
 
 ---
 
-## 2. Surface Mode (`surface`)
+## 2. Baseline Aggregate Mode (`baseline_aggregate`)
+
+### Architecture
+
+**Position Encoding:**
+- Type: HashGrid (or configurable)
+- Input: 3D position (x, y, z)
+- Output: Encoded position features (typically 32D with HashGrid)
+
+**Density MLP:**
+- Input: Encoded position features
+- Output: 8D
+  - Channel 0: Density value σ
+  - Channels 1-3: Diffuse RGB (R_d, G_d, B_d)
+  - Channels 4-7: 4D features (f0, f1, f2, f3)
+- Activation: ReLU (configurable)
+
+**Direction Encoding:**
+- Type: SphericalHarmonics (degree 4) or Composite
+- Input: 3D view direction
+- Output: Encoded direction features (typically 16D)
+
+**RGB MLP:**
+- Input: 4D features + Encoded direction (16D) = 20D (padded to 32D)
+- Output: 3D directional RGB
+- Activation: ReLU → None (output)
+
+**Explicit Grids:** None
+
+### Forward Pass Flow
+
+1. **Position Encoding**: `pos(x,y,z)` → HashGrid → `enc_pos[32D]`
+2. **Density MLP**: `enc_pos[32D]` → MLP(ReLU) → `density_out[8D]`
+3. **Per-Sample Extraction**:
+   - `density = density_out[0]`
+   - `diffuse_RGB = density_out[1:4]`
+   - `features = density_out[4:8]`
+4. **Volume Rendering (Alpha Blending)**:
+   - For each sample along ray:
+     - `alpha_i = 1 - exp(-density_i * dt_i)`
+     - `weight_i = alpha_i * T_i`
+     - `accumulated_diffuse += diffuse_RGB_i * weight_i`
+     - `accumulated_features += features_i * weight_i`
+5. **Per-Pixel Direction Encoding**: `dir(θ,φ)` → SphericalHarmonics → `enc_dir[16D]`
+6. **Per-Pixel RGB MLP**:
+   - `rgb_input = [accumulated_features[4D], enc_dir[16D]]` (20D → padded to 32D)
+   - `directional_RGB = RGB_MLP(rgb_input)[3D]`
+7. **Final Composition**: `final_RGB = accumulated_diffuse + directional_RGB`
+8. **Final Output**: `[final_R, final_G, final_B, accumulated_alpha]` (4D RGBD)
+
+### Backward Pass Flow
+
+1. **Final RGB Gradient Extraction**: Extract `dL/d(final_RGB)` from output gradients
+2. **Composition Backward**:
+   - `dL/d(accumulated_diffuse) = dL/d(final_RGB)`
+   - `dL/d(directional_RGB) = dL/d(final_RGB)`
+3. **RGB MLP Backward** (per-pixel):
+   - Input: `dL/d(directional_RGB)[3D]`
+   - Output: `dL/d(rgb_input)[32D]`
+   - Gradients flow to RGB MLP parameters
+4. **Direction Encoding Backward** (per-pixel):
+   - Input: `dL/d(enc_dir)` from rgb_input gradients[4:20]
+   - Output: `dL/d(dir)` (optional)
+   - Gradients flow to direction encoding parameters
+5. **Feature Gradients Accumulation** (per-pixel → per-sample):
+   - Extract: `dL/d(accumulated_features)` from rgb_input gradients[0:4]
+   - Distribute to samples: `dL/d(features_i) = dL/d(accumulated_features) * weight_i`
+6. **Diffuse RGB Gradients** (per-pixel → per-sample):
+   - Extract: `dL/d(accumulated_diffuse)`
+   - Distribute to samples: `dL/d(diffuse_RGB_i) = dL/d(accumulated_diffuse) * weight_i`
+7. **Density Gradient Extraction**:
+   - Extract `dL/dσ` from output gradients[3]
+   - Combine with gradients from alpha blending weights
+8. **Density MLP Backward** (per-sample):
+   - Input: `dL/d(density_out)[8D]` (density + diffuse RGB + features)
+   - Output: `dL/d(enc_pos)[32D]`
+   - Gradients flow to density MLP parameters
+9. **Position Encoding Backward**:
+   - Input: `dL/d(enc_pos)[32D]`
+   - Gradients flow to HashGrid parameters
+
+### Key Differences from Baseline Mode
+
+1. **Two-Stage Processing**: Baseline processes RGB per-sample, baseline_aggregate processes directional RGB per-pixel
+2. **Separate Diffuse and Directional**: Diffuse color is view-independent (accumulated), directional is view-dependent (computed per-pixel)
+3. **Feature Accumulation**: 4D features are accumulated during volume rendering, then processed by RGB MLP
+4. **8D MLP Output**: Density MLP outputs 8D instead of 16D
+
+---
+
+## 3. Surface Mode (`surface`)
 
 ### Architecture
 
@@ -486,6 +576,7 @@ Same as Surface Mode, plus:
 | Mode | Density Source | Normal Source | Special Features | MLP Output Dims |
 |------|---------------|---------------|------------------|-----------------|
 | baseline | MLP[0] | N/A | None | 16D |
+| baseline_aggregate | MLP[0] | N/A | Diffuse RGB + 4D features, per-pixel RGB MLP | 8D |
 | surface | MLP[0] | Autodiff MLP | Vector potential Φ | 48D |
 | surface_normal | MLP[0] | Autodiff MLP | + Encoded normals | 48D |
 | surface_reflect | MLP[0] | Autodiff MLP | + Encoded reflections | 48D |

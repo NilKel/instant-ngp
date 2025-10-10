@@ -18,6 +18,7 @@
 #include <neural-graphics-primitives/marching_cubes.h>
 #include <neural-graphics-primitives/nerf_loader.h>
 #include <neural-graphics-primitives/nerf_networks/nerf_network_factory.h>
+#include <neural-graphics-primitives/nerf_networks/baseline_explicit_network.h>
 #include <neural-graphics-primitives/render_buffer.h>
 #include <neural-graphics-primitives/takikawa_encoding.cuh>
 #include <neural-graphics-primitives/testbed.h>
@@ -4552,6 +4553,52 @@ void Testbed::reset_network(bool clear_density_grid) {
 
 		if (m_nerf.training.dataset.envmap_data.data()) {
 			m_envmap.trainer->set_params_full_precision(m_nerf.training.dataset.envmap_data.data(), m_nerf.training.dataset.envmap_data.size());
+		}
+	}
+	
+	// Create separate density grid trainer for baseline_explicit if configured
+	if (m_testbed_mode == ETestbedMode::Nerf && m_nerf_network) {
+		auto baseline_explicit = dynamic_cast<BaselineExplicitNetwork<network_precision_t>*>(m_nerf_network.get());
+		if (baseline_explicit && baseline_explicit->uses_separate_grid_optimizer()) {
+			json grid_optimizer_config = baseline_explicit->grid_optimizer_config();
+			m_density_grid_trainer.n_params = baseline_explicit->n_grid_params();
+			
+			tlog::info() << "Creating separate optimizer for density grid (" << m_density_grid_trainer.n_params << " params)";
+			tlog::info() << "Grid optimizer config: " << grid_optimizer_config.dump();
+			
+			// Create a simple wrapper network that only manages grid parameters
+			class GridParamsWrapper : public tcnn::DifferentiableObject<float, network_precision_t, network_precision_t> {
+			public:
+				GridParamsWrapper(BaselineExplicitNetwork<network_precision_t>* net) : m_network(net) {}
+				
+				void inference_mixed_precision_impl(cudaStream_t, const tcnn::GPUMatrixDynamic<float>&, tcnn::GPUMatrixDynamic<network_precision_t>&, bool) override {}
+				std::unique_ptr<tcnn::Context> forward_impl(cudaStream_t, const tcnn::GPUMatrixDynamic<float>&, tcnn::GPUMatrixDynamic<network_precision_t>*, bool, bool) override { return nullptr; }
+				void backward_impl(cudaStream_t, const tcnn::Context&, const tcnn::GPUMatrixDynamic<float>&, const tcnn::GPUMatrixDynamic<network_precision_t>&, const tcnn::GPUMatrixDynamic<network_precision_t>&, tcnn::GPUMatrixDynamic<float>*, bool, tcnn::GradientMode) override {}
+				
+				void set_params_impl(network_precision_t* params, network_precision_t* inference_params, network_precision_t* gradients) override {
+					m_network->set_grid_params(params, inference_params, gradients);
+				}
+				
+				void initialize_params(pcg32&, float*, float) override {}
+				size_t n_params() const override { return m_network->n_grid_params(); }
+				uint32_t padded_output_width() const override { return 0; }
+				uint32_t input_width() const override { return 0; }
+				uint32_t output_width() const override { return 0; }
+				uint32_t required_input_alignment() const override { return 1; }
+				std::vector<std::pair<uint32_t, uint32_t>> layer_sizes() const override { return {}; }
+				json hyperparams() const override { return json{}; }
+				
+			private:
+				BaselineExplicitNetwork<network_precision_t>* m_network;
+			};
+			
+			auto grid_wrapper = std::make_shared<GridParamsWrapper>(baseline_explicit);
+			m_density_grid_trainer.optimizer.reset(tcnn::create_optimizer<network_precision_t>(grid_optimizer_config));
+			m_density_grid_trainer.trainer = std::make_shared<tcnn::Trainer<float, network_precision_t, network_precision_t>>(
+				grid_wrapper, m_density_grid_trainer.optimizer, m_loss, m_seed
+			);
+		} else {
+			m_density_grid_trainer.reset();
 		}
 	}
 

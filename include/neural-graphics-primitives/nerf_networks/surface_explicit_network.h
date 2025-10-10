@@ -157,7 +157,8 @@ public:
 			grid_density_explicit.data(),
 			grid_density_explicit.layout() == tcnn::AoS ? grid_density_explicit.stride() : 1,  // grid stride (padded)
 			rgb_network_input.layout() == tcnn::AoS ? rgb_network_input.stride() : 1,  // output stride
-			rgb_network_input.data()
+			rgb_network_input.data(),
+			false  // Don't apply exp - surface_explicit uses grid for normals, not as direct density
 		);
 		
 		// Step 6: Direction encoding (same as surface mode)
@@ -271,7 +272,8 @@ public:
 			forward->grid_density.data(),
 			forward->grid_density.layout() == tcnn::AoS ? forward->grid_density.stride() : 1,  // grid stride (padded)
 			forward->rgb_network_input.layout() == tcnn::AoS ? forward->rgb_network_input.stride() : 1,  // output stride
-			forward->rgb_network_input.data()
+			forward->rgb_network_input.data(),
+			false  // Don't apply exp - surface_explicit uses grid for normals, not as direct density
 		);
 		
 		// Step 6: Direction encoding (same as surface mode)

@@ -1292,6 +1292,18 @@ public:
 			return {(const vec2*)map->params(), resolution};
 		}
 	} m_distortion;
+	
+	struct DensityGridTrainer {
+		std::shared_ptr<tcnn::Optimizer<network_precision_t>> optimizer;
+		std::shared_ptr<tcnn::Trainer<float, network_precision_t, network_precision_t>> trainer;
+		size_t n_params = 0;
+		
+		void reset() {
+			optimizer.reset();
+			trainer.reset();
+			n_params = 0;
+		}
+	} m_density_grid_trainer;
 
 	std::shared_ptr<NerfNetworkBase<network_precision_t>> m_nerf_network;
 

@@ -416,7 +416,8 @@ void inference_mixed_precision_impl(cudaStream_t stream, const GPUMatrixDynamic<
 			grid_density_explicit.data(),
 			grid_density_explicit.layout() == AoS ? grid_density_explicit.stride() : 1,  // grid stride (padded)
 			rgb_network_input.layout() == AoS ? rgb_network_input.stride() : 1,  // output stride
-			rgb_network_input.data()
+			rgb_network_input.data(),
+			false  // Old monolithic implementation - surface_explicit uses grid for normals
 		);
 		
 		// Step 6: Direction encoding (same as surface mode)
@@ -451,7 +452,8 @@ void inference_mixed_precision_impl(cudaStream_t stream, const GPUMatrixDynamic<
 		grid_density_explicit.data(),
 		grid_density_explicit.layout() == AoS ? grid_density_explicit.stride() : 1,
 		rgb_network_input.layout() == AoS ? rgb_network_input.stride() : 1,
-		rgb_network_input.data()
+		rgb_network_input.data(),
+		true  // Old monolithic: baseline_explicit applies ReLU (grid stores raw density)
 	);
 	
 	// Step 4: Copy MLP features[0-14] to RGB input[1-15]
@@ -731,7 +733,8 @@ forward->density_grid_ctx = m_density_grid->forward(
 		forward->grid_density.data(),
 		forward->grid_density.layout() == AoS ? forward->grid_density.stride() : 1,  // grid stride (padded)
 		forward->rgb_network_input.layout() == AoS ? forward->rgb_network_input.stride() : 1,  // output stride
-		forward->rgb_network_input.data()
+		forward->rgb_network_input.data(),
+		false  // Old monolithic - surface_explicit uses grid for normals
 	);
 		
 		// Step 6: Direction encoding (same as surface mode)
@@ -772,7 +775,8 @@ forward->density_grid_ctx = m_density_grid->forward(
 			forward->grid_density.data(),
 			grid_src_stride,
 			rgb_dst_stride,
-			forward->rgb_network_input.data()
+			forward->rgb_network_input.data(),
+			true  // Old monolithic: baseline_explicit applies ReLU (grid stores raw density)
 		);
 		
 		// Step 4: Copy MLP features[0-14] to RGB input[1-15]

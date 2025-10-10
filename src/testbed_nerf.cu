@@ -3339,6 +3339,13 @@ void Testbed::train_nerf_step(uint32_t target_batch_size, Testbed::NerfCounters&
 		GradientMode::Overwrite,
 		&gradient_matrix
 	);
+	
+	// Train density grid separately if configured
+	if (m_density_grid_trainer.trainer) {
+		// The grid gradients were already accumulated during the main backward pass
+		// Now we just need to step the optimizer to update the grid parameters
+		m_density_grid_trainer.trainer->optimizer_step(stream, 1.0f);
+	}
 
 	if (train_extra_dims) {
 		// Compute extra-dim gradients
