@@ -172,9 +172,6 @@ __global__ void train_nerf(
 	vec3 hitpoint = vec3(0.0f);
 	vec3 loss_bg = vec3(0.0f);
 
-	// For baseline_aggregate mode: separate accumulators
-	vec4 diffuse_color = vec4(0.0f);
-	vec4 accumulated_features = vec4(0.0f);
 	bool is_baseline_aggregate = (padded_output_width == 8);
 
 	bool alive = valid;
@@ -224,20 +221,24 @@ __global__ void train_nerf(
 		// Composit color - handle both standard and baseline_aggregate modes
 		float weight = 0.0f;
 		if (is_baseline_aggregate) {
-			// baseline_aggregate: 8D output [density, diffuse_RGB(3), features(4)]
+			// baseline_aggregate: 8D output [density, diffuse_RGB_raw(3), directional_RGB_raw(3), unused]
 			float density = float(nerf_out[0]);
-			vec3 diffuse_rgb = {float(nerf_out[1]), float(nerf_out[2]), float(nerf_out[3])};
-			vec4 features = {float(nerf_out[4]), float(nerf_out[5]), float(nerf_out[6]), float(nerf_out[7])};
+			vec3 diffuse_rgb_raw = {float(nerf_out[1]), float(nerf_out[2]), float(nerf_out[3])};
+			vec3 directional_rgb_raw = {float(nerf_out[4]), float(nerf_out[5]), float(nerf_out[6])};
+			
+			// Apply activations to both components
+			vec3 diffuse_rgb = network_to_rgb_vec(diffuse_rgb_raw, rgb_activation);
+			vec3 directional_rgb = network_to_rgb_vec(directional_rgb_raw, rgb_activation);
+			
+			// Combine: final_rgb = diffuse + directional
+			vec3 rgb = diffuse_rgb + directional_rgb;
 			
 			float alpha = 1.f - __expf(-network_to_density(density, density_activation) * dt);
-			weight = alpha * (1.0f - diffuse_color.a);
+			weight = alpha * (1.0f - color.a);
 			
-			// Accumulate diffuse RGB and features separately
-			diffuse_color += vec4(network_to_rgb_vec(diffuse_rgb, rgb_activation) * weight, weight);
-			accumulated_features += features * weight;
+			color += vec4(rgb * weight, weight);
 			
-			// For loss computation, use diffuse RGB (directional will be added later)
-			loss_bg += weight * loss_and_gradient(rgbtarget, network_to_rgb_vec(diffuse_rgb, rgb_activation), loss_type).loss;
+			loss_bg += weight * loss_and_gradient(rgbtarget, rgb, loss_type).loss;
 		} else {
 			// Standard mode: 4D output [R, G, B, density]
 			float alpha = 1.f - __expf(-network_to_density(float(nerf_out[3]), density_activation) * dt);
@@ -250,8 +251,7 @@ __global__ void train_nerf(
 
 		hitpoint += weight * pos;
 
-		float current_alpha = is_baseline_aggregate ? diffuse_color.a : color.a;
-		if (1.0f - current_alpha < EPSILON || j >= NERF_STEPS()) {
+		if (1.0f - color.a < EPSILON || j >= NERF_STEPS()) {
 			alive = false;
 		}
 	}
@@ -354,10 +354,6 @@ __global__ void train_nerf(
 	vec3 loss_bg2 = vec3(0.0f);
 	float depth2 = 0.0f;
 	
-	// For baseline_aggregate mode in second pass
-	vec4 diffuse_color2 = vec4(0.0f);
-	vec4 accumulated_features2 = vec4(0.0f);
-	
 	t = startt;
 	j = 0;
 	alive = valid;
@@ -403,15 +399,19 @@ __global__ void train_nerf(
 		float local_depth = distance(pos, ray.o);
 		
 		if (is_baseline_aggregate) {
-			// baseline_aggregate: 8D output
+			// baseline_aggregate: 8D output [density, diffuse_RGB_raw(3), directional_RGB_raw(3), unused]
 			float density = float(local_network_output[0]);
-			vec3 diffuse_rgb = {float(local_network_output[1]), float(local_network_output[2]), float(local_network_output[3])};
-			vec4 features = {float(local_network_output[4]), float(local_network_output[5]), float(local_network_output[6]), float(local_network_output[7])};
+			vec3 diffuse_rgb_raw = {float(local_network_output[1]), float(local_network_output[2]), float(local_network_output[3])};
+			vec3 directional_rgb_raw = {float(local_network_output[4]), float(local_network_output[5]), float(local_network_output[6])};
+			
+			// Apply activations and combine
+			vec3 diffuse_rgb = network_to_rgb_vec(diffuse_rgb_raw, rgb_activation);
+			vec3 directional_rgb = network_to_rgb_vec(directional_rgb_raw, rgb_activation);
+			vec3 rgb = diffuse_rgb + directional_rgb;
 			
 			float alpha = 1.f - __expf(-network_to_density(density, density_activation) * dt);
-			weight = alpha * (1.0f - diffuse_color2.a);
-			diffuse_color2 += vec4(network_to_rgb_vec(diffuse_rgb, rgb_activation) * weight, weight);
-			accumulated_features2 += features * weight;
+			weight = alpha * (1.0f - color2.a);
+			color2 += vec4(rgb * weight, weight);
 		} else {
 			// Standard mode: 4D output
 			float density = network_to_density(float(local_network_output[3]), density_activation);
@@ -423,7 +423,7 @@ __global__ void train_nerf(
 		}
 		
 		depth2 += weight * local_depth;
-		float T = is_baseline_aggregate ? (1.0f - diffuse_color2.a) : (1.0f - color2.a);
+		float T = 1.0f - color2.a;
 
 		t += dt;
 		++j;
@@ -441,16 +441,29 @@ __global__ void train_nerf(
 		// we know the suffix of this ray compared to where we are up to. note the suffix depends on this step's alpha as suffix =
 		// (1-alpha)*(somecolor), so dsuffix/dalpha = -somecolor = -suffix/(1-alpha)
 		
-		// Get current rgb based on mode
-		vec3 rgb = is_baseline_aggregate ? 
-			vec3(local_network_output[1], local_network_output[2], local_network_output[3]) :
-			vec3(local_network_output[0], local_network_output[1], local_network_output[2]);
-		rgb = network_to_rgb_vec(rgb, rgb_activation);
+		// Get current rgb and compute derivatives
+		vec3 rgb, diffuse_rgb, directional_rgb;
+		float density_out_channel, density_derivative;
+		
+		if (is_baseline_aggregate) {
+			// baseline_aggregate: [density, diffuse_raw(3), directional_raw(3), unused]
+			density_out_channel = float(local_network_output[0]);
+			vec3 diffuse_raw = vec3(local_network_output[1], local_network_output[2], local_network_output[3]);
+			vec3 directional_raw = vec3(local_network_output[4], local_network_output[5], local_network_output[6]);
+			
+			diffuse_rgb = network_to_rgb_vec(diffuse_raw, rgb_activation);
+			directional_rgb = network_to_rgb_vec(directional_raw, rgb_activation);
+			rgb = diffuse_rgb + directional_rgb;
+			
+			density_derivative = network_to_density_derivative(density_out_channel, density_activation);
+		} else {
+			// Standard mode: [R, G, B, density]
+			density_out_channel = float(local_network_output[3]);
+			rgb = network_to_rgb_vec(vec3(local_network_output[0], local_network_output[1], local_network_output[2]), rgb_activation);
+			density_derivative = network_to_density_derivative(density_out_channel, density_activation);
+		}
 		
 		const vec3 suffix = color.rgb() - color2.rgb();
-
-		float density_out_channel = is_baseline_aggregate ? float(local_network_output[0]) : float(local_network_output[3]);
-		float density_derivative = network_to_density_derivative(density_out_channel, density_activation);
 		const float depth_suffix = depth - depth2;
 		const float depth_supervision = depth_loss_gradient * (T * local_depth - depth_suffix);
 
@@ -483,12 +496,17 @@ __global__ void train_nerf(
 		tvec<network_precision_t, 4> local_dL_doutput;     // For standard modes
 
 		if (is_baseline_aggregate) {
-			// baseline_aggregate: gradients for [density, diffuse_RGB(3), features(4)]
-			// Density gradient
+			// baseline_aggregate: gradients for [density, diffuse_raw(3), directional_raw(3), unused]
+			// dL/d(final_rgb) = dloss_by_drgb
+			// final_rgb = sigmoid(diffuse_raw) + sigmoid(directional_raw)
+			// So: dL/d(diffuse_raw) = dloss_by_drgb * sigmoid'(diffuse_raw)
+			//     dL/d(directional_raw) = dloss_by_drgb * sigmoid'(directional_raw)
+			
+			// Density gradient (channel 0)
 			local_dL_doutput_8d[0] = loss_scale *
 				(dloss_by_dmlp + fmaxf(0.0f, output_l1_reg_density * density_derivative));
 			
-			// Diffuse RGB gradients (channels 1-3)
+			// Diffuse RGB gradients (channels 1-3) with activation derivative
 			local_dL_doutput_8d[1] = loss_scale *
 				(dloss_by_drgb.x * network_to_rgb_derivative(local_network_output[1], rgb_activation) +
 				 fmaxf(0.0f, output_l2_reg * (float)local_network_output[1]));
@@ -499,11 +517,18 @@ __global__ void train_nerf(
 				(dloss_by_drgb.z * network_to_rgb_derivative(local_network_output[3], rgb_activation) +
 				 fmaxf(0.0f, output_l2_reg * (float)local_network_output[3]));
 			
-			// Feature gradients (channels 4-7) - TODO: add gradients from directional RGB MLP
-			// For now, zero gradients (incomplete)
-			local_dL_doutput_8d[4] = 0.0f;
-			local_dL_doutput_8d[5] = 0.0f;
-			local_dL_doutput_8d[6] = 0.0f;
+			// Directional RGB gradients (channels 4-6) with activation derivative
+			local_dL_doutput_8d[4] = loss_scale *
+				(dloss_by_drgb.x * network_to_rgb_derivative(local_network_output[4], rgb_activation) +
+				 fmaxf(0.0f, output_l2_reg * (float)local_network_output[4]));
+			local_dL_doutput_8d[5] = loss_scale *
+				(dloss_by_drgb.y * network_to_rgb_derivative(local_network_output[5], rgb_activation) +
+				 fmaxf(0.0f, output_l2_reg * (float)local_network_output[5]));
+			local_dL_doutput_8d[6] = loss_scale *
+				(dloss_by_drgb.z * network_to_rgb_derivative(local_network_output[6], rgb_activation) +
+				 fmaxf(0.0f, output_l2_reg * (float)local_network_output[6]));
+			
+			// Unused channel 7
 			local_dL_doutput_8d[7] = 0.0f;
 		} else {
 			// Standard mode: chain rule to go from dloss/drgb to dloss/dmlp_output
@@ -523,7 +548,7 @@ __global__ void train_nerf(
 		// (texsamp.a<0.001f) ? mask_supervision_strength * weight : 0.f;
 
 		if (is_baseline_aggregate) {
-			// Additional density regularization for baseline_aggregate
+			// Additional density regularization for baseline_aggregate (density is channel 0)
 			local_dL_doutput_8d[0] += (float(local_network_output[0]) < 0.0f ? -output_l1_reg_density : 0.0f) +
 				(float(local_network_output[0]) > -10.0f && local_depth < near_distance ? 1e-4f : 0.0f);
 			

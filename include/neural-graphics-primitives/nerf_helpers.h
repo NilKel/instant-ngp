@@ -1412,7 +1412,10 @@ static __global__ void compute_finite_difference_stencil_kernel(
 	float* __restrict__ gradients,
 	const uint32_t dim,
 	const float eps,
-	const uint32_t density_stride  // Stride for density buffers (padded_output_width)
+	const uint32_t density_stride,  // Stride for density buffers (padded_output_width)
+	const bool apply_threshold = false,
+	const float threshold = 0.01f,
+	const bool apply_sigmoid = false
 ) {
 	const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
 	if (i >= n_elements) return;
@@ -1428,6 +1431,17 @@ static __global__ void compute_finite_difference_stencil_kernel(
 		// CRITICAL: Use stride to access first channel of padded output
 		float density_plus = float(density_samples[idx_plus][i * density_stride]);
 		float density_minus = float(density_samples[idx_minus][i * density_stride]);
+		
+		// Apply sigmoid if enabled (for finite_sigm mode - differentiable)
+		if (apply_sigmoid) {
+			density_plus = 1.0f / (1.0f + expf(-density_plus));
+			density_minus = 1.0f / (1.0f + expf(-density_minus));
+		}
+		// Apply thresholding if enabled (for finite_thresh mode - non-differentiable)
+		else if (apply_threshold) {
+			density_plus = (density_plus > threshold) ? 1.0f : 0.0f;
+			density_minus = (density_minus > threshold) ? 1.0f : 0.0f;
+		}
 		
 		grad += stencil_coeffs[j] * (density_plus - density_minus);
 	}
@@ -1452,6 +1466,27 @@ static __global__ void compute_finite_difference_kernel(
 	
 	float grad = (float(density_pos[i]) - float(density_neg[i])) / (2.0f * eps);
 	gradients[i * 3 + dim] = grad;
+}
+
+/**
+ * @brief Simply negate gradients without normalization: n = -∇density (unnormalized)
+ * 
+ * @param n_elements Number of samples
+ * @param gradients Spatial gradients from grid (3D per sample, AoS layout)
+ * @param normals Output unnormalized normals (3D per sample, AoS layout)
+ */
+static __global__ void negate_gradients_kernel(
+	const uint32_t n_elements,
+	const float* __restrict__ gradients,
+	float* __restrict__ normals
+) {
+	const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
+	if (i >= n_elements) return;
+	
+	// Simply negate gradient components (no normalization)
+	normals[i * 3 + 0] = -gradients[i * 3 + 0];
+	normals[i * 3 + 1] = -gradients[i * 3 + 1];
+	normals[i * 3 + 2] = -gradients[i * 3 + 2];
 }
 
 /**
@@ -1768,14 +1803,27 @@ static __global__ void backprop_daubechies_stencil_kernel(
 	const uint32_t dim,
 	const float scale,
 	T* __restrict__ dL_ddensity_sample,
-	const uint32_t density_stride  // Stride for density buffer (padded_output_width)
+	const uint32_t density_stride,  // Stride for density buffer (padded_output_width)
+	const bool apply_sigmoid = false,
+	const T* __restrict__ density_raw_sample = nullptr  // Raw density values (before sigmoid)
 ) {
 	const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
 	if (i >= n_elements) return;
 	
 	const float dL_dgrad_dim = dL_dgradients[i * 3 + dim];
+	float grad = scale * dL_dgrad_dim;
+	
+	// Apply sigmoid chain rule if needed: dL/d(raw) = dL/d(sigmoid) * sigmoid'(raw)
+	// where sigmoid'(x) = sigmoid(x) * (1 - sigmoid(x))
+	if (apply_sigmoid && density_raw_sample) {
+		float raw_density = float(density_raw_sample[i * density_stride]);
+		float sigmoid_val = 1.0f / (1.0f + expf(-raw_density));
+		float sigmoid_deriv = sigmoid_val * (1.0f - sigmoid_val);
+		grad *= sigmoid_deriv;
+	}
+	
 	// CRITICAL: Use stride to write to first channel of padded output
-	dL_ddensity_sample[i * density_stride] = T(scale * dL_dgrad_dim);
+	dL_ddensity_sample[i * density_stride] = T(grad);
 }
 
 
@@ -1794,7 +1842,14 @@ tcnn::GPUMatrixDynamic<float> compute_normals_from_grid_gradients(
 	
 	// Check environment variable for gradient method
 	const char* grad_method_env = std::getenv("NGP_GRAD_METHOD");
-	bool use_finite_diff = (grad_method_env && std::string(grad_method_env) == "finite");
+	bool use_finite_diff = (grad_method_env && (std::string(grad_method_env) == "finite" || 
+	                                             std::string(grad_method_env) == "finite_thresh" ||
+	                                             std::string(grad_method_env) == "finite_sigm" ||
+	                                             std::string(grad_method_env) == "finite_sigm_unnorm"));
+	bool use_threshold = (grad_method_env && std::string(grad_method_env) == "finite_thresh");
+	bool use_sigmoid = (grad_method_env && (std::string(grad_method_env) == "finite_sigm" ||
+	                                         std::string(grad_method_env) == "finite_sigm_unnorm"));
+	bool skip_normalization = (grad_method_env && std::string(grad_method_env) == "finite_sigm_unnorm");
 	
 	GPUMatrixDynamic<float> dDensity_dPos{3, batch_size, stream, AoS};
 	
@@ -1806,6 +1861,15 @@ tcnn::GPUMatrixDynamic<float> compute_normals_from_grid_gradients(
 		const char* genus_env = std::getenv("NGP_GENUS");
 		int genus = (genus_env && std::strlen(genus_env) > 0) ? std::atoi(genus_env) : 1;
 		genus = std::min(std::max(genus, 1), 2);  // Clamp to [1, 2]
+		
+		// Get threshold for finite_thresh mode
+		float density_threshold = 0.01f;  // Default threshold
+		if (use_threshold) {
+			const char* threshold_env = std::getenv("NGP_DENSITY_THRESHOLD");
+			if (threshold_env && std::strlen(threshold_env) > 0) {
+				density_threshold = std::atof(threshold_env);
+			}
+		}
 		
 		DaubechiesStencil stencil(genus);
 		int num_points = stencil.num_points;  // Number of points on each side
@@ -1876,7 +1940,8 @@ tcnn::GPUMatrixDynamic<float> compute_normals_from_grid_gradients(
 					
 			linear_kernel(compute_finite_difference_stencil_kernel<T>, 0, stream,
 				batch_size, d_density_ptrs.data(), num_points, d_stencil_coeffs.data(), 
-				dDensity_dPos.data(), dim, eps, grid_encoding->padded_output_width());
+				dDensity_dPos.data(), dim, eps, grid_encoding->padded_output_width(),
+				use_threshold, density_threshold, use_sigmoid);
 		}
 	}
 } else {
@@ -1922,7 +1987,8 @@ tcnn::GPUMatrixDynamic<float> compute_normals_from_grid_gradients(
 				
 				linear_kernel(compute_finite_difference_stencil_kernel<T>, 0, stream,
 					batch_size, d_density_ptrs.data(), num_points, d_stencil_coeffs.data(), 
-					dDensity_dPos.data(), dim, eps, grid_encoding->padded_output_width());
+					dDensity_dPos.data(), dim, eps, grid_encoding->padded_output_width(),
+					use_threshold, density_threshold, use_sigmoid);
 			}
 		}
 	} else {
@@ -1955,11 +2021,23 @@ tcnn::GPUMatrixDynamic<float> compute_normals_from_grid_gradients(
 	// Normalize to get unit normals: n = -∇density / ||∇density||
 	// Use the same normalization kernel as other modes
 	GPUMatrixDynamic<float> normals{3, batch_size, stream, AoS};
-	linear_kernel(normalize_grid_gradients_kernel, 0, stream,
-		batch_size,
-		dDensity_dPos.data(),
-		normals.data()
-	);
+	
+	// skip_normalization was already declared at the beginning of the function
+	if (skip_normalization) {
+		// Return raw (unnormalized) gradients, just negate them
+		linear_kernel(negate_gradients_kernel, 0, stream,
+			batch_size,
+			dDensity_dPos.data(),
+			normals.data()
+		);
+	} else {
+		// Normalize to unit vectors
+		linear_kernel(normalize_grid_gradients_kernel, 0, stream,
+			batch_size,
+			dDensity_dPos.data(),
+			normals.data()
+		);
+	}
 	
 	return normals;
 }
@@ -1992,20 +2070,37 @@ void backprop_normals_from_finite_differences(
 ) {
 	using namespace tcnn;
 	
+	// Check if using unnormalized sigmoid mode
+	const char* grad_method_env = std::getenv("NGP_GRAD_METHOD");
+	bool skip_normalization = (grad_method_env && std::string(grad_method_env) == "finite_sigm_unnorm");
+	
 	// Backprop through normalization: n = -∇density / ||∇density||
 	// dL/d(∇density) = chain rule through normalization
 	GPUMatrixDynamic<float> dL_dRawGradients{3, batch_size, stream, AoS};
 	
-	// Kernel to compute gradient through normalization
-	// This is the inverse of normalize_grid_gradients_kernel
-	linear_kernel(backprop_normalization_kernel, 0, stream,
-		batch_size,
-		dL_dnormals.data(),
-		normals.data(),
-		dL_dRawGradients.data()
-	);
+	if (skip_normalization) {
+		// For unnormalized mode, just negate back (no normalization Jacobian)
+		linear_kernel(negate_gradients_kernel, 0, stream,
+			batch_size,
+			dL_dnormals.data(),
+			dL_dRawGradients.data()
+		);
+	} else {
+		// For normalized mode, compute gradient through normalization
+		// This is the inverse of normalize_grid_gradients_kernel
+		linear_kernel(backprop_normalization_kernel, 0, stream,
+			batch_size,
+			dL_dnormals.data(),
+			normals.data(),
+			dL_dRawGradients.data()
+		);
+	}
 	
 	const float eps = 1e-4f;  // Must match forward pass
+	
+	// Check if using sigmoid mode (already have grad_method_env and skip_normalization from above)
+	bool use_sigmoid = (grad_method_env && (std::string(grad_method_env) == "finite_sigm" ||
+	                                         std::string(grad_method_env) == "finite_sigm_unnorm"));
 	
 	// Get genus and create stencil
 	int genus = forward_ctx.finite_diff_genus;
@@ -2021,6 +2116,7 @@ void backprop_normals_from_finite_differences(
 			// Compute gradient contributions
 			// Forward: grad[dim] = Σ c_i * [density(+i*eps) - density(-i*eps)] / eps
 			// Backward: dL/ddensity(±i*eps) = ±c_i * dL/dgrad[dim] / eps
+			// If sigmoid: also multiply by sigmoid'(density_raw)
 			
 			float coeff = stencil.coeffs[offset_idx];
 			float scale_neg = -coeff / eps;
@@ -2033,10 +2129,11 @@ void backprop_normals_from_finite_differences(
 			CUDA_CHECK_THROW(cudaMemsetAsync(dL_ddensity_neg.data(), 0, dL_ddensity_neg.n_bytes(), stream));
 			CUDA_CHECK_THROW(cudaMemsetAsync(dL_ddensity_pos.data(), 0, dL_ddensity_pos.n_bytes(), stream));
 			
-		// Gradient for negative offset sample: -coeff * dL/dgrad / eps
+		// Gradient for negative offset sample: -coeff * dL/dgrad / eps (with sigmoid chain rule if enabled)
 		linear_kernel(backprop_daubechies_stencil_kernel<T>, 0, stream,
 			batch_size, dL_dRawGradients.data(), dim, scale_neg, dL_ddensity_neg.data(), 
-			grid_encoding->padded_output_width());
+			grid_encoding->padded_output_width(), use_sigmoid, 
+			use_sigmoid ? forward_ctx.finite_diff_densities[base_idx + offset_idx * 2].data() : nullptr);
 			
 			grid_encoding->backward(
 				stream,
@@ -2046,10 +2143,11 @@ void backprop_normals_from_finite_differences(
 				dL_ddensity_neg, nullptr, use_inference_params, param_gradients_mode
 			);
 			
-		// Gradient for positive offset sample: +coeff * dL/dgrad / eps
+		// Gradient for positive offset sample: +coeff * dL/dgrad / eps (with sigmoid chain rule if enabled)
 		linear_kernel(backprop_daubechies_stencil_kernel<T>, 0, stream,
 			batch_size, dL_dRawGradients.data(), dim, scale_pos, dL_ddensity_pos.data(), 
-			grid_encoding->padded_output_width());
+			grid_encoding->padded_output_width(), use_sigmoid,
+			use_sigmoid ? forward_ctx.finite_diff_densities[base_idx + offset_idx * 2 + 1].data() : nullptr);
 			
 			grid_encoding->backward(
 				stream,

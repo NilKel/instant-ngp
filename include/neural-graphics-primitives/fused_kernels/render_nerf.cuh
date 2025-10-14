@@ -104,9 +104,6 @@ __launch_bounds__(128, 4) __global__ void render_nerf(
 
 	float max_weight = 0.0f;
 	
-	// For baseline_aggregate mode: separate accumulators
-	vec4 diffuse_color = vec4(0.0f);
-	vec4 accumulated_features = vec4(0.0f);
 	bool is_baseline_aggregate = (padded_output_width == 8);
 
 	while (true) {
@@ -154,18 +151,22 @@ __launch_bounds__(128, 4) __global__ void render_nerf(
 		vec3 rgb;
 		
 		if (is_baseline_aggregate) {
-			// baseline_aggregate: 8D output [density, diffuse_RGB(3), features(4)]
+			// baseline_aggregate: 8D output [density, diffuse_RGB_raw(3), directional_RGB_raw(3), unused]
 			float density = float(nerf_out[0]);
-			vec3 diffuse_rgb = {float(nerf_out[1]), float(nerf_out[2]), float(nerf_out[3])};
-			vec4 features = {float(nerf_out[4]), float(nerf_out[5]), float(nerf_out[6]), float(nerf_out[7])};
+			vec3 diffuse_rgb_raw = {float(nerf_out[1]), float(nerf_out[2]), float(nerf_out[3])};
+			vec3 directional_rgb_raw = {float(nerf_out[4]), float(nerf_out[5]), float(nerf_out[6])};
+			
+			// Apply activations to both components
+			vec3 diffuse_rgb = network_to_rgb_vec(diffuse_rgb_raw, rgb_activation);
+			vec3 directional_rgb = network_to_rgb_vec(directional_rgb_raw, rgb_activation);
+			
+			// Combine: final_rgb = diffuse + directional
+			rgb = diffuse_rgb + directional_rgb;
 			
 			alpha = 1.f - __expf(-network_to_density(density, density_activation) * dt);
-			weight = alpha * (1.0f - diffuse_color.a);
+			weight = alpha * (1.0f - color.a);
 			
-			diffuse_color += vec4(network_to_rgb_vec(diffuse_rgb, rgb_activation) * weight, weight);
-			accumulated_features += features * weight;
-			
-			rgb = network_to_rgb_vec(diffuse_rgb, rgb_activation);  // For surface rendering
+			color += vec4(rgb * weight, weight);
 		} else {
 			// Standard mode: 4D output [R, G, B, density]
 			alpha = 1.f - __expf(-network_to_density(float(nerf_out[3]), density_activation) * dt);
@@ -189,21 +190,11 @@ __launch_bounds__(128, 4) __global__ void render_nerf(
 			best_depth_candidate = lens.is_360() ? distance(pos, cam_pos) : dot(cam_fwd, pos - cam_pos);
 			alive = false;
 		} else {
-			float current_alpha = is_baseline_aggregate ? diffuse_color.a : color.a;
-			if (current_alpha > (1.0f - min_transmittance)) {
-				if (is_baseline_aggregate) {
-					color = diffuse_color;
-				}
+			if (color.a > (1.0f - min_transmittance)) {
 				color /= color.a;
 				alive = false;
 			}
 		}
-	}
-
-	// For baseline_aggregate: apply final composition (currently using diffuse only)
-	// TODO: Add per-pixel RGB MLP evaluation for directional component
-	if (is_baseline_aggregate) {
-		color = diffuse_color;
 	}
 
 	if (!valid) {

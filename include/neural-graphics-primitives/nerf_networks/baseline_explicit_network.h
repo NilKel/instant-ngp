@@ -56,18 +56,21 @@ public:
 		
 		this->m_density_grid.reset(tcnn::create_encoding<T>(3, dense_grid_config, 1));
 		
-		// Initialize grid to low density
+		// Initialize grid to uniform low density (Plenoxels uses 0.1)
 		std::vector<T> init_params(this->m_density_grid->n_params());
-		pcg32 rng(42);
+		float init_density = 0.1f;
+		if (density_network.contains("init_density")) {
+			init_density = density_network["init_density"];
+		}
 		for (size_t i = 0; i < init_params.size(); ++i) {
-			init_params[i] = T(-5.0f + (rng.next_float() - 0.5f));
+			init_params[i] = T(init_density);
 		}
 		this->m_density_grid->set_params(init_params.data(), init_params.data(), init_params.data());
 		
-		// RGB network input: density + 15 features + direction encoding
+		// RGB network input: 15 features + direction encoding (NO density to avoid gradient conflict)
 		uint32_t rgb_alignment = tcnn::minimum_alignment(rgb_network);
 		this->m_rgb_network_input_width = tcnn::next_multiple(
-			16 + this->m_dir_encoding->padded_output_width(),
+			15 + this->m_dir_encoding->padded_output_width(),
 			rgb_alignment
 		);
 		
@@ -80,13 +83,28 @@ public:
 			this->m_pos_encoding, this->m_density_network
 		);
 		
-		// Check for separate density grid optimizer config
+		// Configure separate density grid optimizer (Plenoxels-style)
+		// Default Plenoxels learning rate schedule for density grid
+		m_density_grid_optimizer_config = {
+			{"otype", "ExponentialDecay"},
+			{"decay_start", 3000},         // Initial delay period
+			{"decay_interval", 1},         // Decay every step
+			{"learning_rate_start", 30.0}, // Start LR (used to calculate decay_base)
+			{"learning_rate_end", 0.05},   // End LR (used to calculate decay_base)
+			{"nested", {
+				{"otype", "Adam"},
+				{"learning_rate", 30.0},   // Aggressive LR for density grid
+				{"beta1", 0.9},
+				{"beta2", 0.999},
+				{"epsilon", 1e-15}
+			}}
+		};
+		
+		// Override with custom config if provided
 		if (density_network.contains("density_grid_optimizer")) {
 			m_density_grid_optimizer_config = density_network["density_grid_optimizer"];
-			m_use_separate_grid_optimizer = true;
-		} else {
-			m_use_separate_grid_optimizer = false;
 		}
+		m_use_separate_grid_optimizer = true;
 	}
 	
 	// Keep all params in main trainer even with separate optimizer
@@ -112,6 +130,37 @@ public:
 	}
 	
 	json grid_optimizer_config() const { return m_density_grid_optimizer_config; }
+	
+	// Get optimizer config with dynamically calculated decay_base
+	// If total_steps is specified in config, use it; otherwise use the provided parameter
+	json get_grid_optimizer_config(uint32_t fallback_total_steps = 50000) const {
+		json config = m_density_grid_optimizer_config;
+		
+		// If config has learning_rate_start and learning_rate_end, calculate decay_base
+		if (config.contains("learning_rate_start") && config.contains("learning_rate_end")) {
+			float lr_start = config["learning_rate_start"];
+			float lr_end = config["learning_rate_end"];
+			uint32_t decay_start = config.value("decay_start", 0);
+			
+			// Get total steps from config or use fallback
+			uint32_t total_steps = config.value("total_training_steps", fallback_total_steps);
+			
+			// Calculate decay steps (from decay_start to total_steps)
+			uint32_t decay_steps = (total_steps > decay_start) ? (total_steps - decay_start) : 1;
+			
+			// Calculate decay_base: lr_end = lr_start * decay_base^decay_steps
+			// => decay_base = (lr_end / lr_start)^(1/decay_steps)
+			double decay_base = std::pow(lr_end / lr_start, 1.0 / decay_steps);
+			
+			config["decay_base"] = decay_base;
+			
+			tlog::info() << "Calculated decay_base for density grid optimizer:";
+			tlog::info() << "  LR: " << lr_start << " → " << lr_end << " over " << decay_steps << " steps (total=" << total_steps << ", decay_start=" << decay_start << ")";
+			tlog::info() << "  decay_base = " << decay_base;
+		}
+		
+		return config;
+	}
 
 	void inference_mixed_precision_impl(
 		cudaStream_t stream,
@@ -163,17 +212,7 @@ public:
 			stream, density_network_input, density_network_output, use_inference_params
 		);
 		
-		// Step 3: Copy grid density to RGB input[0] (NO activation - grid stores log-density)
-		linear_kernel(replace_first_channel_kernel<T>, 0, stream,
-			batch_size,
-			grid_density_explicit.data(),
-			grid_density_explicit.layout() == tcnn::AoS ? grid_density_explicit.stride() : 1,
-			rgb_network_input.layout() == tcnn::AoS ? rgb_network_input.stride() : 1,
-			rgb_network_input.data(),
-			false  // NO activation: grid stores log-density, renderer applies exp()
-		);
-		
-		// Step 4: Copy MLP features[0-14] to RGB input[1-15]
+		// Step 3: Copy MLP features[0-14] to RGB input[0-14] (NO density to avoid gradient conflict)
 		linear_kernel(copy_channels_kernel<T>, 0, stream,
 			batch_size,
 			15,  // number of channels to copy
@@ -181,11 +220,11 @@ public:
 			density_network_output.layout() == tcnn::AoS ? density_network_output.stride() : 1,
 			rgb_network_input.data(),
 			rgb_network_input.layout() == tcnn::AoS ? rgb_network_input.stride() : 1,
-			1  // destination offset (skip channel 0)
+			0  // destination offset (start from channel 0)
 		);
 		
-		// Step 5: Direction encoding
-		auto dir_out = rgb_network_input.slice_rows(16, this->m_dir_encoding->padded_output_width());
+		// Step 4: Direction encoding
+		auto dir_out = rgb_network_input.slice_rows(15, this->m_dir_encoding->padded_output_width());
 		this->m_dir_encoding->inference_mixed_precision(
 			stream,
 			input.slice_rows(this->m_dir_offset, this->m_dir_encoding->input_width()),
@@ -201,7 +240,8 @@ public:
 			stream, rgb_network_input, rgb_network_output, use_inference_params
 		);
 		
-		// Extract density to output[3] (from grid) - NO activation, grid stores log-density
+		// Extract density to output[3] with ReLU activation (Plenoxels approach)
+		// Note: We apply ReLU here, so rendering kernels should use ENerfActivation::None
 		linear_kernel(extract_density<T>, 0, stream,
 			batch_size,
 			grid_density_explicit.layout() == tcnn::AoS ? grid_density_explicit.stride() : 1,
@@ -210,7 +250,7 @@ public:
 			output.data() + 3 * (output.layout() == tcnn::AoS ? 1 : batch_size),
 			this->m_use_sdf,
 			this->m_variance_network ? this->m_variance_network->params() : nullptr,
-			false  // NO activation: grid stores log-density, renderer applies exp()
+			true  // Apply ReLU: grid stores raw density, apply ReLU for alpha blending
 		);
 	}
 
@@ -268,7 +308,7 @@ public:
 			use_inference_params, false
 		);
 		
-		// Step 3: Copy grid density to RGB input[0] (apply exp() since grid stores log-density)
+		// Step 3: Copy grid density to RGB input[0] with ReLU activation (Plenoxels approach)
 		uint32_t grid_src_stride = forward->grid_density.layout() == tcnn::AoS ? forward->grid_density.stride() : 1;
 		uint32_t rgb_dst_stride = forward->rgb_network_input.layout() == tcnn::AoS ? forward->rgb_network_input.stride() : 1;
 		
@@ -278,7 +318,7 @@ public:
 			grid_src_stride,
 			rgb_dst_stride,
 			forward->rgb_network_input.data(),
-			false  // NO activation: grid stores log-density, renderer applies exp()
+			true  // Apply ReLU: grid stores raw density, apply ReLU before RGB MLP
 		);
 		
 		// Step 4: Copy MLP features[0-14] to RGB input[1-15]
@@ -294,8 +334,8 @@ public:
 			1  // destination offset
 		);
 		
-		// Step 5: Direction encoding
-		auto dir_out = forward->rgb_network_input.slice_rows(16, this->m_dir_encoding->padded_output_width());
+		// Step 4: Direction encoding
+		auto dir_out = forward->rgb_network_input.slice_rows(15, this->m_dir_encoding->padded_output_width());
 		forward->dir_encoding_ctx = this->m_dir_encoding->forward(
 			stream,
 			input.slice_rows(this->m_dir_offset, this->m_dir_encoding->input_width()),
@@ -317,7 +357,8 @@ public:
 		);
 		
 		if (output) {
-			// Extract density to output[3] (from grid) - NO activation, grid stores log-density
+			// Extract density to output[3] with ReLU activation (Plenoxels approach)
+			// Note: We apply ReLU here, so rendering kernels should use ENerfActivation::None
 			linear_kernel(extract_density<T>, 0, stream,
 				batch_size,
 				forward->grid_density.layout() == tcnn::AoS ? forward->grid_density.stride() : 1,
@@ -326,7 +367,7 @@ public:
 				output->data() + 3 * (output->layout() == tcnn::AoS ? 1 : batch_size),
 				this->m_use_sdf,
 				this->m_variance_network ? this->m_variance_network->params() : nullptr,
-				false  // NO activation: grid stores log-density, renderer applies exp()
+				true  // Apply ReLU: grid stores raw density, apply ReLU for alpha blending
 			);
 		}
 		
@@ -373,8 +414,8 @@ public:
 		);
 		
 		// Direction encoding backward
-		auto dL_ddir_out = dL_drgb_network_input.slice_rows(16, this->m_dir_encoding->padded_output_width());
-		auto dir_out_forward = forward.rgb_network_input.slice_rows(16, this->m_dir_encoding->padded_output_width());
+		auto dL_ddir_out = dL_drgb_network_input.slice_rows(15, this->m_dir_encoding->padded_output_width());
+		auto dir_out_forward = forward.rgb_network_input.slice_rows(15, this->m_dir_encoding->padded_output_width());
 		
 		tcnn::GPUMatrixDynamic<float> dL_ddir_encoding_input;
 		if (dL_dinput) {
@@ -389,7 +430,7 @@ public:
 			use_inference_params, param_gradients_mode
 		);
 		
-		// Step 1: Extract gradients for MLP features from RGB input[1-15]
+		// Step 1: Extract gradients for MLP features from RGB input[0-14] (NO density gradients)
 		tcnn::GPUMatrixDynamic<T> dL_ddensity_network_output{
 			this->m_density_network->padded_output_width(), batch_size, stream, tcnn::AoS
 		};
@@ -404,33 +445,20 @@ public:
 			15,  // number of channels to copy
 			dL_drgb_network_input.data(),
 			rgb_src_stride,
-			1,  // source offset (skip channel 0, read from RGB[1-15])
+			0,  // source offset (read from RGB[0-14], no density channel)
 			dL_ddensity_network_output.data(),
 			mlp_dst_stride
 		);
 		
-		// Step 2: Extract gradient for grid density from RGB input[0]
+		// Step 2: Extract density gradient from output[3] (alpha blending) with ReLU chain rule
 		tcnn::GPUMatrixDynamic<T> dL_dgrid_density{
 			this->m_density_grid->padded_output_width(), batch_size, stream,
 			this->m_density_grid->preferred_output_layout()
 		};
 		CUDA_CHECK_THROW(cudaMemsetAsync(dL_dgrid_density.data(), 0, dL_dgrid_density.n_bytes(), stream));
 		
-		uint32_t grid_dst_stride = dL_dgrid_density.layout() == tcnn::AoS ? dL_dgrid_density.stride() : 1;
-		
-		// DISABLED: Do not backprop gradient from RGB input[0] to grid
-		// linear_kernel(extract_first_channel_gradient_kernel<T>, 0, stream,
-		// 	batch_size,
-		// 	dL_drgb_network_input.data(),
-		// 	rgb_src_stride,
-		// 	grid_dst_stride,
-		// 	dL_dgrid_density.data(),
-		// 	nullptr,  // No forward values needed - no activation to chain through
-		// 	false  // NO activation: pass gradients through unchanged
-		// );
-		
-		// Step 2b: ACCUMULATE density gradient from RGBD output (channel 3) to grid
 		uint32_t rgbd_src_stride = dL_doutput.layout() == tcnn::AoS ? dL_doutput.m() : 1;
+		uint32_t grid_dst_stride = dL_dgrid_density.layout() == tcnn::AoS ? dL_dgrid_density.stride() : 1;
 		
 		linear_kernel(accumulate_density_gradient_to_grid_kernel<T>, 0, stream,
 			batch_size,
@@ -439,8 +467,8 @@ public:
 			dL_dgrid_density.data(),
 			grid_dst_stride,
 			dL_doutput.m(),  // Number of rows (channels) = 4 for RGBD
-			nullptr,  // No forward values needed - no activation to chain through
-			false  // NO activation: pass gradients through unchanged
+			forward.grid_density.data(),  // Forward values for ReLU chain rule
+			true  // Apply ReLU chain rule: gradient = 0 when input ≤ 0
 		);
 		
 		// Step 3: Backprop to MLP
@@ -459,7 +487,7 @@ public:
 			use_inference_params, param_gradients_mode
 		);
 		
-		// Step 4: Backprop to grid
+		// Step 4: Backprop to density grid (ONLY from alpha blending gradients)
 		if (this->m_density_grid->n_params() > 0) {
 			this->m_density_grid->backward(
 				stream, *forward.density_grid_ctx, 

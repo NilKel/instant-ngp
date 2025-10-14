@@ -4368,6 +4368,12 @@ void Testbed::reset_network(bool clear_density_grid) {
 				)
 			);
 		}
+		
+		// Auto-configure density activation for baseline_explicit (uses ReLU in network)
+		if (m_method == "baseline_explicit") {
+			m_nerf.density_activation = ENerfActivation::None;
+			tlog::info() << "baseline_explicit: Auto-set density_activation = None (ReLU applied in network)";
+		}
 
 		printf("NerfNetwork created successfully\n");
 		
@@ -4560,7 +4566,8 @@ void Testbed::reset_network(bool clear_density_grid) {
 	if (m_testbed_mode == ETestbedMode::Nerf && m_nerf_network) {
 		auto baseline_explicit = dynamic_cast<BaselineExplicitNetwork<network_precision_t>*>(m_nerf_network.get());
 		if (baseline_explicit && baseline_explicit->uses_separate_grid_optimizer()) {
-			json grid_optimizer_config = baseline_explicit->grid_optimizer_config();
+			// Get optimizer config with dynamically calculated decay_base
+			json grid_optimizer_config = baseline_explicit->get_grid_optimizer_config();
 			m_density_grid_trainer.n_params = baseline_explicit->n_grid_params();
 			
 			tlog::info() << "Creating separate optimizer for density grid (" << m_density_grid_trainer.n_params << " params)";

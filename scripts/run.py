@@ -94,10 +94,13 @@ def parse_args():
 	parser.add_argument("--max-gradient-mag", type=float, default=1.0, dest="max_gradient_mag", help="Maximum gradient magnitude when clamping is enabled. Default: 1.0")
 	
 	# New: Gradient computation method
-	parser.add_argument("--grad", type=str, default="analytical", choices=["analytical", "finite"], help="Gradient computation method. 'analytical' uses autodiff (default), 'finite' uses finite differences for surface_explicit mode.")
+	parser.add_argument("--grad", type=str, default="analytical", choices=["analytical", "finite", "finite_thresh", "finite_sigm", "finite_sigm_unnorm"], help="Gradient computation method. 'analytical' uses autodiff (default), 'finite' uses finite differences, 'finite_thresh' thresholds density to 0/1 (non-differentiable), 'finite_sigm' applies sigmoid before FD (normalized), 'finite_sigm_unnorm' applies sigmoid before FD (unnormalized).")
 	
 	# New: Daubechies stencil genus for finite differences
 	parser.add_argument("--genus", type=int, default=1, choices=[1, 2], help="Daubechies stencil genus for finite differences. 1 = 2-point stencil (default), 2 = 4-point stencil (higher accuracy). Only used with --grad finite.")
+	
+	# New: Threshold value for finite_thresh mode
+	parser.add_argument("--density-threshold", type=float, default=0.01, dest="density_threshold", help="Density threshold for finite_thresh mode. Density > threshold becomes 1.0, else 0.0. Default: 0.01")
 
 	return parser.parse_args()
 
@@ -148,6 +151,19 @@ if __name__ == "__main__":
 	if args.grad == "finite":
 		os.environ["NGP_GRAD_METHOD"] = "finite"
 		# Export genus for finite differences
+		os.environ["NGP_GENUS"] = str(args.genus)
+	elif args.grad == "finite_thresh":
+		os.environ["NGP_GRAD_METHOD"] = "finite_thresh"
+		# Export genus and threshold for finite differences with thresholding
+		os.environ["NGP_GENUS"] = str(args.genus)
+		os.environ["NGP_DENSITY_THRESHOLD"] = str(args.density_threshold)
+	elif args.grad == "finite_sigm":
+		os.environ["NGP_GRAD_METHOD"] = "finite_sigm"
+		# Export genus for finite differences with sigmoid
+		os.environ["NGP_GENUS"] = str(args.genus)
+	elif args.grad == "finite_sigm_unnorm":
+		os.environ["NGP_GRAD_METHOD"] = "finite_sigm_unnorm"
+		# Export genus for finite differences with sigmoid (unnormalized)
 		os.environ["NGP_GENUS"] = str(args.genus)
 	else:
 		os.environ["NGP_GRAD_METHOD"] = "analytical"

@@ -1443,7 +1443,9 @@ forward->density_grid_ctx = m_density_grid->forward(
 		
 		// Check if we're using finite differences and have saved contexts
 		const char* grad_method_env = std::getenv("NGP_GRAD_METHOD");
-		bool use_finite_diff = (grad_method_env && std::string(grad_method_env) == "finite");
+		bool use_finite_diff = (grad_method_env && (std::string(grad_method_env) == "finite" || 
+		                                             std::string(grad_method_env) == "finite_sigm" ||
+		                                             std::string(grad_method_env) == "finite_sigm_unnorm"));
 		
 		if (use_finite_diff && !forward.finite_diff_contexts.empty()) {
 			backprop_normals_from_finite_differences(
