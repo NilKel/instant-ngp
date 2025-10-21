@@ -84,6 +84,7 @@ def parse_args():
 	
 	# New: Normal visualization output
 	parser.add_argument("--visnormals", action="store_true", help="Save normal visualization images alongside rendered images. Only works with surface methods.")
+	parser.add_argument("--visnormals-unnormalized", action="store_true", dest="visnormals_unnormalized", help="Visualize unnormalized normals (shows gradient magnitude). Only works with --visnormals.")
 
 	# New: SDF mode flag
 	parser.add_argument("--sdf", action="store_true", help="Enable NeuS2-style SDF rendering where network output[0] is treated as SDF and density is derived from it.")
@@ -94,7 +95,7 @@ def parse_args():
 	parser.add_argument("--max-gradient-mag", type=float, default=1.0, dest="max_gradient_mag", help="Maximum gradient magnitude when clamping is enabled. Default: 1.0")
 	
 	# New: Gradient computation method
-	parser.add_argument("--grad", type=str, default="analytical", choices=["analytical", "finite", "finite_thresh", "finite_sigm", "finite_sigm_unnorm"], help="Gradient computation method. 'analytical' uses autodiff (default), 'finite' uses finite differences, 'finite_thresh' thresholds density to 0/1 (non-differentiable), 'finite_sigm' applies sigmoid before FD (normalized), 'finite_sigm_unnorm' applies sigmoid before FD (unnormalized).")
+	parser.add_argument("--grad", type=str, default="analytical", choices=["analytical", "finite", "finite_thresh", "finite_thresh_unnorm", "finite_sigm", "finite_sigm_unnorm", "finite_exp", "finite_exp_unnorm"], help="Gradient computation method. 'analytical' uses autodiff (default), 'finite' uses finite differences, 'finite_thresh' thresholds density to 0/1 (normalized), 'finite_thresh_unnorm' thresholds density to 0/1 (unnormalized), 'finite_sigm' applies sigmoid before FD (normalized), 'finite_sigm_unnorm' applies sigmoid before FD (unnormalized), 'finite_exp' uses occupancy=1-exp(-density) for FD (normalized, keeps exp activation for RGBD), 'finite_exp_unnorm' uses occupancy=1-exp(-density) for FD (unnormalized, keeps exp activation for RGBD).")
 	
 	# New: Daubechies stencil genus for finite differences
 	parser.add_argument("--genus", type=int, default=1, choices=[1, 2], help="Daubechies stencil genus for finite differences. 1 = 2-point stencil (default), 2 = 4-point stencil (higher accuracy). Only used with --grad finite.")
@@ -157,16 +158,44 @@ if __name__ == "__main__":
 		# Export genus and threshold for finite differences with thresholding
 		os.environ["NGP_GENUS"] = str(args.genus)
 		os.environ["NGP_DENSITY_THRESHOLD"] = str(args.density_threshold)
+	elif args.grad == "finite_thresh_unnorm":
+		os.environ["NGP_GRAD_METHOD"] = "finite_thresh_unnorm"
+		# Export genus and threshold for finite differences with thresholding (unnormalized)
+		os.environ["NGP_GENUS"] = str(args.genus)
+		os.environ["NGP_DENSITY_THRESHOLD"] = str(args.density_threshold)
 	elif args.grad == "finite_sigm":
 		os.environ["NGP_GRAD_METHOD"] = "finite_sigm"
 		# Export genus for finite differences with sigmoid
 		os.environ["NGP_GENUS"] = str(args.genus)
+		# Auto-disable exponentiation for sigmoid modes (use raw density)
+		print("[INFO] finite_sigm mode: Will auto-set density_activation = None (sigmoid used instead of exp)")
 	elif args.grad == "finite_sigm_unnorm":
 		os.environ["NGP_GRAD_METHOD"] = "finite_sigm_unnorm"
 		# Export genus for finite differences with sigmoid (unnormalized)
 		os.environ["NGP_GENUS"] = str(args.genus)
+		# Auto-disable exponentiation for sigmoid modes (use raw density)
+		print("[INFO] finite_sigm_unnorm mode: Will auto-set density_activation = None (sigmoid used instead of exp)")
+	elif args.grad == "finite_exp":
+		os.environ["NGP_GRAD_METHOD"] = "finite_exp"
+		# Export genus for finite differences with exponential
+		os.environ["NGP_GENUS"] = str(args.genus)
+		# Keep exponential activation for RGBD (consistent with occupancy calculation)
+		print("[INFO] finite_exp mode: Using occupancy=1-exp(-density) for normals (normalized), keeping exp activation for RGBD")
+	elif args.grad == "finite_exp_unnorm":
+		os.environ["NGP_GRAD_METHOD"] = "finite_exp_unnorm"
+		# Export genus for finite differences with exponential (unnormalized)
+		os.environ["NGP_GENUS"] = str(args.genus)
+		# Keep exponential activation for RGBD (consistent with occupancy calculation)
+		print("[INFO] finite_exp_unnorm mode: Using occupancy=1-exp(-density) for normals (unnormalized), keeping exp activation for RGBD")
 	else:
 		os.environ["NGP_GRAD_METHOD"] = "analytical"
+	
+	# Export normal visualization settings
+	if args.visnormals_unnormalized:
+		os.environ["NGP_VISNORMALS_UNNORMALIZED"] = "1"
+		print("[INFO] Normal visualization will show unnormalized normals (gradient magnitude)")
+	else:
+		os.environ["NGP_VISNORMALS_UNNORMALIZED"] = "0"
 
 	testbed = ngp.Testbed()
 	testbed.root_dir = ROOT_DIR
@@ -446,23 +475,27 @@ if __name__ == "__main__":
 				ref_image = testbed.render(resolution[0], resolution[1], 1, True)
 				write_image(os.path.join(output_dir, f"gt_image_{i:04d}.png"), np.clip(ref_image * 2**testbed.exposure, 0.0, 1.0), quality=100)
 
-				# Render predicted image
+				# Render predicted image - ensure we're in Shade mode, not Normals
 				testbed.render_ground_truth = False
+				testbed.render_mode = ngp.RenderMode.Shade  # Explicitly set to Shade mode for color rendering
 				image = testbed.render(resolution[0], resolution[1], spp, True)
 				write_image(os.path.join(output_dir, f"rendered_image_{i:04d}.png"), np.clip(image * 2**testbed.exposure, 0.0, 1.0), quality=100)
 
 				# Render normal visualization if requested
 				if args.visnormals and args.method in ["surface", "surface_normal", "surface_reflect"]:
-					# Save current render mode
-					original_render_mode = testbed.render_mode
 					# Switch to normal visualization mode
 					testbed.render_mode = ngp.RenderMode.Normals
+					testbed.render_ground_truth = False
+					
 					# Render normals
 					normal_image = testbed.render(resolution[0], resolution[1], spp, True)
-					# Normals are already in [0,1] range (mapped from [-1,1]), so no exposure adjustment needed
+					
+					# Normals are in [-1,1] range, map to [0,1] for visualization
+					# RGB = (normal + 1) / 2
 					write_image(os.path.join(output_dir, f"normals_{i:04d}.png"), np.clip(normal_image, 0.0, 1.0), quality=100)
-					# Restore original render mode
-					testbed.render_mode = original_render_mode
+					
+					# Restore to Shade mode for next iteration
+					testbed.render_mode = ngp.RenderMode.Shade
 				elif args.visnormals:
 					print(f"Warning: --visnormals flag only works with surface methods (surface, surface_normal, surface_reflect). Current method: {args.method}")
 
@@ -528,12 +561,14 @@ if __name__ == "__main__":
 			
 			# Render normal visualization if requested
 			if args.visnormals and args.method in ["surface", "surface_normal", "surface_reflect"]:
-				original_render_mode = testbed.render_mode
 				testbed.render_mode = ngp.RenderMode.Normals
+				testbed.render_ground_truth = False
+				
 				normal_image = testbed.render(args.width or int(ref_transforms["w"]), args.height or int(ref_transforms["h"]), args.screenshot_spp, True)
 				normal_outname = outname.replace(".png", "_normals.png")
-				write_image(normal_outname, normal_image)
-				testbed.render_mode = original_render_mode
+				write_image(normal_outname, np.clip(normal_image, 0.0, 1.0))
+				
+				testbed.render_mode = ngp.RenderMode.Shade
 				print(f"rendered normal visualization {normal_outname}")
 	elif args.screenshot_dir:
 		outname = os.path.join(args.screenshot_dir, args.scene + "_" + network_stem)
@@ -545,11 +580,13 @@ if __name__ == "__main__":
 		
 		# Render normal visualization if requested
 		if args.visnormals and args.method in ["surface", "surface_normal", "surface_reflect"]:
-			original_render_mode = testbed.render_mode
 			testbed.render_mode = ngp.RenderMode.Normals
+			testbed.render_ground_truth = False
+			
 			normal_image = testbed.render(args.width or 1920, args.height or 1080, args.screenshot_spp, True)
-			write_image(outname + "_normals.png", normal_image)
-			testbed.render_mode = original_render_mode
+			write_image(outname + "_normals.png", np.clip(normal_image, 0.0, 1.0))
+			
+			testbed.render_mode = ngp.RenderMode.Shade
 			print(f"Rendered normal visualization {outname}_normals.png")
 
 	if args.video_camera_path:

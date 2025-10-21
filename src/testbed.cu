@@ -4374,6 +4374,30 @@ void Testbed::reset_network(bool clear_density_grid) {
 			m_nerf.density_activation = ENerfActivation::None;
 			tlog::info() << "baseline_explicit: Auto-set density_activation = None (ReLU applied in network)";
 		}
+		
+		// Auto-configure density activation for finite_sigm modes (sigmoid replaces exponential)
+		const char* grad_method_env = std::getenv("NGP_GRAD_METHOD");
+		if (grad_method_env && (std::string(grad_method_env) == "finite_sigm" || 
+		                         std::string(grad_method_env) == "finite_sigm_unnorm")) {
+			m_nerf.density_activation = ENerfActivation::None;
+			tlog::info() << grad_method_env << ": Auto-set density_activation = None (sigmoid used for occupancy instead of exp)";
+		}
+		
+		// Configure hashgrid parameters for adaptive epsilon in finite difference normals
+		if (m_nerf_network && encoding_otype.find("grid") != std::string::npos) {
+			uint32_t n_levels = encoding_config.value("n_levels", 16u);
+			uint32_t base_res = encoding_config.value("base_resolution", 16u);
+			float per_level_scale = encoding_config.value("per_level_scale", m_per_level_scale);
+			uint32_t max_steps = m_training_step;  // Use total training steps
+			
+			m_nerf_network->set_hashgrid_params(n_levels, base_res, per_level_scale, max_steps);
+			
+			tlog::info() << "Configured adaptive epsilon for finite difference normals:";
+			tlog::info() << "  n_levels=" << n_levels << ", base_resolution=" << base_res 
+			             << ", per_level_scale=" << per_level_scale << ", max_steps=" << max_steps;
+			tlog::info() << "  Epsilon range: " << m_nerf_network->get_hashgrid_cell_size(0) 
+			             << " (coarse) -> " << m_nerf_network->get_hashgrid_cell_size(n_levels - 1) << " (fine)";
+		}
 
 		printf("NerfNetwork created successfully\n");
 		

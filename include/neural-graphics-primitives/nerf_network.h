@@ -391,7 +391,9 @@ void inference_mixed_precision_impl(cudaStream_t stream, const GPUMatrixDynamic<
 		
 		// Step 2: Compute normals from grid gradients using autodiff
 		GPUMatrixDynamic<float> normals = compute_normals_from_grid_gradients(
-			stream, batch_size, input.slice_rows(0, 3), m_density_grid, *grid_ctx, grid_density_explicit, use_inference_params
+			stream, batch_size, input.slice_rows(0, 3), m_density_grid, *grid_ctx, grid_density_explicit, use_inference_params,
+			nullptr,  // forward_ctx (inference doesn't need backprop contexts)
+			get_adaptive_epsilon()  // Use adaptive epsilon based on training step
 		);
 		
 		// Step 3: MLP forward for features
@@ -711,7 +713,8 @@ forward->density_grid_ctx = m_density_grid->forward(
 	// Step 3: Compute normals from grid gradients using autodiff
 	forward->analytical_normals = compute_normals_from_grid_gradients(
 		stream, batch_size, input.slice_rows(0, 3), m_density_grid, *forward->density_grid_ctx, forward->grid_density, use_inference_params,
-		forward.get()  // Pass context to enable gradient saving for finite diff
+		forward.get(),  // Pass context to enable gradient saving for finite diff
+		get_adaptive_epsilon()  // Use adaptive epsilon based on training step
 	);
 		
 	// Step 4: Compute 15 surface features using kernel

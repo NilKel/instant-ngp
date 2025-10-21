@@ -2788,6 +2788,11 @@ void Testbed::train_nerf(uint32_t target_batch_size, bool get_loss_scalar, cudaS
 	m_trainer->optimizer_step(stream, LOSS_SCALE());
 
 	++m_training_step;
+	
+	// Update training step in network for adaptive epsilon calculation
+	if (m_nerf_network) {
+		m_nerf_network->set_training_step(m_training_step);
+	}
 
 	if (envmap_gradient) {
 		m_envmap.trainer->optimizer_step(stream, LOSS_SCALE());

@@ -271,6 +271,48 @@ public:
 			use_inference_params
 		);
 	}
+	
+	// Configure hashgrid parameters for adaptive epsilon calculation
+	virtual void set_hashgrid_params(uint32_t n_levels, uint32_t base_resolution, float per_level_scale, uint32_t max_training_step) {
+		m_n_levels = n_levels;
+		m_base_resolution = base_resolution;
+		m_per_level_scale = per_level_scale;
+		m_max_training_step = max_training_step;
+	}
+	
+	// Set current training step for adaptive epsilon
+	virtual void set_training_step(uint32_t step) {
+		m_current_training_step = step;
+	}
+	
+	// Calculate hashgrid cell size at a given level
+	// Level L resolution: R_L = floor(Nmin * b^L)
+	// Cell size at level L: cell_size_L = 1.0 / R_L
+	virtual float get_hashgrid_cell_size(uint32_t level) const {
+		if (level >= m_n_levels) level = m_n_levels - 1;
+		float resolution = std::floor(m_base_resolution * std::pow(m_per_level_scale, (float)level));
+		return 1.0f / resolution;
+	}
+	
+	// Get adaptive epsilon based on current training step
+	// Starts at coarsest cell size (level 0) and exponentially decays to finest (level N-1)
+	// Formula: ε(t) = ε_coarse * exp(-(t/T) * log(ε_coarse/ε_fine))
+	//        = ε_coarse * (ε_fine/ε_coarse)^(t/T)
+	virtual float get_adaptive_epsilon() const {
+		if (m_max_training_step == 0) {
+			// Fallback to finest level if max_training_step not set
+			return get_hashgrid_cell_size(m_n_levels - 1);
+		}
+		
+		float eps_coarse = get_hashgrid_cell_size(0);  // Coarsest level
+		float eps_fine = get_hashgrid_cell_size(m_n_levels - 1);  // Finest level
+		
+		// Exponential decay from coarse to fine
+		float t_normalized = std::min(1.0f, (float)m_current_training_step / (float)m_max_training_step);
+		float eps = eps_coarse * std::pow(eps_fine / eps_coarse, t_normalized);
+		
+		return eps;
+	}
 
 protected:
 	// Protected members accessible to derived classes
@@ -299,6 +341,13 @@ protected:
 	bool m_use_sdf = false;
 
 	std::string m_method;
+	
+	// Adaptive epsilon for finite difference normals based on hashgrid cell sizes
+	uint32_t m_n_levels = 16;           // Number of hashgrid levels
+	uint32_t m_base_resolution = 16;    // Nmin: base grid resolution
+	float m_per_level_scale = 2.0f;     // b: per-level scaling factor
+	uint32_t m_max_training_step = 50000;  // Total training steps for epsilon decay
+	uint32_t m_current_training_step = 0;  // Current training step
 
 	// Forward context base (can be extended by derived classes)
 	struct ForwardContextBase : public tcnn::Context {

@@ -202,7 +202,8 @@ __global__ void compute_surface_features_to_slice_kernel(
 		T phi_z = density_output[i * density_stride + (1 + k * 3 + 2) * (density_stride == 1 ? n_elements : 1)];
 		
 		T dot_product = phi_x * T(normal[0]) + phi_y * T(normal[1]) + phi_z * T(normal[2]);
-		T surface_feature = fmaxf(T(0.0f), -dot_product);
+		// T surface_feature = fmaxf(T(0.0f), -dot_product);
+		T surface_feature = -dot_product;
 		
 		rgb_slice[i * slice_stride + (1 + k) * (slice_stride == 1 ? n_elements : 1)] = surface_feature * surface_scale;
 	}
@@ -654,9 +655,9 @@ __global__ void surface_features_slice_backward_kernel(
 		
 		// ReLU gate: gradient flows only if dot_product < 0
 		T dL_ddot_product = T(0.0f);
-		if (dot_product < T(0.0f)) {
+		// if (dot_product < T(0.0f)) {
 			dL_ddot_product = -dL_dsurface_feature_unscaled;
-		}
+		// }
 		
 		// Gradients w.r.t. Φ_k
 		const T dL_dphi_x = dL_ddot_product * T(normal[0]);
@@ -1415,7 +1416,8 @@ static __global__ void compute_finite_difference_stencil_kernel(
 	const uint32_t density_stride,  // Stride for density buffers (padded_output_width)
 	const bool apply_threshold = false,
 	const float threshold = 0.01f,
-	const bool apply_sigmoid = false
+	const bool apply_sigmoid = false,
+	const bool apply_exp = false
 ) {
 	const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
 	if (i >= n_elements) return;
@@ -1432,8 +1434,13 @@ static __global__ void compute_finite_difference_stencil_kernel(
 		float density_plus = float(density_samples[idx_plus][i * density_stride]);
 		float density_minus = float(density_samples[idx_minus][i * density_stride]);
 		
+		// Apply exponential if enabled (for finite_exp mode - differentiable, occupancy = 1 - exp(-density))
+		if (apply_exp) {
+			density_plus = 1.0f - expf(-density_plus);
+			density_minus = 1.0f - expf(-density_minus);
+		}
 		// Apply sigmoid if enabled (for finite_sigm mode - differentiable)
-		if (apply_sigmoid) {
+		else if (apply_sigmoid) {
 			density_plus = 1.0f / (1.0f + expf(-density_plus));
 			density_minus = 1.0f / (1.0f + expf(-density_minus));
 		}
@@ -1805,7 +1812,8 @@ static __global__ void backprop_daubechies_stencil_kernel(
 	T* __restrict__ dL_ddensity_sample,
 	const uint32_t density_stride,  // Stride for density buffer (padded_output_width)
 	const bool apply_sigmoid = false,
-	const T* __restrict__ density_raw_sample = nullptr  // Raw density values (before sigmoid)
+	const T* __restrict__ density_raw_sample = nullptr,  // Raw density values (before sigmoid/exp)
+	const bool apply_exp = false
 ) {
 	const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
 	if (i >= n_elements) return;
@@ -1813,9 +1821,16 @@ static __global__ void backprop_daubechies_stencil_kernel(
 	const float dL_dgrad_dim = dL_dgradients[i * 3 + dim];
 	float grad = scale * dL_dgrad_dim;
 	
+	// Apply exponential chain rule if needed: dL/d(raw) = dL/d(occ) * occ'(raw)
+	// where occupancy = 1 - exp(-density), so occ'(density) = exp(-density)
+	if (apply_exp && density_raw_sample) {
+		float raw_density = float(density_raw_sample[i * density_stride]);
+		float exp_deriv = expf(-raw_density);  // d(1 - exp(-x))/dx = exp(-x)
+		grad *= exp_deriv;
+	}
 	// Apply sigmoid chain rule if needed: dL/d(raw) = dL/d(sigmoid) * sigmoid'(raw)
 	// where sigmoid'(x) = sigmoid(x) * (1 - sigmoid(x))
-	if (apply_sigmoid && density_raw_sample) {
+	else if (apply_sigmoid && density_raw_sample) {
 		float raw_density = float(density_raw_sample[i * density_stride]);
 		float sigmoid_val = 1.0f / (1.0f + expf(-raw_density));
 		float sigmoid_deriv = sigmoid_val * (1.0f - sigmoid_val);
@@ -1836,7 +1851,8 @@ tcnn::GPUMatrixDynamic<float> compute_normals_from_grid_gradients(
 	const tcnn::Context& grid_ctx,
 	const tcnn::GPUMatrixDynamic<T>& grid_output,
 	bool use_inference_params,
-	ForwardCtx* forward_ctx = nullptr  // Optional: save finite diff contexts for backprop
+	ForwardCtx* forward_ctx = nullptr,  // Optional: save finite diff contexts for backprop
+	float adaptive_epsilon = -1.0f  // Adaptive epsilon (-1 = use default)
 ) {
 	using namespace tcnn;
 	
@@ -1844,18 +1860,27 @@ tcnn::GPUMatrixDynamic<float> compute_normals_from_grid_gradients(
 	const char* grad_method_env = std::getenv("NGP_GRAD_METHOD");
 	bool use_finite_diff = (grad_method_env && (std::string(grad_method_env) == "finite" || 
 	                                             std::string(grad_method_env) == "finite_thresh" ||
+	                                             std::string(grad_method_env) == "finite_thresh_unnorm" ||
 	                                             std::string(grad_method_env) == "finite_sigm" ||
-	                                             std::string(grad_method_env) == "finite_sigm_unnorm"));
-	bool use_threshold = (grad_method_env && std::string(grad_method_env) == "finite_thresh");
+	                                             std::string(grad_method_env) == "finite_sigm_unnorm" ||
+	                                             std::string(grad_method_env) == "finite_exp" ||
+	                                             std::string(grad_method_env) == "finite_exp_unnorm"));
+	bool use_threshold = (grad_method_env && (std::string(grad_method_env) == "finite_thresh" ||
+	                                           std::string(grad_method_env) == "finite_thresh_unnorm"));
 	bool use_sigmoid = (grad_method_env && (std::string(grad_method_env) == "finite_sigm" ||
 	                                         std::string(grad_method_env) == "finite_sigm_unnorm"));
-	bool skip_normalization = (grad_method_env && std::string(grad_method_env) == "finite_sigm_unnorm");
+	bool use_exp = (grad_method_env && (std::string(grad_method_env) == "finite_exp" ||
+	                                     std::string(grad_method_env) == "finite_exp_unnorm"));
+	bool skip_normalization = (grad_method_env && (std::string(grad_method_env) == "finite_sigm_unnorm" ||
+	                                                std::string(grad_method_env) == "finite_thresh_unnorm" ||
+	                                                std::string(grad_method_env) == "finite_exp_unnorm"));
 	
 	GPUMatrixDynamic<float> dDensity_dPos{3, batch_size, stream, AoS};
 	
 	if (use_finite_diff) {
 		// Method 2: Finite differences with Daubechies stencils
-		const float eps = 1e-4f;  // TODO: Make proportional to grid cell size
+		// Use adaptive epsilon if provided, otherwise fallback to default
+		const float eps = (adaptive_epsilon > 0.0f) ? adaptive_epsilon : 1e-4f;
 		
 		// Get genus from environment variable (default: 1)
 		const char* genus_env = std::getenv("NGP_GENUS");
@@ -1941,7 +1966,7 @@ tcnn::GPUMatrixDynamic<float> compute_normals_from_grid_gradients(
 			linear_kernel(compute_finite_difference_stencil_kernel<T>, 0, stream,
 				batch_size, d_density_ptrs.data(), num_points, d_stencil_coeffs.data(), 
 				dDensity_dPos.data(), dim, eps, grid_encoding->padded_output_width(),
-				use_threshold, density_threshold, use_sigmoid);
+				use_threshold, density_threshold, use_sigmoid, use_exp);
 		}
 	}
 } else {
@@ -1988,7 +2013,7 @@ tcnn::GPUMatrixDynamic<float> compute_normals_from_grid_gradients(
 				linear_kernel(compute_finite_difference_stencil_kernel<T>, 0, stream,
 					batch_size, d_density_ptrs.data(), num_points, d_stencil_coeffs.data(), 
 					dDensity_dPos.data(), dim, eps, grid_encoding->padded_output_width(),
-					use_threshold, density_threshold, use_sigmoid);
+					use_threshold, density_threshold, use_sigmoid, use_exp);
 			}
 		}
 	} else {
@@ -2098,9 +2123,11 @@ void backprop_normals_from_finite_differences(
 	
 	const float eps = 1e-4f;  // Must match forward pass
 	
-	// Check if using sigmoid mode (already have grad_method_env and skip_normalization from above)
+	// Check if using sigmoid or exp mode (already have grad_method_env and skip_normalization from above)
 	bool use_sigmoid = (grad_method_env && (std::string(grad_method_env) == "finite_sigm" ||
 	                                         std::string(grad_method_env) == "finite_sigm_unnorm"));
+	bool use_exp = (grad_method_env && (std::string(grad_method_env) == "finite_exp" ||
+	                                     std::string(grad_method_env) == "finite_exp_unnorm"));
 	
 	// Get genus and create stencil
 	int genus = forward_ctx.finite_diff_genus;
@@ -2129,11 +2156,12 @@ void backprop_normals_from_finite_differences(
 			CUDA_CHECK_THROW(cudaMemsetAsync(dL_ddensity_neg.data(), 0, dL_ddensity_neg.n_bytes(), stream));
 			CUDA_CHECK_THROW(cudaMemsetAsync(dL_ddensity_pos.data(), 0, dL_ddensity_pos.n_bytes(), stream));
 			
-		// Gradient for negative offset sample: -coeff * dL/dgrad / eps (with sigmoid chain rule if enabled)
+		// Gradient for negative offset sample: -coeff * dL/dgrad / eps (with sigmoid/exp chain rule if enabled)
 		linear_kernel(backprop_daubechies_stencil_kernel<T>, 0, stream,
 			batch_size, dL_dRawGradients.data(), dim, scale_neg, dL_ddensity_neg.data(), 
 			grid_encoding->padded_output_width(), use_sigmoid, 
-			use_sigmoid ? forward_ctx.finite_diff_densities[base_idx + offset_idx * 2].data() : nullptr);
+			(use_sigmoid || use_exp) ? forward_ctx.finite_diff_densities[base_idx + offset_idx * 2].data() : nullptr,
+			use_exp);
 			
 			grid_encoding->backward(
 				stream,
@@ -2143,11 +2171,12 @@ void backprop_normals_from_finite_differences(
 				dL_ddensity_neg, nullptr, use_inference_params, param_gradients_mode
 			);
 			
-		// Gradient for positive offset sample: +coeff * dL/dgrad / eps (with sigmoid chain rule if enabled)
+		// Gradient for positive offset sample: +coeff * dL/dgrad / eps (with sigmoid/exp chain rule if enabled)
 		linear_kernel(backprop_daubechies_stencil_kernel<T>, 0, stream,
 			batch_size, dL_dRawGradients.data(), dim, scale_pos, dL_ddensity_pos.data(), 
 			grid_encoding->padded_output_width(), use_sigmoid,
-			use_sigmoid ? forward_ctx.finite_diff_densities[base_idx + offset_idx * 2 + 1].data() : nullptr);
+			(use_sigmoid || use_exp) ? forward_ctx.finite_diff_densities[base_idx + offset_idx * 2 + 1].data() : nullptr,
+			use_exp);
 			
 			grid_encoding->backward(
 				stream,
@@ -2158,6 +2187,383 @@ void backprop_normals_from_finite_differences(
 			);
 		}
 	}
+}
+
+// ============================================================================
+// SURFACE CORRECTED MODE KERNELS
+// ============================================================================
+// Note: copy_float_to_T_kernel already exists at line 1116, reusing it
+
+/**
+ * @brief Extracts normal correction from density output and computes corrected normals.
+ *
+ * Density output layout: [density, delta_nx, delta_ny, delta_nz, Φ_0...Φ_14]
+ * Extracts channels 1-3 as correction vector and computes: n_corrected = normalize(n_base + delta_n)
+ *
+ * @param n_elements Number of samples
+ * @param density_stride Stride for 48D density output
+ * @param density_output 48D density output
+ * @param n_base Analytical normals (3D per sample, float)
+ * @param n_corrected Output corrected normals (3D per sample, float)
+ */
+template <typename T>
+__global__ void compute_corrected_normals_from_density_kernel(
+	const uint32_t n_elements,
+	const uint32_t density_stride,
+	const T* __restrict__ density_output,
+	const float* __restrict__ n_base,
+	float* __restrict__ n_corrected
+) {
+	const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
+	if (i >= n_elements) return;
+
+	// Read base normal
+	float nx_base = n_base[i * 3 + 0];
+	float ny_base = n_base[i * 3 + 1];
+	float nz_base = n_base[i * 3 + 2];
+
+	// Extract correction from density output channels 1-3
+	float dx = float(density_output[i * density_stride + 1 * (density_stride == 1 ? n_elements : 1)]);
+	float dy = float(density_output[i * density_stride + 2 * (density_stride == 1 ? n_elements : 1)]);
+	float dz = float(density_output[i * density_stride + 3 * (density_stride == 1 ? n_elements : 1)]);
+
+	// Compute combined vector
+	float nx_combined = nx_base + dx;
+	float ny_combined = ny_base + dy;
+	float nz_combined = nz_base + dz;
+
+	// Normalize
+	float norm = sqrtf(nx_combined * nx_combined + ny_combined * ny_combined + nz_combined * nz_combined);
+	float inv_norm = (norm > 1e-8f) ? (1.0f / norm) : 0.0f;
+
+	// Write normalized result
+	n_corrected[i * 3 + 0] = nx_combined * inv_norm;
+	n_corrected[i * 3 + 1] = ny_combined * inv_norm;
+	n_corrected[i * 3 + 2] = nz_combined * inv_norm;
+}
+
+/**
+ * @brief Computes surface features for surface_corrected mode with modified layout.
+ *
+ * Density output layout for surface_corrected: [density, delta_nx, delta_ny, delta_nz, Φ_0...Φ_14]
+ * Vector fields start at channel 4 instead of channel 1.
+ *
+ * Feature computation:
+ * - Channel 0: Density (optionally converted from SDF)
+ * - Channels 1-15: ReLU(-Φ_k · n) for 15 3D vector fields Φ_k from channels 4-46
+ *
+ * @param n_elements Number of samples
+ * @param density_stride Stride for 48D density output
+ * @param density_output 48D output: [SDF/density, delta_n[3], Φ_0, ..., Φ_14]
+ * @param corrected_normals 3D corrected normals per sample
+ * @param slice_stride Stride for output slice
+ * @param rgb_slice Output 16D surface features
+ * @param sdf_mode If true, convert SDF to density for channel 0
+ * @param variance_params Variance parameters for SDF conversion (optional)
+ */
+template <typename T>
+__global__ void compute_surface_features_corrected_kernel(
+	const uint32_t n_elements,
+	const uint32_t density_stride,
+	const T* __restrict__ density_output,
+	const float* __restrict__ corrected_normals,
+	const uint32_t slice_stride,
+	T* __restrict__ rgb_slice,
+	bool sdf_mode = false,
+	const T* __restrict__ variance_params = nullptr
+) {
+	const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
+	if (i >= n_elements) return;
+
+	// Channel 0: Copy density/SDF, converting if needed
+	T density_val = density_output[i * density_stride + 0 * (density_stride == 1 ? n_elements : 1)];
+
+	if (sdf_mode) {
+		const float sdf = float(density_val);
+		const float sdf_clamped = fmaxf(fminf(sdf, 10.0f), -10.0f);
+
+		const float variance = variance_params ? float(variance_params[0]) : 0.12f;
+		const float variance_clamped = fmaxf(fminf(variance, 2.0f), -2.0f);
+		const float s = expf(variance_clamped * 10.0f);
+		const float s_clamped = fminf(s, 1000.0f);
+
+		const float sigmoid_arg = -sdf_clamped * s_clamped;
+		const float sigmoid_arg_clamped = fmaxf(fminf(sigmoid_arg, 50.0f), -50.0f);
+		const float sigmoid_sdf = 1.0f / (1.0f + expf(sigmoid_arg_clamped));
+
+		float density_result = s_clamped * sigmoid_sdf * (1.0f - sigmoid_sdf);
+
+		if (!isfinite(density_result)) {
+			density_result = 0.0f;
+		}
+
+		density_val = T(density_result);
+	}
+
+	rgb_slice[i * slice_stride + 0 * (slice_stride == 1 ? n_elements : 1)] = density_val;
+
+	// Get corrected normal
+	const float* normal = corrected_normals + i * 3;
+	const T surface_scale = T(3.0f);
+
+	// Channels 1-15: ReLU(-Φ_k · n)
+	// Vector fields start at channel 4 (skipping channels 1-3 which are delta_n)
+	for (uint32_t k = 0; k < 15; ++k) {
+		// Read vector Φ_k from channels 4 + k*3 to 4 + k*3 + 2
+		T phi_x = density_output[i * density_stride + (4 + k * 3 + 0) * (density_stride == 1 ? n_elements : 1)];
+		T phi_y = density_output[i * density_stride + (4 + k * 3 + 1) * (density_stride == 1 ? n_elements : 1)];
+		T phi_z = density_output[i * density_stride + (4 + k * 3 + 2) * (density_stride == 1 ? n_elements : 1)];
+
+		T dot_product = phi_x * T(normal[0]) + phi_y * T(normal[1]) + phi_z * T(normal[2]);
+		T surface_feature = -dot_product;
+
+		rgb_slice[i * slice_stride + (1 + k) * (slice_stride == 1 ? n_elements : 1)] = surface_feature * surface_scale;
+	}
+}
+
+/**
+ * @brief Computes corrected normals: n_corrected = normalize(n_base + delta_n).
+ *
+ * Takes analytical normals (n_base) and correction vector (delta_n) from the
+ * corrector network, adds them, and normalizes the result.
+ * This version reads the first 3 channels from a network output with stride.
+ *
+ * @param n_elements Number of samples
+ * @param correction_stride Stride for correction network output (1 for SoA, width for AoS)
+ * @param correction_output Correction network output (16D padded, use first 3 channels)
+ * @param n_base Analytical normals (3D per sample, float)
+ * @param n_corrected Output corrected normals (3D per sample, float)
+ */
+template <typename T>
+__global__ void compute_corrected_normals_kernel(
+	const uint32_t n_elements,
+	const uint32_t correction_stride,
+	const T* __restrict__ correction_output,
+	const float* __restrict__ n_base,
+	float* __restrict__ n_corrected
+) {
+	const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
+	if (i >= n_elements) return;
+
+	// Read base normal
+	float nx_base = n_base[i * 3 + 0];
+	float ny_base = n_base[i * 3 + 1];
+	float nz_base = n_base[i * 3 + 2];
+
+	// Read correction from first 3 channels of correction network output
+	float dx_raw = float(correction_output[i * correction_stride + 0 * (correction_stride == 1 ? n_elements : 1)]);
+	float dy_raw = float(correction_output[i * correction_stride + 1 * (correction_stride == 1 ? n_elements : 1)]);
+	float dz_raw = float(correction_output[i * correction_stride + 2 * (correction_stride == 1 ? n_elements : 1)]);
+
+	// Transform sigmoid output [0,1] to [-0.5, 0.5] range
+	float dx = dx_raw - 0.5f;
+	float dy = dy_raw - 0.5f;
+	float dz = dz_raw - 0.5f;
+
+	// Compute combined vector
+	float nx_combined = nx_base + dx;
+	float ny_combined = ny_base + dy;
+	float nz_combined = nz_base + dz;
+
+	// Normalize
+	float norm = sqrtf(nx_combined * nx_combined + ny_combined * ny_combined + nz_combined * nz_combined);
+	float inv_norm = (norm > 1e-8f) ? (1.0f / norm) : 0.0f;
+
+	// Write normalized result
+	n_corrected[i * 3 + 0] = nx_combined * inv_norm;
+	n_corrected[i * 3 + 1] = ny_combined * inv_norm;
+	n_corrected[i * 3 + 2] = nz_combined * inv_norm;
+}
+
+/**
+ * @brief Backward pass through corrected normal computation with strided output.
+ *
+ * Computes gradients of n_corrected = normalize(n_base + delta_n) w.r.t. both
+ * n_base and the correction network output (first 3 channels).
+ * Optionally includes Eikonal loss gradient.
+ *
+ * Gradient formula:
+ * Let v = n_base + delta_n, n = v / ||v||
+ * dL/dv = (I / ||v|| - v v^T / ||v||^3) * dL/dn
+ * dL/d(n_base) = dL/dv
+ * dL/d(delta_n) = dL/dv
+ *
+ * Eikonal loss (if enabled): L_eik = (||v|| - 1)^2
+ * dL_eik/dv = 2 * weight * (||v|| - 1) * v / ||v||
+ *
+ * @param n_elements Number of samples
+ * @param correction_stride Stride for correction network output
+ * @param correction_output Correction network output from forward pass
+ * @param n_base Analytical normals from forward pass
+ * @param dL_dn_corrected Gradient w.r.t. corrected normals
+ * @param dL_dn_base Output gradient w.r.t. base normals (accumulate)
+ * @param dL_dcorrection_output Output gradient w.r.t. correction network output (accumulate first 3 channels)
+ * @param use_eikonal_loss Whether to include Eikonal loss gradient
+ * @param eikonal_weight Weight for Eikonal regularization
+ */
+template <typename T>
+__global__ void corrected_normals_backward_kernel(
+	const uint32_t n_elements,
+	const uint32_t correction_stride,
+	const T* __restrict__ correction_output,
+	const float* __restrict__ n_base,
+	const float* __restrict__ dL_dn_corrected,
+	float* __restrict__ dL_dn_base,
+	T* __restrict__ dL_dcorrection_output,
+	bool use_eikonal_loss = false,
+	float eikonal_weight = 0.1f
+) {
+	const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
+	if (i >= n_elements) return;
+
+	// Read base normal
+	float nx_base = n_base[i * 3 + 0];
+	float ny_base = n_base[i * 3 + 1];
+	float nz_base = n_base[i * 3 + 2];
+
+	// Read correction from first 3 channels
+	float dx = float(correction_output[i * correction_stride + 0 * (correction_stride == 1 ? n_elements : 1)]);
+	float dy = float(correction_output[i * correction_stride + 1 * (correction_stride == 1 ? n_elements : 1)]);
+	float dz = float(correction_output[i * correction_stride + 2 * (correction_stride == 1 ? n_elements : 1)]);
+
+	// Compute combined vector v = n_base + delta_n
+	float vx = nx_base + dx;
+	float vy = ny_base + dy;
+	float vz = nz_base + dz;
+
+	float norm_v = sqrtf(vx * vx + vy * vy + vz * vz);
+	float inv_norm = (norm_v > 1e-8f) ? (1.0f / norm_v) : 0.0f;
+	float inv_norm3 = inv_norm * inv_norm * inv_norm;
+
+	// Read gradient w.r.t. corrected normal
+	float dL_dnx = dL_dn_corrected[i * 3 + 0];
+	float dL_dny = dL_dn_corrected[i * 3 + 1];
+	float dL_dnz = dL_dn_corrected[i * 3 + 2];
+
+	// Jacobian of normalization: J = (I / ||v|| - v v^T / ||v||^3)
+	// dL/dv = J^T * dL/dn
+	float dot_product = vx * dL_dnx + vy * dL_dny + vz * dL_dnz;
+
+	float dL_dvx = (dL_dnx * inv_norm) - (vx * dot_product * inv_norm3);
+	float dL_dvy = (dL_dny * inv_norm) - (vy * dot_product * inv_norm3);
+	float dL_dvz = (dL_dnz * inv_norm) - (vz * dot_product * inv_norm3);
+
+	// Add Eikonal loss gradient if enabled
+	if (use_eikonal_loss) {
+		float eik_grad_scale = 2.0f * eikonal_weight * (norm_v - 1.0f) * inv_norm;
+		dL_dvx += eik_grad_scale * vx;
+		dL_dvy += eik_grad_scale * vy;
+		dL_dvz += eik_grad_scale * vz;
+	}
+
+	// Accumulate gradients - both n_base and delta_n receive the same gradient
+	dL_dn_base[i * 3 + 0] += dL_dvx;
+	dL_dn_base[i * 3 + 1] += dL_dvy;
+	dL_dn_base[i * 3 + 2] += dL_dvz;
+
+	// Write gradients to correction network output (first 3 channels)
+	uint32_t idx_x = i * correction_stride + 0 * (correction_stride == 1 ? n_elements : 1);
+	uint32_t idx_y = i * correction_stride + 1 * (correction_stride == 1 ? n_elements : 1);
+	uint32_t idx_z = i * correction_stride + 2 * (correction_stride == 1 ? n_elements : 1);
+
+	dL_dcorrection_output[idx_x] += T(dL_dvx);
+	dL_dcorrection_output[idx_y] += T(dL_dvy);
+	dL_dcorrection_output[idx_z] += T(dL_dvz);
+}
+
+/**
+ * @brief Adds Eikonal loss gradients for corrected normals.
+ *
+ * Eikonal loss enforces ||n_base + delta_n|| = 1 by penalizing deviation from unit norm.
+ * Loss: L_eik = (||n_base + delta_n|| - 1)^2
+ * Gradient: dL/d(n_base + delta_n) = 2 * weight * (||v|| - 1) * v / ||v||
+ * where v = n_base + delta_n
+ *
+ * Both n_base and delta_n receive the same gradient since they are added.
+ *
+ * @param n_elements Number of samples
+ * @param eikonal_weight Weight for Eikonal regularization
+ * @param n_base Analytical normals (3D per sample, float)
+ * @param delta_n Correction vectors (3D per sample, T type)
+ * @param dL_dn_base Gradient buffer for base normals (accumulate)
+ * @param dL_ddelta_n Gradient buffer for correction (accumulate)
+ */
+template <typename T>
+__global__ void add_eikonal_gradients_corrected_kernel(
+	const uint32_t n_elements,
+	const float eikonal_weight,
+	const float* __restrict__ n_base,
+	const T* __restrict__ delta_n,
+	float* __restrict__ dL_dn_base,
+	T* __restrict__ dL_ddelta_n
+) {
+	const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
+	if (i >= n_elements) return;
+
+	// Read base normal and correction
+	float nx_base = n_base[i * 3 + 0];
+	float ny_base = n_base[i * 3 + 1];
+	float nz_base = n_base[i * 3 + 2];
+
+	float dx = float(delta_n[i * 3 + 0]);
+	float dy = float(delta_n[i * 3 + 1]);
+	float dz = float(delta_n[i * 3 + 2]);
+
+	// Compute combined vector v = n_base + delta_n
+	float vx = nx_base + dx;
+	float vy = ny_base + dy;
+	float vz = nz_base + dz;
+
+	// Compute norm
+	float norm_v_sq = vx * vx + vy * vy + vz * vz;
+	float norm_v = sqrtf(norm_v_sq + 1e-6f);
+
+	// Eikonal gradient: 2 * weight * (||v|| - 1) * v / ||v||
+	float eikonal_error = norm_v - 1.0f;
+	float eikonal_grad_coeff = 2.0f * eikonal_weight * eikonal_error / (norm_v + 1e-8f);
+
+	float dL_dvx = eikonal_grad_coeff * vx;
+	float dL_dvy = eikonal_grad_coeff * vy;
+	float dL_dvz = eikonal_grad_coeff * vz;
+
+	// Accumulate gradients (same for both n_base and delta_n)
+	dL_dn_base[i * 3 + 0] += dL_dvx;
+	dL_dn_base[i * 3 + 1] += dL_dvy;
+	dL_dn_base[i * 3 + 2] += dL_dvz;
+
+	dL_ddelta_n[i * 3 + 0] += T(dL_dvx);
+	dL_ddelta_n[i * 3 + 1] += T(dL_dvy);
+	dL_ddelta_n[i * 3 + 2] += T(dL_dvz);
+}
+
+/**
+ * @brief Adds analytical normal gradients to density network gradients.
+ *
+ * This kernel accumulates gradients from analytical normals back into the density network
+ * gradient buffer. Used in surface_corrected mode to propagate normal gradients through
+ * the density network.
+ *
+ * @param n_elements Number of samples
+ * @param dL_danalytical_normals Gradients w.r.t. analytical normals (3D per sample, float)
+ * @param dL_ddensity_network_output Gradient buffer for density network (accumulate)
+ */
+template <typename T>
+__global__ void add_analytical_normals_gradient(
+	const uint32_t n_elements,
+	const float* __restrict__ dL_danalytical_normals,
+	T* __restrict__ dL_ddensity_network_output
+) {
+	const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
+	if (i >= n_elements) return;
+
+	// Read analytical normal gradients
+	float dL_dnx = dL_danalytical_normals[i * 3 + 0];
+	float dL_dny = dL_danalytical_normals[i * 3 + 1];
+	float dL_dnz = dL_danalytical_normals[i * 3 + 2];
+
+	// Add to density network gradients (channel 0 corresponds to SDF/density)
+	// The analytical normals come from the SDF gradient, so we add to channel 0
+	atomicAdd(&dL_ddensity_network_output[i * 48 + 0], T(dL_dnx + dL_dny + dL_dnz));
 }
 
 

@@ -303,6 +303,142 @@ Same as Surface Mode, plus:
 
 ---
 
+## 4.5. Surface Corrected Mode (`surface_corrected`)
+
+### Architecture
+
+Extends Surface Mode with a learned normal corrector network for improved surface features.
+
+**Position Encoding:** HashGrid (same as Surface Mode)
+
+**Density MLP:** Same as Surface Mode
+- Input: Encoded position (32D)
+- Output: 48D (1D density + 45D vector potential Φ)
+- Activation: ReLU
+
+**Corrector Network:** NEW
+- Input: 3D analytical normals (from autodiff)
+- Output: 3D correction vector `δ_n`
+- Default: FullyFusedMLP with 64 neurons, 2 hidden layers
+- Activation: ReLU → None (output)
+
+**Direction Encoding:** SphericalHarmonics (same as Surface Mode)
+
+**RGB MLP:** Same as Surface Mode
+- Input: 16D surface features + 16D encoded direction = 32D
+- Output: 3D RGB
+- Note: Surface features computed using **corrected normals** instead of base normals
+
+**Explicit Grids:** None
+
+### Forward Pass Flow
+
+1. **Position Encoding**: `pos[3D]` → HashGrid → `enc_pos[32D]`
+2. **Density MLP**: `enc_pos[32D]` → MLP(ReLU) → `density_out[48D]`
+3. **Analytical Normal Computation** (Autodiff):
+   - Create gradient seed: `dL/d(density_out) = [1, 0, 0, ..., 0]`
+   - Backward through density MLP: Get `dL/d(enc_pos)`
+   - Backward through position encoding: Get `dSDF/dpos[3D]`
+   - Normalize: `n_base = -normalize(dSDF/dpos)`
+4. **Corrector Network**:
+   - Input: `n_base[3D]`
+   - Forward: `n_base[3D]` → Corrector MLP → `δ_n[3D]`
+5. **Corrected Normal Computation**:
+   - Combine: `v = n_base + δ_n`
+   - Normalize: `n_corrected = normalize(v)`
+6. **Surface Feature Computation**:
+   - Reshape `density_out[1:46]` as 15 vectors `Φ_k[3D]` (k=0..14)
+   - For each k: `feature_k = ReLU(-Φ_k · n_corrected)`  ← **Uses corrected normals!**
+   - Result: `surface_features[15D]`
+7. **Density Extraction**: `density = density_out[0]`
+8. **RGB Input Assembly**:
+   - `rgb_input[0] = density`
+   - `rgb_input[1:16] = surface_features[15D]`
+   - `rgb_input[16:32] = enc_dir[16D]`
+9. **Direction Encoding**: `dir[3D]` → SphericalHarmonics → `enc_dir[16D]`
+10. **RGB MLP**: `rgb_input[32D]` → MLP(ReLU→None) → `RGB[3D]`
+11. **Final Output**: `[R, G, B, σ]`
+
+### Backward Pass Flow
+
+1. **RGB MLP Backward**: `dL/dRGB[3D]` → `dL/d(rgb_input)[32D]`
+2. **Direction Encoding Backward**: `dL/d(enc_dir)` from rgb_input[16:32]
+3. **Surface Features Backward**:
+   - Input: `dL/d(surface_features)[15D]` from rgb_input[1:16]
+   - For each k: Compute `dL/d(Φ_k)` and `dL/d(n_corrected)` using chain rule through ReLU(-Φ_k · n_corrected)
+   - Accumulate: `dL/d(density_out)[1:46]` from Φ gradients
+   - Collect: `dL/d(n_corrected)[3D]` for corrector backward
+4. **Corrected Normal Backward**:
+   - Chain rule through normalization: `n_corrected = normalize(n_base + δ_n)`
+   - Jacobian: `J = (I/||v|| - vv^T/||v||^3)` where `v = n_base + δ_n`
+   - Compute:
+     - `dL/d(n_base) = J^T · dL/d(n_corrected)`
+     - `dL/d(δ_n) = J^T · dL/d(n_corrected)` (same as dL/d(n_base))
+5. **Eikonal Loss (Optional)**:
+   - If `use_eikonal_loss` enabled:
+   - Loss: `L_eik = (||n_base + δ_n|| - 1)²`
+   - Gradient: `dL/dv = 2 * eikonal_weight * (||v|| - 1) * v / ||v||`
+   - Accumulate to both:
+     - `dL/d(n_base) += dL/dv`
+     - `dL/d(δ_n) += dL/dv`
+6. **Corrector Network Backward**:
+   - Input: `dL/d(δ_n)[3D]` (from rendering loss + Eikonal loss)
+   - Backward through corrector MLP
+   - Updates corrector network parameters
+   - **No input gradients** (n_base comes from autodiff, not backpropagated here)
+7. **Density Gradient**:
+   - Add `dL/dσ` from output[3] to `dL/d(density_out)[0]`
+   - Add gradient from rgb_input[0]
+8. **Normal Gradients Backward** (Second-order, optional):
+   - If `backprop_normals` enabled:
+   - Chain `dL/d(n_base)` through normalization
+   - Backward through position encoding (second pass)
+   - Backward through density MLP (second pass)
+   - Accumulate into `dL/d(density_out)`
+9. **Density MLP Backward**: `dL/d(density_out)[48D]` → `dL/d(enc_pos)[32D]`
+10. **Position Encoding Backward**: `dL/d(enc_pos)[32D]` → HashGrid gradients
+
+### Key Differences from Surface Mode
+
+1. **Corrector Network**: New component that learns to refine analytical normals
+2. **Two-Stage Normal Computation**:
+   - Stage 1: Autodiff normals (n_base) from density gradients
+   - Stage 2: Learned correction (δ_n) applied to n_base
+3. **Improved Surface Features**: Dot products computed with corrected normals
+4. **Eikonal Supervision**: Optional geometric regularization on corrected field
+5. **Additional Parameters**: ~12K params for corrector network (default config)
+
+### Use Cases
+
+- **Noisy Analytical Normals**: When density gradients are unreliable (coarse hashgrids, early training)
+- **Complex Geometry**: Scenes requiring high-fidelity normals for accurate rendering
+- **Geometric Consistency**: Eikonal loss helps maintain unit-norm gradients
+- **Reflective Surfaces**: Better normals improve view-dependent effects
+
+### Configuration
+
+Add to JSON config:
+```json
+{
+  "method": "surface_corrected",
+  "corrector_network": {
+    "otype": "FullyFusedMLP",
+    "activation": "ReLU",
+    "output_activation": "None",
+    "n_neurons": 64,
+    "n_hidden_layers": 2
+  }
+}
+```
+
+Enable Eikonal loss via:
+```cpp
+network->set_use_eikonal_loss(true);
+network->set_eikonal_weight(0.01f);  // Adjust weight as needed
+```
+
+---
+
 ## 5. Volume Mode (`volume`)
 
 ### Architecture
@@ -580,6 +716,7 @@ Same as Surface Mode, plus:
 | surface | MLP[0] | Autodiff MLP | Vector potential Φ | 48D |
 | surface_normal | MLP[0] | Autodiff MLP | + Encoded normals | 48D |
 | surface_reflect | MLP[0] | Autodiff MLP | + Encoded reflections | 48D |
+| surface_corrected | MLP[0] | Autodiff MLP + Corrector | Learned normal correction + Eikonal | 48D |
 | volume | MLP[0] | N/A | Divergence features | 48D |
 | hash_surface | MLP | Autodiff MLP | Hash feature vectors | 1D |
 | baseline_explicit | Grid | N/A | Grid density | 15D |

@@ -25,14 +25,28 @@
 		"n_levels": 8,
 		"n_features_per_level": 4,
 		"log2_hashmap_size": 19,
-		"base_resolution": 16
+		"base_resolution": 16,
+		"correction_encoding": {
+			"otype": "HashGrid",
+			"n_levels": 4,
+			"n_features_per_level": 2,
+			"log2_hashmap_size": 16,
+			"base_resolution": 16
+		}
 	},
 	"network": {
 		"otype": "FullyFusedMLP",
 		"activation": "ReLU",
 		"output_activation": "None",
 		"n_neurons": 64,
-		"n_hidden_layers": 2
+		"n_hidden_layers": 2,
+		"correction_network": {
+			"otype": "FullyFusedMLP",
+			"activation": "ReLU",
+			"output_activation": "None",
+			"n_neurons": 32,
+			"n_hidden_layers": 1
+		}
 	},
 	"dir_encoding": {
 		"otype": "Composite",
@@ -100,4 +114,3 @@
 		}
 	}
 }
-

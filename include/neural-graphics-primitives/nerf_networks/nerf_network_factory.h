@@ -14,6 +14,7 @@
 #include "surface_network.h"
 #include "surface_normal_network.h"
 #include "surface_reflect_network.h"
+#include "surface_corrected_network.h"
 #include "surface_explicit_network.h"
 #include "baseline_explicit_network.h"
 #include "hash_surface_network.h"
@@ -34,7 +35,7 @@ namespace ngp {
  * @param density_network Density MLP configuration (JSON)
  * @param rgb_network RGB MLP configuration (JSON)
  * @param method Rendering method: "baseline", "surface", "surface_normal", "surface_reflect",
- *               "surface_explicit", "baseline_explicit", "hash_surface", "volume"
+ *               "surface_corrected", "surface_explicit", "baseline_explicit", "hash_surface", "volume"
  * @param use_sdf Whether to use SDF-to-density conversion (NeuS2 style)
  * @return std::shared_ptr<NerfNetworkBase<T>> Pointer to mode-specific network implementation
  * 
@@ -92,6 +93,40 @@ std::shared_ptr<NerfNetworkBase<T>> create_nerf_network(
 			use_sdf
 		);
 	}
+	else if (method == "surface_corrected") {
+		// Extract correction encoding and network configs, or use defaults
+		nlohmann::json correction_encoding_config = pos_encoding.value("correction_encoding", nlohmann::json::object());
+		nlohmann::json correction_network_config = density_network.value("correction_network", nlohmann::json::object());
+
+		// If not specified in the main configs, provide sensible defaults
+		if (correction_encoding_config.empty()) {
+			correction_encoding_config = {
+				{"otype", "HashGrid"},
+				{"n_levels", 4},
+				{"n_features_per_level", 2},
+				{"log2_hashmap_size", 16},
+				{"base_resolution", 16}
+			};
+		}
+
+		if (correction_network_config.empty()) {
+			correction_network_config = {
+				{"otype", "FullyFusedMLP"},
+				{"activation", "ReLU"},
+				{"output_activation", "Sigmoid"},
+				{"n_neurons", 32},
+				{"n_hidden_layers", 1}
+			};
+		}
+
+		return std::make_shared<SurfaceCorrectedNetwork<T>>(
+			n_pos_dims, n_dir_dims, n_extra_dims, dir_offset,
+			pos_encoding, dir_encoding, density_network, rgb_network,
+			use_sdf,
+			correction_encoding_config,
+			correction_network_config
+		);
+	}
 	else if (method == "surface_explicit") {
 		return std::make_shared<SurfaceExplicitNetwork<T>>(
 			n_pos_dims, n_dir_dims, n_extra_dims, dir_offset,
@@ -142,6 +177,7 @@ inline std::vector<std::string> get_supported_methods() {
 		"surface",
 		"surface_normal",
 		"surface_reflect",
+		"surface_corrected",
 		"surface_explicit",
 		"baseline_explicit",
 		"hash_surface",
