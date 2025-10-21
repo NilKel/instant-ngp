@@ -126,12 +126,50 @@ public:
 			stream, batch_size, input, density_network_input, density_network_output, use_inference_params
 		);
 		
-		// Compute surface features using analytical normals
+		// STEP 5: Correction network inference setup
+		tcnn::GPUMatrixDynamic<T> correction_network_input{
+			m_correction_network_input_width, batch_size, stream, tcnn::AoS
+		};
+		
+		tcnn::GPUMatrixDynamic<T> correction_network_output{
+			m_correction_network->padded_output_width(), batch_size, stream, tcnn::AoS
+		};
+		
+		CUDA_CHECK_THROW(cudaMemsetAsync(correction_network_input.data(), 0,
+		                                  correction_network_input.n_bytes(), stream));
+		
+		auto correction_encoding_output = correction_network_input.slice_rows(
+			0, m_correction_encoding->padded_output_width()
+		);
+		
+		m_correction_encoding->inference_mixed_precision(
+			stream,
+			input.slice_rows(0, m_correction_encoding->input_width()),
+			correction_encoding_output,
+			use_inference_params
+		);
+		
+		m_correction_network->inference_mixed_precision(
+			stream, correction_network_input, correction_network_output, use_inference_params
+		);
+		
+		// Compute corrected normals using correction network output
+		tcnn::GPUMatrixDynamic<float> corrected_normals{3, batch_size, stream, tcnn::AoS};
+		
+		linear_kernel(compute_corrected_normals_kernel<T>, 0, stream,
+			batch_size,
+			correction_network_output.layout() == tcnn::AoS ? correction_network_output.stride() : 1,
+			correction_network_output.data(),
+			analytical_normals.data(),
+			corrected_normals.data()
+		);
+		
+		// Compute surface features using corrected normals
 		linear_kernel(compute_surface_features_to_slice_kernel<T>, 0, stream,
 			batch_size,
 			density_network_output.layout() == tcnn::AoS ? density_network_output.stride() : 1,
 			density_network_output.data(),
-			analytical_normals.data(),
+			corrected_normals.data(),
 			rgb_network_input.layout() == tcnn::AoS ? rgb_network_input.stride() : 1,
 			rgb_network_input.data(),
 			this->m_use_sdf,
@@ -245,10 +283,16 @@ public:
 			prepare_input_gradients
 		);
 		
-		// DEBUG: Skip correction and use analytical normals directly
+		// STEP 5: Compute corrected normals using correction network output
 		forward->corrected_normals = tcnn::GPUMatrixDynamic<float>{3, batch_size, stream, tcnn::AoS};
-		CUDA_CHECK_THROW(cudaMemcpyAsync(forward->corrected_normals.data(), forward->analytical_normals.data(),
-		                                  forward->corrected_normals.n_bytes(), cudaMemcpyDeviceToDevice, stream));
+		
+		linear_kernel(compute_corrected_normals_kernel<T>, 0, stream,
+			batch_size,
+			forward->correction_network_output.layout() == tcnn::AoS ? forward->correction_network_output.stride() : 1,
+			forward->correction_network_output.data(),
+			forward->analytical_normals.data(),
+			forward->corrected_normals.data()
+		);
 		
 		// Compute surface features from normals
 		auto surface_features_slice = forward->rgb_network_input.slice_rows(0, 16);
